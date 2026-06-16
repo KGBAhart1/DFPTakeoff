@@ -2677,11 +2677,19 @@ def main():
 
     # Check for updates in background (won't block startup)
     try:
+        from PyQt5.QtCore import QObject, pyqtSignal
         from updater import check_for_update
+
+        class _UpdateNotifier(QObject):
+            found = pyqtSignal(dict)
+
+        _notifier = _UpdateNotifier()
+        _notifier.found.connect(_show_update_dialog)
+
         def _on_update(info):
             if info:
-                # Use QTimer to run in main thread
-                QTimer.singleShot(2000, lambda: _show_update_dialog(info))
+                _notifier.found.emit(info)
+
         check_for_update(_on_update)
     except Exception:
         pass
