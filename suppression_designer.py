@@ -287,6 +287,7 @@ MFR_APPLIANCE_OVERRIDES = {
         # Broilers
         "chain_broiler_c":  {"nt":"N-1LP","flow":1,"nq":1},
         "chain_broiler_o":  {"nt":"N-2HP","flow":2,"nq":1},
+        "chain_pizza_oven": {"nt":"N-1LP","flow":1,"nq":1},
         "upright_broiler":  {"nt":"N-1LP","flow":1,"nq":1},  # Fig 3-22: 36"×24"
         "salamander":       {"nt":"N-1LP","flow":1,"nq":1},
         "cheese_melter":    {"nt":"N-1LP","flow":1,"nq":1},
@@ -339,6 +340,7 @@ MFR_APPLIANCE_OVERRIDES = {
         # Broilers
         "chain_broiler_c":  {"nt":"Appl(11982)","flow":1,"nq":1},
         "chain_broiler_o":  {"nt":"FG(13729)","flow":2,"nq":1},
+        "chain_pizza_oven": {"nt":"Appl(11982)","flow":1,"nq":1},
         "upright_broiler":  {"nt":"UBroiler(11984)","flow":1,"nq":2},  # 2 × 0.5 fp = 1 fp
         "salamander":       {"nt":"Appl(11982)","flow":1,"nq":1},
         "cheese_melter":    {"nt":"Appl(11982)","flow":1,"nq":1},
@@ -415,6 +417,8 @@ APPLIANCE_DEFS = {
     "chain_broiler_c":  {"label":"Chain\nBrlr Cls",   "short":"CBRC", "name":"Chain Broiler Closed",       "dw":36,"dd":24,"flow":1,"nt":"ADP","nq":1,"r":[],"color":"#1c2833","legs":True},
     # Chain broiler open: 2 ADP (tunnel + top opening), flow 2 (§3-4.19)
     "chain_broiler_o":  {"label":"Chain\nBrlr Open",  "short":"CBRO", "name":"Chain Broiler Open",         "dw":36,"dd":24,"flow":2,"nt":"ADP","nq":2,"r":[],"color":"#1c2833","legs":True},
+    # Chain pizza oven: conveyor tunnel with pizza decks on each side, flow 1 ADP
+    "chain_pizza_oven": {"label":"Chain\nPizza Oven", "short":"CPZ",  "name":"Chain Pizza Oven",           "dw":48,"dd":30,"dh":12,"flow":1,"nt":"ADP","nq":1,"r":[],"color":"#1c2833","legs":True},
     # Upright broiler: ADP, flow 1 (§3-4.13)
     "upright_broiler":  {"label":"Upright\nBroiler",  "short":"UPB",  "name":"Upright Broiler",            "dw":24,"dd":24,"flow":1,"nt":"ADP","nq":1,"r":[],"color":"#2e4053","legs":True},
     # Salamander / cheese melter: treated as upright broiler — ADP, flow 1
@@ -446,7 +450,7 @@ APPLIANCE_GROUPS = [
     ("Charbroilers",   ["charbroiler","lava_charbroiler","mesq_charbroiler",
                          "elec_charbroiler","radiant_gas",
                          "grillworks_2","grillworks_3"]),
-    ("Broilers",       ["chain_broiler_c","chain_broiler_o","upright_broiler",
+    ("Broilers",       ["chain_broiler_c","chain_broiler_o","chain_pizza_oven","upright_broiler",
                          "salamander","cheese_melter"]),
     ("Other",          ["soup_stove","bell_10","tandoor_oven","gyro","convection_oven","ecology_unit","table"]),
 ]
@@ -1557,6 +1561,66 @@ class ApplianceItem(QGraphicsItem):
                 painter.setPen(QPen(belt_col,1.2,Qt.DashLine))
                 for tv in (0.30, 0.70):
                     painter.drawLine(tp(0.12,tv), tp(0.88,tv))
+
+        elif k=="chain_pizza_oven":
+            # ── Chain Pizza Oven ──────────────────────────────────────────────
+            # Conveyor tunnel (same roller/belt as chain broiler) in the centre,
+            # with a flat pizza-catch deck extending from each side.
+            deck_w   = w * 0.20          # deck width each side
+            tunnel_x = deck_w
+            tunnel_w = w - 2 * deck_w
+            slot_y   = h * 0.28; slot_h = h * 0.38
+            roller_r = slot_h * 0.50
+
+            # Left deck
+            deck_col = QColor(185, 182, 175)
+            painter.setBrush(QBrush(deck_col)); painter.setPen(QPen(face_col.darker(130), 1.2))
+            painter.drawRect(QRectF(0, slot_y - slot_h*0.10, deck_w, slot_h * 1.20))
+            # Deck surface lines (pizza rests)
+            painter.setPen(QPen(face_col.darker(150), 0.8))
+            for ly in (slot_y + slot_h*0.25, slot_y + slot_h*0.60):
+                painter.drawLine(QPointF(2, ly), QPointF(deck_w - 2, ly))
+
+            # Right deck
+            painter.setBrush(QBrush(deck_col)); painter.setPen(QPen(face_col.darker(130), 1.2))
+            painter.drawRect(QRectF(tunnel_x + tunnel_w, slot_y - slot_h*0.10, deck_w, slot_h * 1.20))
+            painter.setPen(QPen(face_col.darker(150), 0.8))
+            for ly in (slot_y + slot_h*0.25, slot_y + slot_h*0.60):
+                painter.drawLine(QPointF(tunnel_x + tunnel_w + 2, ly), QPointF(w - 2, ly))
+
+            # Tunnel slot (dark interior)
+            painter.setBrush(QBrush(QColor(20, 20, 20))); painter.setPen(QPen(face_col, 1.5))
+            painter.drawRect(QRectF(tunnel_x, slot_y, tunnel_w, slot_h))
+            # Glow inside tunnel
+            painter.setBrush(QBrush(QColor(220, 80, 0, 35))); painter.setPen(Qt.NoPen)
+            painter.drawRect(QRectF(tunnel_x + roller_r, slot_y + 1, tunnel_w - 2*roller_r, slot_h - 2))
+            # Belt strands
+            belt_col = QColor(90, 88, 80)
+            for strand_y in (slot_y + slot_h*0.28, slot_y + slot_h*0.72):
+                painter.setPen(QPen(belt_col, 1.5, Qt.DashLine))
+                painter.drawLine(QPointF(tunnel_x + roller_r, strand_y),
+                                 QPointF(tunnel_x + tunnel_w - roller_r, strand_y))
+            # Drive rollers
+            for rx in (tunnel_x + roller_r, tunnel_x + tunnel_w - roller_r):
+                ry_c = slot_y + slot_h / 2
+                painter.setBrush(QBrush(QColor(125, 125, 130)))
+                painter.setPen(QPen(face_col.lighter(120), 1.2))
+                painter.drawEllipse(QPointF(rx, ry_c), roller_r, roller_r)
+                painter.setBrush(QBrush(QColor(80, 80, 85)))
+                painter.drawEllipse(QPointF(rx, ry_c), roller_r*0.38, roller_r*0.38)
+                painter.setPen(QPen(face_col, 0.8))
+                for ang in (0, 60, 120):
+                    ang_r = math.radians(ang)
+                    painter.drawLine(
+                        QPointF(rx + roller_r*0.38*math.cos(ang_r), ry_c + roller_r*0.38*math.sin(ang_r)),
+                        QPointF(rx + roller_r*0.85*math.cos(ang_r), ry_c + roller_r*0.85*math.sin(ang_r)))
+
+            # Top face: deck surfaces isometric on each side of the tunnel
+            deck_frac = deck_w / w
+            for u0, u1 in ((0.0, deck_frac), (1.0 - deck_frac, 1.0)):
+                deck_poly = QPolygonF([tp(u0, 0.05), tp(u1, 0.05), tp(u1, 0.95), tp(u0, 0.95)])
+                painter.setBrush(QBrush(QColor(deck_col).lighter(108))); painter.setPen(QPen(face_col.darker(130), 0.8))
+                painter.drawPolygon(deck_poly)
 
         elif k=="upright_broiler":
             # ── Upright Broiler ───────────────────────────────────────────────
@@ -3270,9 +3334,10 @@ class ApplianceSizeDialog(QDialog):
         self.nm=QLineEdit(); self.nm.setPlaceholderText("Custom label (optional)")
         self.ws=QDoubleSpinBox(); self.ws.setRange(6,240); self.ws.setValue(d["dw"]); self.ws.setSuffix("  in")
         self.ds=QDoubleSpinBox(); self.ds.setRange(6,120); self.ds.setValue(d["dd"]); self.ds.setSuffix("  in")
-        self.hs=QDoubleSpinBox(); self.hs.setRange(4,96);  self.hs.setValue(30);     self.hs.setSuffix("  in")
+        default_h = d.get("dh", 30)
+        self.hs=QDoubleSpinBox(); self.hs.setRange(1,96);  self.hs.setValue(default_h); self.hs.setSuffix("  in")
         l.addRow("Label:",self.nm); l.addRow("Width:",self.ws); l.addRow("Depth:",self.ds); l.addRow("Height:",self.hs)
-        l.addRow(QLabel(f"Default: {d['dw']}\"W × {d['dd']}\"D  |  Height default 30\""))
+        l.addRow(QLabel(f"Default: {d['dw']}\"W × {d['dd']}\"D  |  Height default {default_h}\""))
         br=QHBoxLayout()
         ok=QPushButton("Place"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;"); ok.clicked.connect(self.accept)
         ca=QPushButton("Cancel"); ca.clicked.connect(self.reject)
