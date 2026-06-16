@@ -1,0 +1,135 @@
+
+[2026-06-11 16:00:44.051554] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:00:47.696441] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:00:48.702147] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:01:12.862237] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:01:14.635239] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:01:15.679948] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:01:15.890151] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:01:19.084041] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
+
+[2026-06-11 16:01:20.991784] _sys_panel.refresh
+Traceback (most recent call last):
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 3843, in _on_changed
+    self._sys_panel.refresh(sc)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2830, in refresh
+    total=scene.total_flow(); capacity=scene.bottle_capacity()
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in total_flow
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+       ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\General Manager\OneDrive - Defense Fire Protection\Takeoff\suppression_designer.py", line 2348, in <genexpr>
+    f+=sum(nz.flow_points() for nz in h.plenum_nozzles)
+           ^^^^^^^^^^^^^^
+AttributeError: 'AppNozzleItem' object has no attribute 'flow_points'
