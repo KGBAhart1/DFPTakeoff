@@ -8,7 +8,7 @@ Runs in a background thread so it never blocks startup.
 import json, threading, os, tempfile, subprocess
 from urllib.request import urlopen, Request
 from urllib.error import URLError
-from version import APP_VERSION, UPDATE_CHECK_URL, INSTALLER_URL
+from version import APP_VERSION, UPDATE_CHECK_URL
 
 
 def _parse_version(v: str):
@@ -42,8 +42,8 @@ def check_for_update(callback):
     threading.Thread(target=_check, daemon=True).start()
 
 
-def download_and_install(parent=None):
-    """Download the installer from SharePoint and run it, then quit the app."""
+def download_and_install(download_url, parent=None):
+    """Download the installer from the given URL and run it, then quit the app."""
     from PyQt5.QtWidgets import QProgressDialog, QMessageBox, QApplication
     from PyQt5.QtCore import Qt
 
@@ -54,7 +54,7 @@ def download_and_install(parent=None):
     QApplication.processEvents()
 
     try:
-        req = Request(INSTALLER_URL, headers={"User-Agent": "DFPTakeoffPro"})
+        req = Request(download_url, headers={"User-Agent": "DFPTakeoffPro"})
         with urlopen(req, timeout=120) as resp:
             data = resp.read()
         tmp_dir = tempfile.mkdtemp()

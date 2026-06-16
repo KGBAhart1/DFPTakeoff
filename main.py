@@ -2591,7 +2591,7 @@ def _show_update_dialog(info: dict):
     msg.setDefaultButton(QMessageBox.Yes)
     if msg.exec_() == QMessageBox.Yes:
         from updater import download_and_install
-        download_and_install()
+        download_and_install(info.get("download_url", ""))
 
 
 def main():
