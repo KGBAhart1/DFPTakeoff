@@ -368,6 +368,14 @@ def effective_defn(key, mfr_key="kidde"):
 #       LPF=Low-proximity fryer (flow 2)
 # flow= flow points per Table 3-1 of Kidde WHDR DIOM P/N 87-122000-001
 # nq  = number of nozzles placed per appliance
+#
+# HOW TO ADD A NEW APPLIANCE:
+#   1. Add entry to APPLIANCE_DEFS below (copy a similar one as template)
+#      Optional fields: "dh" = custom default height in inches (default is 30 if omitted)
+#   2. Add the key to the correct group in APPLIANCE_GROUPS so it appears in the palette
+#   3. Add manufacturer overrides in MFR_APPLIANCE_OVERRIDES if nozzle type differs by brand
+#   4. Add a paint block in ApplianceItem.paint() — search for "elif k==" to find the section
+#      Each appliance key needs its own elif block to draw the icon on the canvas
 APPLIANCE_DEFS = {
     # ── Fryers — F nozzle, flow 2 each (DIOM §3-4.1 – 3-4.7) ─────────────────
     "fryer_sm":       {"label":"Fryer\nSmall",    "short":"FRY-S","name":"Fryer Small",       "dw":14.5,"dd":14.5,"flow":2,"nt":"F","nq":1,"r":[],"color":"#c0392b","legs":True},
@@ -679,7 +687,12 @@ class ApplianceItem(QGraphicsItem):
         super().__init__()
         self.key=key; self.defn=APPLIANCE_DEFS[key]
         self.w_in=w_in or self.defn["dw"]; self.d_in=d_in or self.defn["dd"]; self.h_in=h_in
-        self.custom_name=custom_name; self.show_label=True; self.app_nozzles=[]; self._nozzles_placed=False
+        self.custom_name=custom_name; self.show_label=True; self.app_nozzles=[]
+        # _nozzles_placed: True once nozzles have been assigned (place, load, or mfr switch).
+        # Needed to distinguish "appliance just dropped with 0 nozzles yet" from "user deleted all nozzles".
+        # total_flow() and recommendation() use this: if True, count app_nozzles (can be 0);
+        # if False, fall back to the definition's default flow so the count isn't zero on first drop.
+        self._nozzles_placed=False
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges); self.setZValue(1)
