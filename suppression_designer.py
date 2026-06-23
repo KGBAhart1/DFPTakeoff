@@ -83,10 +83,10 @@ from PyQt5.QtWidgets import (
     QTabWidget, QInputDialog, QFileDialog,
 )
 from PyQt5.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QImage, QPolygonF,
+    QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QImage, QPolygonF,
     QPainterPath, QRadialGradient, QPixmap,
 )
-from PyQt5.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, pyqtSignal
 try:
     from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
     _PRINT_AVAILABLE = True
@@ -718,7 +718,7 @@ class ApplianceItem(QGraphicsItem):
         super().__init__()
         self.key=key; self.defn=APPLIANCE_DEFS[key]
         self.w_in=w_in or self.defn["dw"]; self.d_in=d_in or self.defn["dd"]; self.h_in=h_in
-        self.custom_name=custom_name; self.show_label=True; self.app_nozzles=[]
+        self.custom_name=custom_name; self.show_label=True; self.label_offset=(0.0,0.0); self.app_nozzles=[]
         # _nozzles_placed: True once nozzles have been assigned (place, load, or mfr switch).
         # Needed to distinguish "appliance just dropped with 0 nozzles yet" from "user deleted all nozzles".
         # total_flow() and recommendation() use this: if True, count app_nozzles (can be 0);
@@ -792,7 +792,7 @@ class ApplianceItem(QGraphicsItem):
             # label
             if _item_show_label(self):
                 painter.setPen(QColor(50,50,50)); painter.setFont(QFont("Arial",7))
-                painter.drawText(QRectF(0, h+4, w, 14), Qt.AlignCenter,
+                painter.drawText(QRectF(self.label_offset[0], h+4+self.label_offset[1], w, 14), Qt.AlignCenter,
                                  self.custom_name or self.defn["name"])
             if self.isSelected():
                 painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
@@ -856,7 +856,7 @@ class ApplianceItem(QGraphicsItem):
             if _item_show_label(self):
                 painter.setPen(QColor("#232728")); painter.setFont(QFont("Arial",9,QFont.Bold))
                 lbl = self.custom_name or self.defn["name"]
-                painter.drawText(QRectF(0, total_h+4, w, 22), Qt.AlignCenter, lbl)
+                painter.drawText(QRectF(self.label_offset[0], total_h+4+self.label_offset[1], w, 22), Qt.AlignCenter, lbl)
             if self.isSelected():
                 painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
                 painter.drawRect(self.boundingRect().adjusted(-2,-2,2,2))
@@ -1767,13 +1767,14 @@ class ApplianceItem(QGraphicsItem):
 
         # ── Label ─────────────────────────────────────────────────────────────
         if _item_show_label(self):
+            lox, loy = self.label_offset
             painter.setPen(QColor("#232728"))
             painter.setFont(QFont("Arial", 9, QFont.Bold))
             lbl=self.custom_name or self.defn["name"]
-            painter.drawText(QRectF(0,self.box_h_px+self.leg_px+4,self.w_px,22),Qt.AlignCenter,lbl)
+            painter.drawText(QRectF(lox,self.box_h_px+self.leg_px+4+loy,self.w_px,22),Qt.AlignCenter,lbl)
             if self.scene() and getattr(self.scene(),"show_dimensions",False):
                 painter.setPen(QColor("#888")); painter.setFont(QFont("Arial", 7))
-                painter.drawText(QRectF(0,self.box_h_px+self.leg_px+26,self.w_px,14),Qt.AlignCenter,
+                painter.drawText(QRectF(lox,self.box_h_px+self.leg_px+26+loy,self.w_px,14),Qt.AlignCenter,
                                  f'{self.w_in:.0f}"W × {self.d_in:.0f}"D × {self.h_in:.0f}"H')
         if self.isSelected():
             painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
@@ -1784,7 +1785,12 @@ class ApplianceItem(QGraphicsItem):
         return super().itemChange(change, value)
 
     def contextMenuEvent(self, event):
-        result=_context_menu_base(self, event, ["Edit Appliance…", "Edit Nozzles…", "Bring to Front", "Send to Back"])
+        result=_context_menu_base(self, event, ["Nudge Label ↑","Nudge Label ↓","Nudge Label ←","Nudge Label →","Reset Label","Edit Appliance…", "Edit Nozzles…", "Bring to Front", "Send to Back"])
+        if result=="Nudge Label ↑": self.label_offset=(self.label_offset[0], self.label_offset[1]-8); self.prepareGeometryChange(); self.update(); return
+        elif result=="Nudge Label ↓": self.label_offset=(self.label_offset[0], self.label_offset[1]+8); self.prepareGeometryChange(); self.update(); return
+        elif result=="Nudge Label ←": self.label_offset=(self.label_offset[0]-10, self.label_offset[1]); self.prepareGeometryChange(); self.update(); return
+        elif result=="Nudge Label →": self.label_offset=(self.label_offset[0]+10, self.label_offset[1]); self.prepareGeometryChange(); self.update(); return
+        elif result=="Reset Label": self.label_offset=(0.0, 0.0); self.prepareGeometryChange(); self.update(); return
         if result=="Bring to Front":
             sc=self.scene()
             others=[i for i in sc.items() if getattr(i,"ITEM_TYPE","")=="appliance" and i is not self]
@@ -2369,7 +2375,8 @@ class DetectorItem(QGraphicsItem):
             lx, ly = self._label_pos()
             painter.setPen(QPen(body_col.darker(120)))
             painter.setFont(QFont("Arial", 6))
-            painter.drawText(QRectF(lx, ly, 60, 13), Qt.AlignHCenter|Qt.AlignTop, self.link_type)
+            short_lbl = self.link_type.split()[0].strip() if self.link_type else ""
+            painter.drawText(QRectF(lx, ly, 60, 13), Qt.AlignHCenter|Qt.AlignTop, short_lbl)
         # Selection highlight
         if sel:
             painter.setBrush(Qt.NoBrush)
@@ -2402,6 +2409,130 @@ class DetectorItem(QGraphicsItem):
             if idx >= 0: dlg._cb.setCurrentIndex(idx)
             if dlg.exec_() == QDialog.Accepted:
                 self.link_type = dlg.link_type(); self.update()
+        elif act == dele:
+            sc = self.scene()
+            if sc: sc.removeItem(self)
+
+
+class FreeLabelDialog(QDialog):
+    """Multi-line text input for free labels."""
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Label Text")
+        self.setMinimumWidth(300)
+        l = QVBoxLayout(self)
+        l.addWidget(QLabel("Enter label text (multiple lines OK):"))
+        self._edit = QTextEdit()
+        self._edit.setPlainText(text)
+        self._edit.setFixedHeight(80)
+        l.addWidget(self._edit)
+        br = QHBoxLayout()
+        ok = QPushButton("OK"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(cancel); br.addWidget(ok)
+        l.addLayout(br)
+
+    def text(self):
+        return self._edit.toPlainText().strip()
+
+
+class FreeLabelItem(QGraphicsItem):
+    """Free-placed text label with optional leader line to a target point."""
+    ITEM_TYPE = "free_label"
+    _FONT = QFont("Arial", 9, QFont.Bold)
+
+    def __init__(self, text="Label", leader_end=None):
+        super().__init__()
+        self.text = text
+        self.leader_end = QPointF(leader_end) if leader_end else None
+        self._dragging_leader = False
+        self.setFlag(QGraphicsItem.ItemIsMovable)
+        self.setFlag(QGraphicsItem.ItemIsSelectable)
+        self.setZValue(5)
+
+    def _text_rect(self):
+        fm = QFontMetricsF(self._FONT)
+        lines = self.text.split("\n")
+        tw = max(fm.width(ln) for ln in lines) + 10
+        th = fm.height() * len(lines) + 6
+        return QRectF(0, 0, max(tw, 40), max(th, 18))
+
+    def boundingRect(self):
+        r = self._text_rect().adjusted(-2, -2, 2, 2)
+        if self.leader_end:
+            r = r.united(QRectF(self.leader_end, QSizeF(1, 1)).adjusted(-6, -6, 6, 6))
+        return r
+
+    def shape(self):
+        p = QPainterPath(); p.addRect(self.boundingRect()); return p
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        tr = self._text_rect()
+        if self.leader_end:
+            painter.setPen(QPen(QColor("#444"), 1.2))
+            painter.drawLine(QPointF(tr.center().x(), tr.bottom()), self.leader_end)
+            painter.setBrush(QBrush(QColor("#444"))); painter.setPen(Qt.NoPen)
+            painter.drawEllipse(self.leader_end, 3, 3)
+            if self.isSelected():
+                painter.setBrush(QBrush(QColor("#ff7002")))
+                painter.setPen(QPen(QColor("#ff7002"), 1))
+                painter.drawEllipse(self.leader_end, 5, 5)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
+        painter.setPen(QPen(QColor("#444"), 0.8))
+        painter.drawRect(tr)
+        painter.setPen(QColor("#222"))
+        painter.setFont(self._FONT)
+        painter.drawText(tr, Qt.AlignCenter | Qt.TextWordWrap, self.text)
+        if self.isSelected():
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#ff7002"), 1.5, Qt.DashLine))
+            painter.drawRect(self.boundingRect().adjusted(-1, -1, 1, 1))
+
+    def mousePressEvent(self, event):
+        if self.leader_end and event.button() == Qt.LeftButton:
+            if (event.pos() - self.leader_end).manhattanLength() < 12:
+                self._dragging_leader = True
+                event.accept(); return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_leader:
+            self.prepareGeometryChange()
+            self.leader_end = event.pos()
+            self.update(); event.accept(); return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging_leader:
+            self._dragging_leader = False
+            event.accept(); return
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu()
+        edit_act = menu.addAction("Edit Text…")
+        if self.leader_end:
+            toggle_leader = menu.addAction("Remove Leader Line")
+        else:
+            toggle_leader = menu.addAction("Add Leader Line")
+        menu.addSeparator()
+        dele = menu.addAction("Delete")
+        act = menu.exec_(event.screenPos())
+        if act == edit_act:
+            dlg = FreeLabelDialog(self.text)
+            if dlg.exec_() == QDialog.Accepted and dlg.text():
+                self.text = dlg.text(); self.prepareGeometryChange(); self.update()
+        elif act == toggle_leader:
+            self.prepareGeometryChange()
+            if self.leader_end:
+                self.leader_end = None
+            else:
+                tr = self._text_rect()
+                self.leader_end = QPointF(tr.center().x(), tr.bottom() + 40)
+            self.update()
         elif act == dele:
             sc = self.scene()
             if sc: sc.removeItem(self)
@@ -2773,6 +2904,9 @@ class SuppressionScene(QGraphicsScene):
             item=GasValveItem(); item.setPos(pt)
         elif t=="detector":
             item=DetectorItem(link_type=spec.get("link_type","165 - ML Style")); item.setPos(pt)
+        elif t=="free_label":
+            leader = QPointF(0, 50)
+            item=FreeLabelItem(text=spec.get("text","Label"), leader_end=leader); item.setPos(pt)
         else: return
         if t!="appliance": self.addItem(item)
         self.set_mode_select(); self.layout_changed.emit()
@@ -2977,6 +3111,7 @@ class SuppressionScene(QGraphicsScene):
                              "name":item.custom_name,
                              "x":item.x(),"y":item.y(),
                              "z":item.zValue(),
+                             "lbl_off":list(getattr(item,"label_offset",(0,0))),
                              "nozzles":nozzles})
             elif t == "free_nozzle":
                 out.append({"type":"free_nozzle","x":item.x(),"y":item.y(),
@@ -3001,6 +3136,12 @@ class SuppressionScene(QGraphicsScene):
                 out.append({"type":"detector","x":item.x(),"y":item.y(),
                              "link_type":getattr(item,"link_type","165 - ML Style"),
                              "lbl_off":list(getattr(item,"label_offset",(0,0)))})
+            elif t == "free_label":
+                ld = {"type":"free_label","x":item.x(),"y":item.y(),
+                      "text":item.text}
+                if item.leader_end:
+                    ld["lx"]=item.leader_end.x(); ld["ly"]=item.leader_end.y()
+                out.append(ld)
             elif t == "pipe_segment":
                 out.append({"type":"pipe_segment",
                              "x1":item._p1.x(),"y1":item._p1.y(),
@@ -3048,6 +3189,7 @@ class SuppressionScene(QGraphicsScene):
                                      d.get("h_in",30), d.get("name"))
                 item.setPos(d["x"], d["y"]); self.addItem(item)
                 if "z" in d: item.setZValue(d["z"])
+                if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
                 for nz_d in d.get("nozzles",[]):
                     nz = AppNozzleItem(nz_d["nozzle_type"], nz_d["direction"])
                     nz.setParentItem(item)
@@ -3081,6 +3223,10 @@ class SuppressionScene(QGraphicsScene):
                 item = DetectorItem(link_type=d.get("link_type","165 - ML Style"))
                 if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
                 item.setPos(d["x"],d["y"]); self.addItem(item)
+            elif t == "free_label":
+                le = QPointF(d["lx"], d["ly"]) if "lx" in d else None
+                item = FreeLabelItem(text=d.get("text","Label"), leader_end=le)
+                item.setPos(d["x"], d["y"]); self.addItem(item)
             elif t == "pipe_segment":
                 item = PipeSegmentItem(
                     QPointF(d["x1"],d["y1"]), QPointF(d["x2"],d["y2"]),
@@ -3276,6 +3422,7 @@ class AppliancePalette(QWidget):
             ("alarm_bell",   "Alarm Bell",  "#c0392b"),
             ("gas_valve",    "Gas Valve",   "#c0392b"),
             ("detector",     "Detector",    "#1a472a"),
+            ("free_label",   "Label",       "#555555"),
         ]
         for key, lbl_txt, col in equip_items:
             c = QColor(col)
@@ -3927,7 +4074,7 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
         import datetime as _dt
         from PyQt5.QtCore import Qt as _Qt, QRectF as _QRectF
         DRAW_TYPES=("hood","duct","appliance","app_nozzle","free_nozzle",
-                    "bottle","control_head","pull_station","detector")
+                    "bottle","control_head","pull_station","detector","free_label")
 
         def _item_full_rect(item):
             sr=item.sceneBoundingRect()
@@ -4559,6 +4706,12 @@ class SuppressionDesigner(QDialog):
             lt=dlg.link_type()
             self._scene.set_mode_place("detector",{"link_type":lt})
             self._mode_lbl.setText(f"  Placing link ({lt}) — click canvas  |  Esc=cancel")
+        elif key=="free_label":
+            dlg = FreeLabelDialog(parent=self)
+            if dlg.exec_() != QDialog.Accepted or not dlg.text():
+                self._palette.clear_all(); return
+            self._scene.set_mode_place("free_label", {"text": dlg.text()})
+            self._mode_lbl.setText("  Placing label — click canvas  |  Esc=cancel")
 
     def _on_changed(self):
         try:
