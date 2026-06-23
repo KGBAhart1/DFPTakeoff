@@ -3690,7 +3690,13 @@ class AppSettingsDialog(QDialog):
     def _browse_logo(self):
         try:
             path, _ = QFileDialog.getOpenFileName(self, "Select Logo", "", "Images (*.png *.jpg *.jpeg *.bmp)", options=QFileDialog.DontUseNativeDialog)
-            if path: self._logo_path.setText(path)
+            if path:
+                base = os.path.join(os.path.expanduser("~"), "Documents", "DFP TakeoffPro")
+                os.makedirs(base, exist_ok=True)
+                ext = os.path.splitext(path)[1] or ".png"
+                dest = os.path.join(base, f"company_logo{ext}")
+                shutil.copy2(path, dest)
+                self._logo_path.setText(dest)
         except Exception:
             _log_error("_browse_logo", None)
 
