@@ -1,5 +1,5 @@
 {
-  "version": "1.0.6",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.0.6/DFP_TakeoffPro_Setup_1.0.6.exe",
-  "notes": "Minor improvements and code documentation."
+  "version": "1.0.7",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.0.7/DFP_TakeoffPro_Setup_1.0.7.exe",
+  "notes": "Label nudging, detector colors, control head options, gas valve label fix, select all, pizza oven nozzles."
 }

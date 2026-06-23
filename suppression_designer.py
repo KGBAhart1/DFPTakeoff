@@ -151,6 +151,36 @@ BUCKEYE_NOZZLE_COLORS = {
     "N-2W":  "#27ae60",   # green — Wide spray 2-flow
 }
 
+def _nozzle_color(nozzle_type):
+    return QColor(BUCKEYE_NOZZLE_COLORS.get(nozzle_type, PIPE_COL.name()
+                  if hasattr(PIPE_COL,'name') else "#1e64b4"))
+
+def _nozzle_color_rgb(nozzle_type):
+    """Return (r, g, b) tuple in 0-1 range for PDF export."""
+    c = _nozzle_color(nozzle_type)
+    return (c.redF(), c.greenF(), c.blueF())
+
+# Distinct detector colors keyed by link temperature prefix — no two temps share a color.
+# Avoids yellow/light colors that are hard to see on white backgrounds.
+_DETECTOR_COLORS = {
+    "135": "#8e44ad",   # purple
+    "165": "#c0392b",   # red
+    "212": "#2980b9",   # blue
+    "286": "#27ae60",   # green
+    "360": "#d35400",   # orange
+    "450": "#1abc9c",   # teal
+    "500": "#7f8c8d",   # gray
+}
+
+def _detector_color(link_type):
+    """Return a QColor for a detector's link type. Unique per temperature rating."""
+    temp = link_type.split()[0].strip() if link_type else ""
+    return QColor(_DETECTOR_COLORS.get(temp, "#2c3e50"))
+
+def _detector_color_rgb(link_type):
+    c = _detector_color(link_type)
+    return (c.redF(), c.greenF(), c.blueF())
+
 NOZZLE_DIRS = {
     "Down ↓":        ( 0.0,  1.0),
     "Up ↑":          ( 0.0, -1.0),
@@ -287,7 +317,7 @@ MFR_APPLIANCE_OVERRIDES = {
         # Broilers
         "chain_broiler_c":  {"nt":"N-1LP","flow":1,"nq":1},
         "chain_broiler_o":  {"nt":"N-2HP","flow":2,"nq":1},
-        "chain_pizza_oven": {"nt":"N-1LP","flow":1,"nq":1},
+        "chain_pizza_oven": {"nt":"N-1LP","flow":2,"nq":2},
         "upright_broiler":  {"nt":"N-1LP","flow":1,"nq":1},  # Fig 3-22: 36"×24"
         "salamander":       {"nt":"N-1LP","flow":1,"nq":1},
         "cheese_melter":    {"nt":"N-1LP","flow":1,"nq":1},
@@ -340,7 +370,7 @@ MFR_APPLIANCE_OVERRIDES = {
         # Broilers
         "chain_broiler_c":  {"nt":"Appl(11982)","flow":1,"nq":1},
         "chain_broiler_o":  {"nt":"FG(13729)","flow":2,"nq":1},
-        "chain_pizza_oven": {"nt":"Appl(11982)","flow":1,"nq":1},
+        "chain_pizza_oven": {"nt":"Appl(11982)","flow":2,"nq":2},
         "upright_broiler":  {"nt":"UBroiler(11984)","flow":1,"nq":2},  # 2 × 0.5 fp = 1 fp
         "salamander":       {"nt":"Appl(11982)","flow":1,"nq":1},
         "cheese_melter":    {"nt":"Appl(11982)","flow":1,"nq":1},
@@ -426,7 +456,8 @@ APPLIANCE_DEFS = {
     # Chain broiler open: 2 ADP (tunnel + top opening), flow 2 (§3-4.19)
     "chain_broiler_o":  {"label":"Chain\nBrlr Open",  "short":"CBRO", "name":"Chain Broiler Open",         "dw":36,"dd":24,"flow":2,"nt":"ADP","nq":2,"r":[],"color":"#1c2833","legs":True},
     # Chain pizza oven: conveyor tunnel with pizza decks on each side, flow 1 ADP
-    "chain_pizza_oven": {"label":"Chain\nPizza Oven", "short":"CPZ",  "name":"Chain Pizza Oven",           "dw":48,"dd":30,"dh":12,"flow":1,"nt":"ADP","nq":1,"r":[],"color":"#1c2833","legs":True},
+    "chain_pizza_oven": {"label":"Chain\nPizza Oven", "short":"CPZ",  "name":"Chain Pizza Oven",           "dw":48,"dd":30,"dh":12,"flow":2,"nt":"ADP","nq":2,"r":[],"color":"#1c2833","legs":True,
+                         "nz_layout":"sides"},
     # Upright broiler: ADP, flow 1 (§3-4.13)
     "upright_broiler":  {"label":"Upright\nBroiler",  "short":"UPB",  "name":"Upright Broiler",            "dw":24,"dd":24,"flow":1,"nt":"ADP","nq":1,"r":[],"color":"#2e4053","legs":True},
     # Salamander / cheese melter: treated as upright broiler — ADP, flow 1
@@ -1803,6 +1834,7 @@ class AppNozzleItem(QGraphicsItem):
     def __init__(self, nozzle_type="1N", direction="Down ↓"):
         super().__init__()
         self.nozzle_type=nozzle_type; self.direction=direction; self.show_label=True
+        self.label_offset=(0.0, 0.0)
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable); self.setZValue(3)
 
@@ -1810,19 +1842,31 @@ class AppNozzleItem(QGraphicsItem):
 
     def _vec(self): return NOZZLE_DIRS.get(self.direction,(0,1))
 
+    def _label_pos(self):
+        dx,dy=[v*self.ARROW_LEN for v in self._vec()]
+        if dx < -1:
+            lx, ly = dx - 62, dy - 8
+        elif dx > 1:
+            lx, ly = dx + 4, dy - 8
+        elif dy < -1:
+            lx, ly = dx + 4, dy - 18
+        else:
+            lx, ly = dx + 4, dy + 4
+        return lx + self.label_offset[0], ly + self.label_offset[1]
+
     def boundingRect(self):
         dx,dy=[v*self.ARROW_LEN for v in self._vec()]
-        pad=6; lpad=58
-        return QRectF(min(0,dx)-pad,min(0,dy)-pad,abs(dx)+pad*2+lpad,abs(dy)+pad*2+18)
+        lx, ly = self._label_pos()
+        xs = [0, dx, lx, lx+58]; ys = [0, dy, ly, ly+16]
+        pad=6
+        return QRectF(min(xs)-pad, min(ys)-pad, max(xs)-min(xs)+pad*2, max(ys)-min(ys)+pad*2)
 
     def shape(self):
         p=QPainterPath(); p.addRect(self.boundingRect()); return p
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
-        # Color-code Buckeye nozzles; default to PIPE_COL for all others
-        col = QColor(BUCKEYE_NOZZLE_COLORS.get(self.nozzle_type, PIPE_COL.name()
-                     if hasattr(PIPE_COL,'name') else "#1e64b4"))
+        col = _nozzle_color(self.nozzle_type)
         dx,dy=[v*self.ARROW_LEN for v in self._vec()]
         # Base dot at connection point
         painter.setBrush(QBrush(col)); painter.setPen(Qt.NoPen)
@@ -1831,8 +1875,9 @@ class AppNozzleItem(QGraphicsItem):
         draw_arrow(painter,0,0,dx,dy,col,width=3)
         # Label
         if _item_show_label(self):
+            lx, ly = self._label_pos()
             painter.setPen(col); painter.setFont(QFont("Arial", 9, QFont.Bold))
-            painter.drawText(QRectF(dx+4,dy-8,58,16),Qt.AlignLeft,self.nozzle_type)
+            painter.drawText(QRectF(lx,ly,58,16),Qt.AlignLeft,self.nozzle_type)
         if self.isSelected():
             painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.boundingRect())
@@ -1840,11 +1885,21 @@ class AppNozzleItem(QGraphicsItem):
     def contextMenuEvent(self, event):
         m=QMenu()
         lbl_act=m.addAction("Hide Label" if getattr(self,"show_label",True) else "Show Label")
+        nudge_menu=m.addMenu("Nudge Label")
+        nup=nudge_menu.addAction("↑ Up"); ndn=nudge_menu.addAction("↓ Down")
+        nlt=nudge_menu.addAction("← Left"); nrt=nudge_menu.addAction("→ Right")
+        nudge_menu.addSeparator()
+        nrst=nudge_menu.addAction("Reset Position")
         m.addSeparator()
         edit_act=m.addAction("Edit Nozzle…")
         del_act =m.addAction("Delete Nozzle")
         chosen=m.exec_(event.screenPos())
         if chosen==lbl_act: self.show_label=not getattr(self,"show_label",True); self.update()
+        elif chosen==nup: self.label_offset=(self.label_offset[0], self.label_offset[1]-8); self.prepareGeometryChange(); self.update()
+        elif chosen==ndn: self.label_offset=(self.label_offset[0], self.label_offset[1]+8); self.prepareGeometryChange(); self.update()
+        elif chosen==nlt: self.label_offset=(self.label_offset[0]-10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif chosen==nrt: self.label_offset=(self.label_offset[0]+10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif chosen==nrst: self.label_offset=(0.0, 0.0); self.prepareGeometryChange(); self.update()
         elif chosen==edit_act:
             dlg=NozzleEditDialog(self.nozzle_type, self.direction)
             if dlg.exec_()==QDialog.Accepted:
@@ -1872,6 +1927,7 @@ class FreeNozzleItem(QGraphicsItem):
     def __init__(self, nozzle_type="1N", direction="Down ↓"):
         super().__init__()
         self.nozzle_type=nozzle_type; self.direction=direction; self.show_label=True
+        self.label_offset=(0.0, 0.0)
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable); self.setZValue(3)
 
@@ -1879,36 +1935,67 @@ class FreeNozzleItem(QGraphicsItem):
 
     def _vec(self): return NOZZLE_DIRS.get(self.direction,(0,1))
 
+    def _label_pos(self):
+        dx,dy=[v*self.ARROW_LEN for v in self._vec()]
+        if dx < -1:
+            lx, ly = dx - 62, dy - 8
+        elif dx > 1:
+            lx, ly = dx + 4, dy - 8
+        elif dy < -1:
+            lx, ly = dx + 4, dy - 18
+        else:
+            lx, ly = dx + 4, dy + 4
+        return lx + self.label_offset[0], ly + self.label_offset[1]
+
     def boundingRect(self):
         dx,dy=[v*self.ARROW_LEN for v in self._vec()]
-        pad=6; lpad=58
-        return QRectF(min(0,dx)-pad,min(0,dy)-pad,abs(dx)+pad*2+lpad,abs(dy)+pad*2+18)
+        lx, ly = self._label_pos()
+        xs = [0, dx, lx, lx+58]; ys = [0, dy, ly, ly+16]
+        pad=6
+        return QRectF(min(xs)-pad, min(ys)-pad, max(xs)-min(xs)+pad*2, max(ys)-min(ys)+pad*2)
 
     def shape(self):
         p=QPainterPath(); p.addRect(self.boundingRect()); return p
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
-        col = QColor(BUCKEYE_NOZZLE_COLORS.get(self.nozzle_type, PIPE_COL.name()
-                     if hasattr(PIPE_COL,'name') else "#1e64b4"))
+        col = _nozzle_color(self.nozzle_type)
         dx,dy=[v*self.ARROW_LEN for v in self._vec()]
         painter.setBrush(QBrush(col)); painter.setPen(Qt.NoPen)
         painter.drawEllipse(-4,-4,8,8)
         draw_arrow(painter,0,0,dx,dy,col,width=3)
         if _item_show_label(self):
+            lx, ly = self._label_pos()
             painter.setPen(col); painter.setFont(QFont("Arial", 9, QFont.Bold))
-            painter.drawText(QRectF(dx+4,dy-8,58,16),Qt.AlignLeft,self.nozzle_type)
+            painter.drawText(QRectF(lx,ly,58,16),Qt.AlignLeft,self.nozzle_type)
         if self.isSelected():
             painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.boundingRect())
 
     def contextMenuEvent(self, event):
-        result=_context_menu_base(self, event, ["Edit Nozzle…"])
-        if result=="Edit Nozzle…":
+        m=QMenu()
+        lbl_act=m.addAction("Hide Label" if getattr(self,"show_label",True) else "Show Label")
+        nudge_menu=m.addMenu("Nudge Label")
+        nup=nudge_menu.addAction("↑ Up"); ndn=nudge_menu.addAction("↓ Down")
+        nlt=nudge_menu.addAction("← Left"); nrt=nudge_menu.addAction("→ Right")
+        nudge_menu.addSeparator()
+        nrst=nudge_menu.addAction("Reset Position")
+        m.addSeparator()
+        edit_act=m.addAction("Edit Nozzle…")
+        m.addSeparator()
+        del_act=m.addAction("Delete")
+        chosen=m.exec_(event.screenPos())
+        if chosen==lbl_act: self.show_label=not getattr(self,"show_label",True); self.update()
+        elif chosen==nup: self.label_offset=(self.label_offset[0], self.label_offset[1]-8); self.prepareGeometryChange(); self.update()
+        elif chosen==ndn: self.label_offset=(self.label_offset[0], self.label_offset[1]+8); self.prepareGeometryChange(); self.update()
+        elif chosen==nlt: self.label_offset=(self.label_offset[0]-10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif chosen==nrt: self.label_offset=(self.label_offset[0]+10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif chosen==nrst: self.label_offset=(0.0, 0.0); self.prepareGeometryChange(); self.update()
+        elif chosen==edit_act:
             dlg=NozzleEditDialog(self.nozzle_type, self.direction)
             if dlg.exec_()==QDialog.Accepted:
                 self.nozzle_type=dlg.nozzle_type(); self.direction=dlg.direction(); self.update()
-        elif result=="delete":
+        elif chosen==del_act:
             sc=self.scene()
             if sc: sc.removeItem(self)
 
@@ -1967,13 +2054,54 @@ class BottleItem(QGraphicsItem):
             if sc: sc.removeItem(self)
 
 
+CTRL_HEAD_OPTIONS = [
+    ("hvac",    "System connected to HVAC"),
+    ("facp",    "System connected to building FACP"),
+    ("bell",    "System utilizes a local bell"),
+    ("visual",  "System utilizes a local visual indicator"),
+]
+
+class ControlHeadOptionsDialog(QDialog):
+    def __init__(self, current=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Control Head Options")
+        self.setMinimumWidth(340)
+        l = QVBoxLayout(self)
+        l.setSpacing(10); l.setContentsMargins(16,16,16,16)
+        l.addWidget(QLabel("Select system connections:"))
+        self._checks = {}
+        cur = current or {}
+        for key, label in CTRL_HEAD_OPTIONS:
+            cb = QCheckBox(label)
+            cb.setChecked(cur.get(key, False))
+            l.addWidget(cb)
+            self._checks[key] = cb
+        br = QHBoxLayout()
+        ok = QPushButton("OK"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(cancel); br.addWidget(ok)
+        l.addLayout(br)
+
+    def values(self):
+        return {k: cb.isChecked() for k, cb in self._checks.items()}
+
+
 class ControlHeadItem(QGraphicsItem):
     ITEM_TYPE="control_head"
-    def __init__(self):
+    def __init__(self, options=None):
         super().__init__()
         self.show_label=True
+        self.options = options or {}
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable); self.setZValue(1)
+
+    def notes_lines(self):
+        lines = []
+        for key, label in CTRL_HEAD_OPTIONS:
+            if self.options.get(key):
+                lines.append(label)
+        return lines
 
     def boundingRect(self): return QRectF(0,0,52,38)
     def shape(self):
@@ -1992,8 +2120,12 @@ class ControlHeadItem(QGraphicsItem):
             painter.drawRect(self.boundingRect().adjusted(-2,-2,2,2))
 
     def contextMenuEvent(self, event):
-        result=_context_menu_base(self,event)
-        if result=="delete":
+        result=_context_menu_base(self,event,["Edit Options…"])
+        if result=="Edit Options…":
+            dlg = ControlHeadOptionsDialog(self.options)
+            if dlg.exec_() == QDialog.Accepted:
+                self.options = dlg.values()
+        elif result=="delete":
             sc=self.scene()
             if sc: sc.removeItem(self)
 
@@ -2085,6 +2217,8 @@ class GasValveItem(QGraphicsItem):
 
     def __init__(self):
         super().__init__()
+        self.show_label = True
+        self.label_offset = (0.0, 0.0)
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setZValue(3)
@@ -2114,10 +2248,18 @@ class GasValveItem(QGraphicsItem):
         painter.setPen(QPen(QColor("#7a5c00"), 1.5))
         painter.drawLine(QPointF(cx-8, cy), QPointF(cx+8, cy))
         painter.drawLine(QPointF(cx, cy-8), QPointF(cx, cy+8))
-        # Label below the valve
-        painter.setPen(QPen(QColor("#222")))
-        painter.setFont(QFont("Arial", 7, QFont.Bold))
-        painter.drawText(QRectF(0, h+2, w, 12), Qt.AlignHCenter|Qt.AlignTop, "Gas Valve")
+        # Label — stays horizontal regardless of rotation
+        if _item_show_label(self):
+            painter.save()
+            rot = self.rotation()
+            if rot:
+                painter.rotate(-rot)
+            lx = self.label_offset[0]
+            ly = h + 2 + self.label_offset[1]
+            painter.setPen(QPen(QColor("#222")))
+            painter.setFont(QFont("Arial", 7, QFont.Bold))
+            painter.drawText(QRectF(lx - w/2, ly - h/2, w * 2, 12), Qt.AlignHCenter|Qt.AlignTop, "Gas Valve")
+            painter.restore()
         # Selection highlight
         if sel:
             painter.setBrush(Qt.NoBrush)
@@ -2125,15 +2267,28 @@ class GasValveItem(QGraphicsItem):
             painter.drawRect(self.boundingRect().adjusted(1,1,-1,-1))
 
     def contextMenuEvent(self, event):
-        from PyQt5.QtWidgets import QMenu, QAction
+        from PyQt5.QtWidgets import QMenu
         menu = QMenu()
+        lbl_act = menu.addAction("Hide Label" if getattr(self,"show_label",True) else "Show Label")
+        nudge_menu = menu.addMenu("Nudge Label")
+        nup=nudge_menu.addAction("↑ Up"); ndn=nudge_menu.addAction("↓ Down")
+        nlt=nudge_menu.addAction("← Left"); nrt=nudge_menu.addAction("→ Right")
+        nudge_menu.addSeparator()
+        nrst=nudge_menu.addAction("Reset Position")
+        menu.addSeparator()
         r90  = menu.addAction("Rotate 90°")
         r180 = menu.addAction("Rotate 180°")
         r270 = menu.addAction("Rotate 270°")
         menu.addSeparator()
         dele = menu.addAction("Delete")
         act = menu.exec_(event.screenPos())
-        if act == r90:   self.setRotation((self.rotation()+90)%360)
+        if act == lbl_act: self.show_label = not getattr(self,"show_label",True); self.update()
+        elif act==nup: self.label_offset=(self.label_offset[0], self.label_offset[1]-8); self.prepareGeometryChange(); self.update()
+        elif act==ndn: self.label_offset=(self.label_offset[0], self.label_offset[1]+8); self.prepareGeometryChange(); self.update()
+        elif act==nlt: self.label_offset=(self.label_offset[0]-10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif act==nrt: self.label_offset=(self.label_offset[0]+10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif act==nrst: self.label_offset=(0.0, 0.0); self.prepareGeometryChange(); self.update()
+        elif act == r90:   self.setRotation((self.rotation()+90)%360)
         elif act == r180: self.setRotation((self.rotation()+180)%360)
         elif act == r270: self.setRotation((self.rotation()+270)%360)
         elif act == dele:
@@ -2181,31 +2336,40 @@ class DetectorItem(QGraphicsItem):
     def __init__(self, link_type="165 - ML Style"):
         super().__init__()
         self.link_type = link_type
+        self.label_offset = (0.0, 0.0)
+        self.show_label = True
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setZValue(3)
 
+    def _label_pos(self):
+        return -30 + self.label_offset[0], 10 + self.label_offset[1]
+
     def boundingRect(self):
-        return QRectF(-16, -11, 32, 11 + 16)  # body + label space
+        lx, ly = self._label_pos()
+        xs = [-16, 16, lx, lx+60]; ys = [-11, 11, ly, ly+13]
+        return QRectF(min(xs)-2, min(ys)-2, max(xs)-min(xs)+4, max(ys)-min(ys)+4)
 
     def paint(self, painter, option, widget=None):
         sel = self.isSelected()
         W, H = 26, 16   # rounded rect body
-        body_col = QColor("#1a7a2e") if not sel else QColor("#27ae60")
-        # Body — green rounded rectangle
+        body_col = _detector_color(self.link_type)
+        if sel: body_col = body_col.lighter(130)
         painter.setBrush(QBrush(body_col))
-        painter.setPen(QPen(QColor("#0d3d14"), 1.5))
+        painter.setPen(QPen(body_col.darker(160), 1.5))
         painter.drawRoundedRect(QRectF(-W/2, -H/2, W, H), 4, 4)
         # Two white circles side by side inside the rectangle
         painter.setBrush(QBrush(Qt.white))
         painter.setPen(Qt.NoPen)
-        cr = H/2 - 3   # circle radius fits inside the rect
+        cr = H/2 - 3
         for cx in (-W/4, W/4):
             painter.drawEllipse(QPointF(cx, 0), cr, cr)
-        # Label below
-        painter.setPen(QPen(QColor("#111")))
-        painter.setFont(QFont("Arial", 6))
-        painter.drawText(QRectF(-30, H/2+2, 60, 13), Qt.AlignHCenter|Qt.AlignTop, self.link_type)
+        # Label
+        if _item_show_label(self):
+            lx, ly = self._label_pos()
+            painter.setPen(QPen(body_col.darker(120)))
+            painter.setFont(QFont("Arial", 6))
+            painter.drawText(QRectF(lx, ly, 60, 13), Qt.AlignHCenter|Qt.AlignTop, self.link_type)
         # Selection highlight
         if sel:
             painter.setBrush(Qt.NoBrush)
@@ -2215,9 +2379,30 @@ class DetectorItem(QGraphicsItem):
     def contextMenuEvent(self, event):
         from PyQt5.QtWidgets import QMenu
         menu = QMenu()
+        lbl_act = menu.addAction("Hide Label" if getattr(self,"show_label",True) else "Show Label")
+        nudge_menu = menu.addMenu("Nudge Label")
+        nup=nudge_menu.addAction("↑ Up"); ndn=nudge_menu.addAction("↓ Down")
+        nlt=nudge_menu.addAction("← Left"); nrt=nudge_menu.addAction("→ Right")
+        nudge_menu.addSeparator()
+        nrst=nudge_menu.addAction("Reset Position")
+        menu.addSeparator()
+        edit_act = menu.addAction("Edit Link Type…")
+        menu.addSeparator()
         dele = menu.addAction("Delete")
         act = menu.exec_(event.screenPos())
-        if act == dele:
+        if act == lbl_act: self.show_label = not getattr(self,"show_label",True); self.update()
+        elif act==nup: self.label_offset=(self.label_offset[0], self.label_offset[1]-8); self.prepareGeometryChange(); self.update()
+        elif act==ndn: self.label_offset=(self.label_offset[0], self.label_offset[1]+8); self.prepareGeometryChange(); self.update()
+        elif act==nlt: self.label_offset=(self.label_offset[0]-10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif act==nrt: self.label_offset=(self.label_offset[0]+10, self.label_offset[1]); self.prepareGeometryChange(); self.update()
+        elif act==nrst: self.label_offset=(0.0, 0.0); self.prepareGeometryChange(); self.update()
+        elif act == edit_act:
+            dlg = LinkTypeDialog()
+            idx = dlg._cb.findText(self.link_type)
+            if idx >= 0: dlg._cb.setCurrentIndex(idx)
+            if dlg.exec_() == QDialog.Accepted:
+                self.link_type = dlg.link_type(); self.update()
+        elif act == dele:
             sc = self.scene()
             if sc: sc.removeItem(self)
 
@@ -2445,18 +2630,31 @@ class SuppressionScene(QGraphicsScene):
         if nq == 0:
             return
 
-        if   nq == 1: offsets = [0.0]
-        elif nq == 2: offsets = [-appl.w_px*0.22,  appl.w_px*0.22]
-        elif nq == 3: offsets = [-appl.w_px*0.30, 0.0, appl.w_px*0.30]
-        elif nq == 4: offsets = [-appl.w_px*0.34, -appl.w_px*0.11,
-                                   appl.w_px*0.11,  appl.w_px*0.34]
-        else:         offsets = [appl.w_px*(i/(nq-1)-0.5)*0.70 for i in range(nq)]
+        base_defn = APPLIANCE_DEFS.get(appl.key, {})
+        nz_layout = base_defn.get("nz_layout")
+        if nz_layout == "sides":
+            mid_y = appl.leg_px + appl.box_h_px * 0.5
+            nz_l = AppNozzleItem(nt, "Right →")
+            nz_l.setParentItem(appl)
+            nz_l.setPos(-20, mid_y)
+            appl.app_nozzles.append(nz_l)
+            nz_r = AppNozzleItem(nt, "Left ←")
+            nz_r.setParentItem(appl)
+            nz_r.setPos(appl.w_px + 20, mid_y)
+            appl.app_nozzles.append(nz_r)
+        else:
+            if   nq == 1: offsets = [0.0]
+            elif nq == 2: offsets = [-appl.w_px*0.22,  appl.w_px*0.22]
+            elif nq == 3: offsets = [-appl.w_px*0.30, 0.0, appl.w_px*0.30]
+            elif nq == 4: offsets = [-appl.w_px*0.34, -appl.w_px*0.11,
+                                       appl.w_px*0.11,  appl.w_px*0.34]
+            else:         offsets = [appl.w_px*(i/(nq-1)-0.5)*0.70 for i in range(nq)]
 
-        for off in offsets:
-            nz = AppNozzleItem(nt, "Down ↓")
-            nz.setParentItem(appl)
-            nz.setPos(appl.w_px*0.5 + off, nz_local_y)
-            appl.app_nozzles.append(nz)
+            for off in offsets:
+                nz = AppNozzleItem(nt, "Down ↓")
+                nz.setParentItem(appl)
+                nz.setPos(appl.w_px*0.5 + off, nz_local_y)
+                appl.app_nozzles.append(nz)
         appl._nozzles_placed = True
 
     def set_mode_place(self,item_type,spec=None):
@@ -2501,6 +2699,7 @@ class SuppressionScene(QGraphicsScene):
                 nz=AppNozzleItem(nd.get("nozzle_type", hood_nz["duct"]), nd.get("direction","Up ↑"))
                 nz.setParentItem(duct)
                 nz.setPos(nd["lx"], nd["ly"])
+                if "lbl_off" in nd: nz.label_offset=tuple(nd["lbl_off"])
                 duct.duct_nozzles.append(nz)
         else:
             for i in range(2):
@@ -2532,17 +2731,30 @@ class SuppressionScene(QGraphicsScene):
             hood_nz_scene = (hs[0].scenePos().y() + hs[0].h_px - 8) if hs else item.scenePos().y() - 120
             nz_local_y = hood_nz_scene - item.scenePos().y()   # negative = above item origin
             defn=effective_defn(spec["key"], self._active_mfr); nq=defn["nq"]; nt=defn["nt"] or "1N"
-            # Spread nozzles evenly across appliance width for any count
-            if   nq==1: offsets=[0.0]
-            elif nq==2: offsets=[-item.w_px*0.22, item.w_px*0.22]
-            elif nq==3: offsets=[-item.w_px*0.30, 0.0, item.w_px*0.30]
-            elif nq==4: offsets=[-item.w_px*0.34,-item.w_px*0.11, item.w_px*0.11, item.w_px*0.34]
-            else:       offsets=[item.w_px*(i/(nq-1)-0.5)*0.70 for i in range(nq)]
-            for off in offsets:
-                nz=AppNozzleItem(nt,"Down ↓")
-                nz.setParentItem(item)                          # child — follows appliance
-                nz.setPos(item.w_px*0.5 + off, nz_local_y)    # local coords
-                item.app_nozzles.append(nz)
+            base_defn = APPLIANCE_DEFS.get(spec["key"], {})
+            nz_layout = base_defn.get("nz_layout")
+            if nz_layout == "sides":
+                mid_y = item.leg_px + item.box_h_px * 0.5
+                nz_l = AppNozzleItem(nt, "Right →")
+                nz_l.setParentItem(item)
+                nz_l.setPos(-20, mid_y)
+                item.app_nozzles.append(nz_l)
+                nz_r = AppNozzleItem(nt, "Left ←")
+                nz_r.setParentItem(item)
+                nz_r.setPos(item.w_px + 20, mid_y)
+                item.app_nozzles.append(nz_r)
+            else:
+                # Spread nozzles evenly across appliance width for any count
+                if   nq==1: offsets=[0.0]
+                elif nq==2: offsets=[-item.w_px*0.22, item.w_px*0.22]
+                elif nq==3: offsets=[-item.w_px*0.30, 0.0, item.w_px*0.30]
+                elif nq==4: offsets=[-item.w_px*0.34,-item.w_px*0.11, item.w_px*0.11, item.w_px*0.34]
+                else:       offsets=[item.w_px*(i/(nq-1)-0.5)*0.70 for i in range(nq)]
+                for off in offsets:
+                    nz=AppNozzleItem(nt,"Down ↓")
+                    nz.setParentItem(item)
+                    nz.setPos(item.w_px*0.5 + off, nz_local_y)
+                    item.app_nozzles.append(nz)
             item._nozzles_placed = True
         elif t=="free_nozzle":
             item=FreeNozzleItem(spec.get("nozzle_type","1N"),spec.get("direction","Down ↓"))
@@ -2552,7 +2764,7 @@ class SuppressionScene(QGraphicsScene):
                             max_flow=spec.get("max_flow"), mfr_key=spec.get("mfr_key","kidde"))
             item.setPos(pt)
         elif t=="control_head":
-            item=ControlHeadItem(); item.setPos(pt)
+            item=ControlHeadItem(options=spec.get("options")); item.setPos(pt)
         elif t=="pull_station":
             item=PullStationItem(); item.setPos(pt)
         elif t=="alarm_bell":
@@ -2651,6 +2863,10 @@ class SuppressionScene(QGraphicsScene):
                 self._pipe_start=None; self.update()
             else:
                 self.set_mode_select()
+        elif event.key()==Qt.Key_A and event.modifiers()==Qt.ControlModifier:
+            for item in self.items():
+                if getattr(item,"ITEM_TYPE","") not in ("","pipe_overlay") and not item.parentItem():
+                    item.setSelected(True)
         elif event.key()==Qt.Key_Delete:
             for item in list(self.selectedItems()):
                 it=getattr(item,"ITEM_TYPE","")
@@ -2733,12 +2949,19 @@ class SuppressionScene(QGraphicsScene):
         for item in self.items():
             t = getattr(item, "ITEM_TYPE", "")
             if t == "hood":
+                pnozzles = []
+                for nz in getattr(item,"plenum_nozzles",[]):
+                    pnozzles.append({"nozzle_type":nz.nozzle_type,"direction":nz.direction,
+                                     "lx":nz.pos().x(),"ly":nz.pos().y(),
+                                     "lbl_off":list(getattr(nz,"label_offset",(0,0)))})
                 out.append({"type":"hood","x":item.x(),"y":item.y(),
                              "w_in":item.w_in,"d_in":item.d_in,"label":item.label,
-                             "zone":getattr(item,"zone","Zone 1")})
+                             "zone":getattr(item,"zone","Zone 1"),
+                             "nozzles":pnozzles})
             elif t == "duct":
                 nozzles=[{"nozzle_type":nz.nozzle_type,"direction":nz.direction,
-                          "lx":nz.pos().x(),"ly":nz.pos().y()}
+                          "lx":nz.pos().x(),"ly":nz.pos().y(),
+                          "lbl_off":list(getattr(nz,"label_offset",(0,0)))}
                          for nz in getattr(item,"duct_nozzles",[])]
                 out.append({"type":"duct","x":item.x(),"y":item.y(),
                              "w_in":item.w_in,"h_in":item.h_in,"nozzles":nozzles})
@@ -2747,7 +2970,8 @@ class SuppressionScene(QGraphicsScene):
                 for nz in getattr(item,"app_nozzles",[]):
                     nozzles.append({"nozzle_type":nz.nozzle_type,
                                     "direction":nz.direction,
-                                    "lx":nz.pos().x(),"ly":nz.pos().y()})
+                                    "lx":nz.pos().x(),"ly":nz.pos().y(),
+                                    "lbl_off":list(getattr(nz,"label_offset",(0,0)))})
                 out.append({"type":"appliance","key":item.key,
                              "w_in":item.w_in,"d_in":item.d_in,"h_in":item.h_in,
                              "name":item.custom_name,
@@ -2756,22 +2980,27 @@ class SuppressionScene(QGraphicsScene):
                              "nozzles":nozzles})
             elif t == "free_nozzle":
                 out.append({"type":"free_nozzle","x":item.x(),"y":item.y(),
-                             "nozzle_type":item.nozzle_type,"direction":item.direction})
+                             "nozzle_type":item.nozzle_type,"direction":item.direction,
+                             "lbl_off":list(getattr(item,"label_offset",(0,0)))})
             elif t == "bottle":
                 out.append({"type":"bottle","x":item.x(),"y":item.y(),
                              "gal":item.gal,"max_flow":item.max_flow,
                              "mfr_key":item.mfr_key,"label":item.label})
             elif t == "control_head":
-                out.append({"type":"control_head","x":item.x(),"y":item.y()})
+                out.append({"type":"control_head","x":item.x(),"y":item.y(),
+                             "options":item.options})
             elif t == "pull_station":
                 out.append({"type":"pull_station","x":item.x(),"y":item.y()})
             elif t == "alarm_bell":
                 out.append({"type":"alarm_bell","x":item.x(),"y":item.y()})
             elif t == "gas_valve":
                 out.append({"type":"gas_valve","x":item.x(),"y":item.y(),
-                             "rotation":item.rotation()})
+                             "rotation":item.rotation(),
+                             "lbl_off":list(getattr(item,"label_offset",(0,0)))})
             elif t == "detector":
-                out.append({"type":"detector","x":item.x(),"y":item.y(),"link_type":getattr(item,"link_type","165 - ML Style")})
+                out.append({"type":"detector","x":item.x(),"y":item.y(),
+                             "link_type":getattr(item,"link_type","165 - ML Style"),
+                             "lbl_off":list(getattr(item,"label_offset",(0,0)))})
             elif t == "pipe_segment":
                 out.append({"type":"pipe_segment",
                              "x1":item._p1.x(),"y1":item._p1.y(),
@@ -2792,6 +3021,23 @@ class SuppressionScene(QGraphicsScene):
             if t == "hood":
                 item = HoodItem(d["w_in"], d["d_in"], d.get("label","Hood"), d.get("zone","Zone 1"))
                 item.setPos(d["x"], d["y"]); self.addItem(item)
+                saved_pnz = d.get("nozzles")
+                if saved_pnz:
+                    for nz_d in saved_pnz:
+                        nz = AppNozzleItem(nz_d["nozzle_type"], nz_d["direction"])
+                        nz.setParentItem(item)
+                        nz.setPos(nz_d["lx"], nz_d["ly"])
+                        if "lbl_off" in nz_d: nz.label_offset=tuple(nz_d["lbl_off"])
+                        item.plenum_nozzles.append(nz)
+                else:
+                    hood_nz = MFR_HOOD_NOZZLE.get(self._active_mfr, MFR_HOOD_NOZZLE["kidde"])
+                    n_nz=item.flow_points()
+                    spacing=item.w_px/(n_nz+1)
+                    for i in range(n_nz):
+                        nz=AppNozzleItem(hood_nz["plenum"],"Right →")
+                        nz.setParentItem(item)
+                        nz.setPos(spacing*(i+1), item.h_px*0.35)
+                        item.plenum_nozzles.append(nz)
             elif t == "duct":
                 item = DuctItem(d["w_in"], d["h_in"])
                 item.setPos(d["x"], d["y"]); self.addItem(item)
@@ -2806,11 +3052,13 @@ class SuppressionScene(QGraphicsScene):
                     nz = AppNozzleItem(nz_d["nozzle_type"], nz_d["direction"])
                     nz.setParentItem(item)
                     nz.setPos(nz_d["lx"], nz_d["ly"])
+                    if "lbl_off" in nz_d: nz.label_offset=tuple(nz_d["lbl_off"])
                     item.app_nozzles.append(nz)
                 if d.get("nozzles") is not None:
                     item._nozzles_placed = True
             elif t == "free_nozzle":
                 item = FreeNozzleItem(d["nozzle_type"], d["direction"])
+                if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
                 item.setPos(d["x"], d["y"]); self.addItem(item)
             elif t == "bottle":
                 item = BottleItem(d.get("gal",4.0),
@@ -2819,16 +3067,19 @@ class SuppressionScene(QGraphicsScene):
                                   mfr_key=d.get("mfr_key","kidde"))
                 item.setPos(d["x"], d["y"]); self.addItem(item)
             elif t == "control_head":
-                item = ControlHeadItem(); item.setPos(d["x"],d["y"]); self.addItem(item)
+                item = ControlHeadItem(options=d.get("options")); item.setPos(d["x"],d["y"]); self.addItem(item)
             elif t == "pull_station":
                 item = PullStationItem(); item.setPos(d["x"],d["y"]); self.addItem(item)
             elif t == "alarm_bell":
                 item = AlarmBellItem(); item.setPos(d["x"],d["y"]); self.addItem(item)
             elif t == "gas_valve":
                 item = GasValveItem(); item.setPos(d["x"],d["y"])
-                item.setRotation(d.get("rotation",0)); self.addItem(item)
+                item.setRotation(d.get("rotation",0))
+                if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
+                self.addItem(item)
             elif t == "detector":
                 item = DetectorItem(link_type=d.get("link_type","165 - ML Style"))
+                if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
                 item.setPos(d["x"],d["y"]); self.addItem(item)
             elif t == "pipe_segment":
                 item = PipeSegmentItem(
@@ -3676,7 +3927,7 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
         import datetime as _dt
         from PyQt5.QtCore import Qt as _Qt, QRectF as _QRectF
         DRAW_TYPES=("hood","duct","appliance","app_nozzle","free_nozzle",
-                    "bottle","control_head","pull_station")
+                    "bottle","control_head","pull_station","detector")
 
         def _item_full_rect(item):
             sr=item.sceneBoundingRect()
@@ -3711,9 +3962,6 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
         rev=meta.get("revision","A") or "A"
         rev_d=meta.get("rev_date","") or ""
         tmp_files=[]
-
-        NOZZLE_COLORS={"1N":(0.8,0.2,0.1),"1W":(0.1,0.4,0.8),"2N":(0.5,0.1,0.5),
-                       "2W":(0.1,0.6,0.3),"3N":(0.8,0.5,0.0),"3W":(0.2,0.2,0.7)}
 
         for pg_idx,(sys_name,scene,items) in enumerate(active):
             # Bounding rect of scene content
@@ -3816,35 +4064,61 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
 
             # Legend
             nozzle_types_used=[]; seen_nt=set()
+            det_types_used=[]; seen_dt=set()
             for it in scene.items():
                 nt=getattr(it,"nozzle_type","")
                 if nt and nt not in seen_nt:
                     seen_nt.add(nt); nozzle_types_used.append(nt)
-            if nozzle_types_used and sy2<H-FOOTER_H-30:
+                if getattr(it,"ITEM_TYPE","")=="detector":
+                    lt=it.link_type
+                    if lt not in seen_dt:
+                        seen_dt.add(lt); det_types_used.append(lt)
+            has_legend = nozzle_types_used or det_types_used
+            if has_legend and sy2<H-FOOTER_H-30:
                 sy2+=6
                 pg.draw_line((sx2,sy2),(W-BORDER,sy2),color=dark,width=0.5); sy2+=8
                 pg.insert_text((sx2,sy2),"LEGEND",fontsize=8,color=dark,fontname="helv"); sy2+=11
                 for nt in nozzle_types_used:
                     if sy2>H-FOOTER_H-10: break
-                    col=NOZZLE_COLORS.get(nt,(0.2,0.2,0.2))
+                    col=_nozzle_color_rgb(nt)
                     pg.draw_circle((sx2+4,sy2-3),4,color=col,fill=col)
                     pg.insert_text((sx2+12,sy2),f"Nozzle {nt}",fontsize=7,color=dark,fontname="helv"); sy2+=10
+                for lt in det_types_used:
+                    if sy2>H-FOOTER_H-10: break
+                    col=_detector_color_rgb(lt)
+                    # Draw mini detector symbol: colored rounded rect with two white circles
+                    lx0=sx2; ly0=sy2-6; lw=12; lh=8
+                    pg.draw_rect(fitz.Rect(lx0,ly0,lx0+lw,ly0+lh),color=col,fill=col)
+                    cr=2
+                    pg.draw_circle((lx0+lw*0.3, ly0+lh/2), cr, color=(1,1,1), fill=(1,1,1))
+                    pg.draw_circle((lx0+lw*0.7, ly0+lh/2), cr, color=(1,1,1), fill=(1,1,1))
+                    pg.insert_text((sx2+16,sy2),f"{lt}",fontsize=7,color=dark,fontname="helv"); sy2+=10
 
             # Notes (only on first page)
             if pg_idx==0:
-                notes_text=(meta.get("notes","") or "").strip()
-                if notes_text and sy2<H-FOOTER_H-30:
+                # Gather control head connection notes
+                ctrl_notes = []
+                for it in scene.items():
+                    if getattr(it,"ITEM_TYPE","")=="control_head":
+                        ctrl_notes.extend(it.notes_lines())
+                user_notes = (meta.get("notes","") or "").strip()
+                all_notes = "\n".join(ctrl_notes)
+                if user_notes:
+                    all_notes = (all_notes + "\n" + user_notes) if all_notes else user_notes
+                all_notes = all_notes.strip()
+                if all_notes and sy2<H-FOOTER_H-30:
                     sy2+=6
                     pg.draw_line((sx2,sy2),(W-BORDER,sy2),color=dark,width=0.5); sy2+=8
                     pg.insert_text((sx2,sy2),"NOTES",fontsize=8,color=dark,fontname="helv"); sy2+=11
-                    words=notes_text.split(); line=""
-                    for w in words:
-                        if len(line)+len(w)+1>24:
-                            if sy2>H-FOOTER_H-10: break
-                            pg.insert_text((sx2,sy2),line.strip(),fontsize=7,color=(0.2,0.2,0.2),fontname="helv"); sy2+=10; line=""
-                        line+=w+" "
-                    if line.strip() and sy2<=H-FOOTER_H-10:
-                        pg.insert_text((sx2,sy2),line.strip(),fontsize=7,color=(0.2,0.2,0.2),fontname="helv")
+                    for note_line in all_notes.split("\n"):
+                        words=note_line.split(); line=""
+                        for w in words:
+                            if len(line)+len(w)+1>42:
+                                if sy2>H-FOOTER_H-10: break
+                                pg.insert_text((sx2,sy2),line.strip(),fontsize=7,color=(0.2,0.2,0.2),fontname="helv"); sy2+=10; line=""
+                            line+=w+" "
+                        if line.strip() and sy2<=H-FOOTER_H-10:
+                            pg.insert_text((sx2,sy2),line.strip(),fontsize=7,color=(0.2,0.2,0.2),fontname="helv"); sy2+=10
 
             # Company logo (bottom-right of sidebar, above footer)
             if pg_idx==0:
@@ -4265,7 +4539,10 @@ class SuppressionDesigner(QDialog):
                 "mfr_key":mk, "label":tank["model"]})
             self._mode_lbl.setText(f"  Placing {MANUFACTURERS[mk]['name']} {tank['model']} — click canvas  |  Esc=cancel")
         elif key=="control_head":
-            self._scene.set_mode_place("control_head")
+            dlg = ControlHeadOptionsDialog(parent=self)
+            if dlg.exec_() != QDialog.Accepted:
+                self._palette.clear_all(); return
+            self._scene.set_mode_place("control_head", {"options": dlg.values()})
             self._mode_lbl.setText("  Placing control head — click canvas  |  Esc=cancel")
         elif key=="pull_station":
             self._scene.set_mode_place("pull_station")
@@ -4428,6 +4705,16 @@ class SuppressionDesigner(QDialog):
             return self._save_project()
         return ans == QMessageBox.Discard
 
+    def reject(self):
+        if self._check_unsaved():
+            super().reject()
+
+    def closeEvent(self, event):
+        if self._check_unsaved():
+            event.accept()
+        else:
+            event.ignore()
+
     def _edit_project_info(self):
         dlg = ProjectInfoDialog(self._project_meta, self)
         if dlg.exec_() == QDialog.Accepted:
@@ -4534,6 +4821,26 @@ class SuppressionDesigner(QDialog):
         has_content=any(s["scene"].hoods() or s["scene"].appliances() for s in self._systems)
         if not has_content:
             QMessageBox.warning(self,"Nothing to export","Add a hood and appliances first."); return
+        customer = (self._project_meta.get("customer","") or "").strip()
+        location = (self._project_meta.get("location","") or "").strip()
+        if not customer or not location:
+            missing = []
+            if not customer: missing.append("Customer Name")
+            if not location: missing.append("Location")
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Missing Project Info")
+            msg.setIcon(QMessageBox.Warning)
+            msg.setText(f"The following fields are empty:\n• " + "\n• ".join(missing) +
+                        "\n\nThe export will be missing this information.")
+            enter_btn = msg.addButton("Enter Info", QMessageBox.AcceptRole)
+            msg.addButton("Continue Without", QMessageBox.RejectRole)
+            msg.exec_()
+            if msg.clickedButton() == enter_btn:
+                self._edit_project_info()
+                customer = (self._project_meta.get("customer","") or "").strip()
+                location = (self._project_meta.get("location","") or "").strip()
+                if not customer or not location:
+                    return
         pdf_dir = _submittals_dir()
         default_pdf = f"{self.project_name or 'Suppression'}_Submittal.pdf"
         name, ok = QInputDialog.getText(self, "Save Submittal PDF", "Filename:", text=default_pdf)
