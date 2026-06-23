@@ -3,7 +3,7 @@
 ; Then open this file in Inno Setup and click Build > Compile
 
 #define MyAppName "DFP TakeoffPro"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "Defense Fire Protection"
 #define MyAppURL "https://defensefirepro.com"
 #define MyAppExeName "DFP TakeoffPro.exe"

@@ -2534,12 +2534,15 @@ def _make_splash(app):
 
 def _show_license_dialog(parent=None):
     """Show activation dialog. Returns True if licensed."""
-    from license import check_activation, activate
-    from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton, QHBoxLayout
+    from license import check_activation, activate, get_machine_id
+    from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QLabel, QLineEdit,
+                                  QPushButton, QHBoxLayout, QApplication)
 
     ok, msg = check_activation()
     if ok:
         return True
+
+    machine_id = get_machine_id()
 
     dlg = QDialog(parent)
     dlg.setWindowTitle("DFP TakeoffPro - Activation Required")
@@ -2554,9 +2557,24 @@ def _show_license_dialog(parent=None):
     msg_lbl = QLabel(msg); msg_lbl.setWordWrap(True); msg_lbl.setAlignment(Qt.AlignCenter)
     layout.addWidget(msg_lbl)
 
-    layout.addWidget(QLabel("Enter your license key:"))
-    key_edit = QLineEdit(); key_edit.setPlaceholderText("DFPTP-XXXXX-XXXXX-XXXXX-XXXXX")
-    key_edit.setStyleSheet("font-family:monospace;font-size:14px;padding:6px;letter-spacing:2px;")
+    layout.addWidget(QLabel("<b>Your Machine ID:</b>"))
+    mid_edit = QLineEdit(machine_id); mid_edit.setReadOnly(True)
+    mid_edit.setStyleSheet("background:#f0f0f0;padding:6px;font-family:Consolas;font-size:13px;")
+    layout.addWidget(mid_edit)
+
+    copy_btn = QPushButton("Copy Machine ID")
+    copy_btn.setStyleSheet("padding:4px 12px;")
+    copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(machine_id))
+    layout.addWidget(copy_btn)
+
+    layout.addWidget(QLabel(
+        "Send this Machine ID to your administrator to receive a license key.\n"
+        "Contact: kevinh@defensefirepro.com"
+    ))
+
+    layout.addWidget(QLabel("<b>License Key:</b>"))
+    key_edit = QLineEdit(); key_edit.setPlaceholderText("DFP-XXXXXX-XXXXXX-XXXXXX-XXXXXX")
+    key_edit.setStyleSheet("font-family:Consolas;font-size:13px;padding:6px;")
     layout.addWidget(key_edit)
 
     status_lbl = QLabel(""); status_lbl.setAlignment(Qt.AlignCenter)
