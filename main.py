@@ -2008,10 +2008,21 @@ class MainWindow(QMainWindow):
             tb.addAction(act)
             self._cov_toggles[ctype] = act
 
+        # Help
+        tb.addSeparator()
+        a = QAction("Help", self)
+        a.triggered.connect(self._show_help)
+        tb.addAction(a)
+
         # Wire up scale-measurement callback
         self.canvas.scale_measured.connect(self._on_scale_measured)
 
     # ── Design-mode handlers ──────────────────────────────────────────────────
+
+    def _show_help(self):
+        from help_system import HelpDialog, TAKEOFF_MANUAL
+        dlg = HelpDialog(TAKEOFF_MANUAL, "Takeoff", self)
+        dlg.exec_()
 
     def _toggle_design_mode(self, checked):
         self.canvas.set_design_mode(checked)

@@ -2375,7 +2375,9 @@ class DetectorItem(QGraphicsItem):
             lx, ly = self._label_pos()
             painter.setPen(QPen(body_col.darker(120)))
             painter.setFont(QFont("Arial", 6))
-            short_lbl = self.link_type.split()[0].strip() if self.link_type else ""
+            import re
+            nums = re.findall(r'\d+', self.link_type or "")
+            short_lbl = nums[0] if nums else self.link_type
             painter.drawText(QRectF(lx, ly, 60, 13), Qt.AlignHCenter|Qt.AlignTop, short_lbl)
         # Selection highlight
         if sel:
@@ -4170,6 +4172,7 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
             pg.draw_line((sx2,sy2),(W-BORDER,sy2),color=dark,width=0.5); sy2+=8
             pg.insert_text((sx2,sy2),"APPLIANCE / NOZZLE LIST",fontsize=8,color=dark,fontname="helv"); sy2+=12
             for a in scene.appliances():
+                if a.key == "table": continue
                 if sy2>H-FOOTER_H-10: break
                 ed=effective_defn(a.key,scene.active_mfr)
                 pg.insert_text((sx2,sy2),f"{a.custom_name or a.defn['short']}",fontsize=7,color=dark,fontname="helv")
@@ -4365,10 +4368,6 @@ class ProjectInfoDialog(QDialog):
         rev_row.addWidget(self._rev_date); rev_row.addStretch()
         _row("Revision:", rev_widget)
 
-        self._tank = QLineEdit(m.get("tank",""))
-        self._tank.setPlaceholderText("e.g. 2× Ansul R-102 1.5 gal")
-        _row("Tank / Cylinder:", self._tank)
-
         self._notes = QTextEdit(m.get("notes",""))
         self._notes.setPlaceholderText("Any additional notes…")
         self._notes.setFixedHeight(72)
@@ -4393,7 +4392,6 @@ class ProjectInfoDialog(QDialog):
             "revision":   self._revision.text().strip() or "A",
             "rev_date":   self._rev_date.text().strip(),
             "notes":      self._notes.toPlainText().strip(),
-            "tank":       self._tank.text().strip(),
         }
 
 
@@ -4488,6 +4486,7 @@ class SuppressionDesigner(QDialog):
             tbl.addWidget(_btn("Print",     self._print_pdf, color="#7d3c98"))
         tbl.addWidget(_sep())
         tbl.addWidget(_btn("Settings",      self._open_settings))
+        tbl.addWidget(_btn("Help",          self._show_help, color="#2c3e50"))
         tbl.addStretch()
         self._mode_lbl=QLabel("  Select  ·  Scroll=zoom  ·  Middle-drag or Ctrl+drag=pan  ·  Del=delete  ·  Right-click=options  ·  Esc=cancel")
         self._mode_lbl.setStyleSheet("color:#888;font-size:10px;"); tbl.addWidget(self._mode_lbl)
@@ -4969,6 +4968,11 @@ class SuppressionDesigner(QDialog):
             dlg.exec_()
         except Exception:
             _log_error("_open_settings", None)
+
+    def _show_help(self):
+        from help_system import HelpDialog, SUPPRESSION_MANUAL
+        dlg = HelpDialog(SUPPRESSION_MANUAL, "Suppression Designer", self)
+        dlg.exec_()
 
     def _export(self):
         has_content=any(s["scene"].hoods() or s["scene"].appliances() for s in self._systems)
