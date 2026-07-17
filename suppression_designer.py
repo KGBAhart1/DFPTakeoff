@@ -2,7 +2,7 @@
 DFP TakeoffPro – Kitchen Suppression Designer (3D View) v3
 ⚠ Verify ALL flow numbers against current Kidde/Badger design manuals.
 """
-import math, os, json, shutil, datetime, sys, traceback
+import math, os, json, re, shutil, datetime, sys, traceback
 
 try:
     from version import APP_VERSION
@@ -4912,8 +4912,9 @@ class SuppressionDesigner(QDialog):
 
     def _save_project_as(self):
         meta  = self._project_meta
-        cust  = meta.get("customer","Project").replace(" ","_")
-        job   = meta.get("job_number","")
+        _bad  = re.compile(r'[<>:"/\\|?*\s]+')
+        cust  = _bad.sub("_", meta.get("customer", "Project")).strip("_") or "Project"
+        job   = _bad.sub("_", meta.get("job_number", "")).strip("_")
         default = f"{cust}{'_'+job if job else ''}.dfp"
         proj_dir = _projects_dir()
         name, ok = QInputDialog.getText(self, "Save Project As", "Filename:", text=default)
