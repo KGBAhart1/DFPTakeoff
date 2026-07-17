@@ -77,7 +77,7 @@ ZONE_BORDER_COL = {
 
 # Coverage limits (§4-5.1)
 MAX_WORK_VOL_FT3   = 1260.0   # ft³ per TF nozzle (§4-5.1.1)
-MAX_WORK_HEIGHT_FT = 10.0     # ft — overhead TF nozzle system
+MAX_WORK_HEIGHT_FT = 24.0     # ft — per DIOM §4-5.1.1 Table 4-2
 MAX_DUCT_LEN_FT    = 28.0     # ft per DP nozzle (§4-5.1.3)
 MAX_DUCT_DIA_IN    = 48.0     # inches — round duct
 MAX_DUCT_PERIM_IN  = 150.8    # inches — rectangular duct perimeter
@@ -155,6 +155,58 @@ def _nozzle_grid(count):
     return rows, cols
 
 
+# DIOM Table 4-2 — Module dimensions per booth height
+# key = booth height (ft, ceiling to 12); value = [(side2_ft, side1_ft), ...]
+# side2 = column header (smaller), side1 = table value (larger)
+# Heights 0-12 use the 12-ft row; heights above 24 ft are not permitted.
+_TABLE_4_2 = {
+    12: [(7.5,14.00),(8.0,13.10),(8.5,12.30),(9.0,11.60),(9.5,11.00),(10.0,10.50)],
+    13: [(7.5,12.90),(8.0,12.10),(8.5,11.40),(9.0,10.70),(9.5,10.20),(10.0, 9.60)],
+    14: [(7.5,12.00),(8.0,11.20),(8.5,10.50),(9.0,10.00),(9.5, 9.40),(10.0, 9.00)],
+    15: [(7.5,11.20),(8.0,10.50),(8.5, 9.80),(9.0, 9.30),(9.5, 8.80),(10.0, 8.40)],
+    16: [(7.5,10.50),(8.0, 9.80),(8.5, 9.20),(9.0, 8.70),(9.5, 8.20),(10.0, 7.80)],
+    17: [(7.5, 9.80),(8.0, 9.20),(8.5, 8.70),(9.0, 8.20),(9.5, 7.80),(10.0, 7.40)],
+    18: [(7.5, 9.30),(8.0, 8.75),(8.5, 8.20),(9.0, 7.70),(9.5, 7.30),(10.0, 7.00)],
+    19: [(7.5, 8.80),(8.0, 8.30),(8.5, 7.80),(9.0, 7.30),(9.5, 6.90),(10.0, 6.60)],
+    20: [(7.5, 8.40),(8.0, 7.80),(8.5, 7.40),(9.0, 7.00),(9.5, 6.60),(10.0, 6.30)],
+    21: [(7.5, 8.00),(8.0, 7.50),(8.5, 7.00),(9.0, 6.70),(9.5, 6.30),(10.0, 6.00)],
+    22: [(7.5, 7.60),(8.0, 7.10),(8.5, 6.70),(9.0, 6.30),(9.5, 6.00),(10.0, 5.70)],
+    23: [(7.5, 7.30),(8.0, 6.80),(8.5, 6.40),(9.0, 6.00),(9.5, 5.70),(10.0, 5.40)],
+    24: [(7.5, 7.00),(8.0, 6.50),(8.5, 6.10),(9.0, 5.80),(9.5, 5.50),(10.0, 5.25)],
+}
+
+
+def _work_area_modules(L: float, W: float, H: float):
+    """
+    Determine the minimum nozzle/module count for a work area per DIOM Table 4-2.
+
+    Returns (total_nozzles, n_along_L, n_along_W, mod_L_ft, mod_W_ft).
+    Both the area constraint (Table 4-2) and the volume constraint (1,260 ft³)
+    must be satisfied; this function satisfies both simultaneously.
+    """
+    H_key = min(24, max(12, math.ceil(H)))
+    entries = _TABLE_4_2[H_key]
+
+    best = None
+    for s2, s1 in entries:
+        # Try each table pair in both orientations (s1 along L or along W)
+        for (dim_L, dim_W) in [(s1, s2), (s2, s1)]:
+            nL = max(1, math.ceil(L / dim_L))
+            nW = max(1, math.ceil(W / dim_W))
+            # Honour volume constraint too
+            while (L / nL) * (W / nW) * H > MAX_WORK_VOL_FT3 + 0.01:
+                if (L / nL) >= (W / nW):
+                    nL += 1
+                else:
+                    nW += 1
+            total = nL * nW
+            if best is None or total < best[0]:
+                best = (total, nL, nW, L / nL, W / nW)
+
+    return best if best else (max(1, math.ceil(L * W * H / MAX_WORK_VOL_FT3)), 1,
+                              max(1, math.ceil(L * W * H / MAX_WORK_VOL_FT3)), L, W / 1)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Data model
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -189,19 +241,30 @@ class ZoneData:
         if self.nozzle_override is not None:
             return self.nozzle_override
         if self.zone_type == ZONE_WORK:
-            return max(1, math.ceil(self.volume / MAX_WORK_VOL_FT3))
+            return _work_area_modules(self.length, self.width, self.height)[0]
         elif self.zone_type == ZONE_DUCT:
             return max(1, math.ceil(self.length / MAX_DUCT_LEN_FT))
         else:  # Plenum — 1 nozzle covers 15ft L × 15ft W per §4-5.1.4
             area = self.length * self.width
             return max(1, math.ceil(area / (15.0 * 15.0)))
 
+    @property
+    def module_info(self):
+        """Return (total, n_along_L, n_along_W, mod_L_ft, mod_W_ft) for ZONE_WORK."""
+        if self.zone_type != ZONE_WORK:
+            return None
+        if self.nozzle_override is not None:
+            nc = self.nozzle_override
+            rows, cols = _nozzle_grid(nc)
+            return (nc, cols, rows, self.length / max(1, cols), self.width / max(1, rows))
+        return _work_area_modules(self.length, self.width, self.height)
+
     def warnings(self):
         """Return list of warning strings for this zone."""
         w = []
         if self.zone_type == ZONE_WORK:
-            if self.height > MAX_WORK_HEIGHT_FT:
-                w.append(f"[{self.label}] Height {self.height:.1f} ft exceeds 10 ft max for overhead TF system")
+            if self.height > 24.0:
+                w.append(f"[{self.label}] Height {self.height:.1f} ft exceeds 24 ft max (DIOM §4-5.1.1)")
             vol_per = self.volume / max(1, self.nozzle_count)
             if vol_per > MAX_WORK_VOL_FT3:
                 w.append(f"[{self.label}] Volume per nozzle {vol_per:.0f} ft³ exceeds 1,260 ft³ max")
@@ -239,9 +302,7 @@ class ZoneItem(QGraphicsItem):
         self._update_pos()
 
     def _update_pos(self):
-        # Front-top-left of zone at scene (x_ft * PX, 0);
-        # scene y=0 is the booth ceiling / top-of-front-wall.
-        self.setPos(self.zone.x * PX_PER_FT, 0.0)
+        self.setPos(self.zone.x * PX_PER_FT, self.zone.y * PX_PER_FT)
 
     def boundingRect(self):
         z = self.zone
@@ -256,9 +317,7 @@ class ZoneItem(QGraphicsItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
             self.zone.x = self.pos().x() / PX_PER_FT
-            # Lock vertical position — zones always sit at ceiling (y=0 in scene)
-            if self.pos().y() != 0.0:
-                self.setPos(self.pos().x(), 0.0)
+            self.zone.y = self.pos().y() / PX_PER_FT
             if hasattr(self._scene_ref, "_on_zone_moved"):
                 self._scene_ref._on_zone_moved()
         return super().itemChange(change, value)
@@ -306,9 +365,29 @@ class ZoneItem(QGraphicsItem):
                             2.5 if (self._hover or self.isSelected()) else 1.5))
         painter.drawPolygon(QPolygonF([ftl, ftr, btr, btl]))
 
-        # Draw nozzle grid on ceiling for work-area and plenum zones
-        if z.zone_type in (ZONE_WORK, ZONE_PLEN):
-            self._draw_ceiling_nozzles(painter, ftl, ftr, btl)
+        # ── Module grid on ceiling (work areas only) ──────────────────────────
+        if z.zone_type == ZONE_WORK:
+            minfo = z.module_info
+            if minfo:
+                _, nL, nW, _, _ = minfo
+                if nL > 1 or nW > 1:
+                    len_x = ftr.x() - ftl.x()
+                    len_y = ftr.y() - ftl.y()
+                    dep_x = btl.x() - ftl.x()
+                    dep_y = btl.y() - ftl.y()
+                    grid_pen = QPen(QColor(60, 60, 200, 180), 1.2, Qt.DotLine)
+                    painter.setPen(grid_pen)
+                    painter.setBrush(Qt.NoBrush)
+                    for i in range(1, nL):
+                        f = i / nL
+                        p1 = QPointF(ftl.x() + len_x * f, ftl.y() + len_y * f)
+                        p2 = QPointF(p1.x() + dep_x,       p1.y() + dep_y)
+                        painter.drawLine(p1, p2)
+                    for j in range(1, nW):
+                        f = j / nW
+                        p1 = QPointF(ftl.x() + dep_x * f, ftl.y() + dep_y * f)
+                        p2 = QPointF(p1.x() + len_x,       p1.y() + len_y)
+                        painter.drawLine(p1, p2)
 
         # ── Right side face ───────────────────────────────────────────────────
         side_col = QColor(border.red(), border.green(), border.blue(), 60)
@@ -325,10 +404,6 @@ class ZoneItem(QGraphicsItem):
         painter.setPen(front_pen)
         painter.drawPolygon(QPolygonF([ftl, ftr, fbr, fbl]))
 
-        # Duct zone: draw nozzle dots along the front face (horizontal run)
-        if z.zone_type == ZONE_DUCT:
-            self._draw_duct_nozzles(painter, w_px, h_px, z)
-
         # ── Front face labels ─────────────────────────────────────────────────
         painter.setPen(QPen(border.darker(150)))
         painter.setFont(QFont("Arial", 8, QFont.Bold))
@@ -341,7 +416,10 @@ class ZoneItem(QGraphicsItem):
 
         noz_txt = f"{z.nozzle_count}× {z.nozzle_type}"
         if z.zone_type == ZONE_WORK:
-            noz_txt += f"  ({z.volume:.0f} ft³)"
+            minfo = z.module_info
+            if minfo:
+                _, nL, nW, mL, mW = minfo
+                noz_txt += f"  ({nL}×{nW} modules, {mL:.1f}′×{mW:.1f}′ ea)"
         painter.drawText(QRectF(5, 33, w_px - 10, 14), Qt.AlignLeft | Qt.AlignVCenter, noz_txt)
 
         if z.warnings():
@@ -349,63 +427,6 @@ class ZoneItem(QGraphicsItem):
             painter.setFont(QFont("Arial", 7, QFont.Bold))
             painter.drawText(QRectF(5, h_px - 18, w_px - 10, 14),
                              Qt.AlignLeft, "⚠ " + z.warnings()[0])
-
-    # ── Nozzle helpers ────────────────────────────────────────────────────────
-
-    def _draw_ceiling_nozzles(self, painter, ftl, ftr, btl):
-        """Place nozzles in a rows×cols grid on the isometric ceiling face."""
-        z   = self.zone
-        nc  = z.nozzle_count
-        if nc <= 0:
-            return
-        rows, cols = _nozzle_grid(nc)
-        n_col  = QColor(NOZZLE_COLOR_HEX[z.nozzle_type])
-        R      = 6    # radius of nozzle symbol
-        hang   = 10   # px below ceiling for nozzle tip
-
-        # Unit vectors spanning the ceiling parallelogram
-        len_x = (ftr.x() - ftl.x()) / (cols + 1)
-        len_y = (ftr.y() - ftl.y()) / (cols + 1)
-        dep_x = (btl.x() - ftl.x()) / (rows + 1)
-        dep_y = (btl.y() - ftl.y()) / (rows + 1)
-
-        placed = 0
-        for row in range(rows):
-            for col in range(cols):
-                if placed >= nc:
-                    break
-                cx = ftl.x() + len_x * (col + 1) + dep_x * (row + 1)
-                cy = ftl.y() + len_y * (col + 1) + dep_y * (row + 1)
-
-                # Stem hanging from ceiling
-                painter.setPen(QPen(n_col.darker(130), 1.5))
-                painter.drawLine(QPointF(cx, cy), QPointF(cx, cy + hang))
-
-                # Nozzle head
-                painter.setBrush(QBrush(n_col))
-                painter.setPen(QPen(Qt.white, 1))
-                painter.drawEllipse(QPointF(cx, cy + hang), R, R)
-                painter.setFont(QFont("Arial", 5, QFont.Bold))
-                painter.drawText(QRectF(cx - R, cy + hang - R, R*2, R*2),
-                                 Qt.AlignCenter, z.nozzle_type[:2])
-                placed += 1
-
-    def _draw_duct_nozzles(self, painter, w_px, h_px, z):
-        """Draw DP/3-Way nozzles evenly along the duct (front face, horizontal)."""
-        nc    = z.nozzle_count
-        if nc <= 0:
-            return
-        n_col = QColor(NOZZLE_COLOR_HEX[z.nozzle_type])
-        R     = 6
-        ny    = h_px / 2
-        for i in range(nc):
-            nx = w_px * (i + 1) / (nc + 1)
-            painter.setBrush(QBrush(n_col))
-            painter.setPen(QPen(Qt.white, 1))
-            painter.drawEllipse(QPointF(nx, ny), R, R)
-            painter.setFont(QFont("Arial", 5, QFont.Bold))
-            painter.drawText(QRectF(nx - R, ny - R, R*2, R*2),
-                             Qt.AlignCenter, z.nozzle_type[:2])
 
     def contextMenuEvent(self, event):
         menu = QMenu()
@@ -498,53 +519,202 @@ class BoothShellItem(QGraphicsItem):
                          Qt.AlignLeft, f"{W:.0f}′ deep")
 
 
-class CylinderItem(QGraphicsItem):
-    """Visual cylinder symbol."""
+class NozzleItem(QGraphicsItem):
+    """Standalone draggable nozzle with optional coverage indicator."""
+    ITEM_TYPE = "nozzle"
+    R = 8   # symbol radius px
+    COV_RX = 88   # coverage ellipse half-width px  (≈ 6.7 ft radius at 22px/ft × 0.6)
+    COV_RY = 40   # coverage ellipse half-height (isometric compression)
 
-    def __init__(self, label="IND-45", color="#8e44ad"):
+    def __init__(self, nozzle_type=NOZZLE_TF, scene_ref=None, coverage_visible=True):
         super().__init__()
-        self.label = label
-        self.color = QColor(color)
+        self.nozzle_type     = nozzle_type
+        self._scene_ref      = scene_ref
+        self.coverage_visible = coverage_visible
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self._hover = False
 
     def boundingRect(self):
-        return QRectF(0, 0, 40, 80)
+        R = self.R + 4
+        if self.coverage_visible and self.nozzle_type != NOZZLE_DP:
+            return QRectF(-self.COV_RX - 2, -self.COV_RY - 2,
+                          (self.COV_RX + 2) * 2, (self.COV_RY + 2) * 2)
+        return QRectF(-R, -R, R * 2, R * 2)
 
     def paint(self, painter, option, widget=None):
-        # Cylinder body
-        painter.setBrush(QBrush(self.color))
-        painter.setPen(QPen(self.color.darker(140), 2))
-        painter.drawRoundedRect(QRectF(5, 10, 30, 60), 6, 6)
-        # Top cap
-        painter.drawEllipse(QRectF(5, 5, 30, 14))
-        # Label
+        painter.setRenderHint(QPainter.Antialiasing)
+        n_col = QColor(NOZZLE_COLOR_HEX[self.nozzle_type])
+        R = self.R
+
+        # Coverage zone (behind nozzle symbol)
+        if self.coverage_visible and self.nozzle_type != NOZZLE_DP:
+            cov_fill = QColor(n_col.red(), n_col.green(), n_col.blue(), 22)
+            cov_edge = QColor(n_col.red(), n_col.green(), n_col.blue(), 90)
+            painter.setBrush(QBrush(cov_fill))
+            painter.setPen(QPen(cov_edge, 1, Qt.DashLine))
+            painter.drawEllipse(QPointF(0, 0), self.COV_RX, self.COV_RY)
+
+        # Stem drop-line
+        painter.setPen(QPen(n_col.darker(130), 1.5))
+        painter.drawLine(QPointF(0, -R - 8), QPointF(0, -R))
+
+        # Nozzle circle
+        if self.isSelected():
+            painter.setBrush(QBrush(QColor(_PALETTE_ORANGE)))
+        else:
+            painter.setBrush(QBrush(n_col))
+        painter.setPen(QPen(Qt.white, 1.2))
+        painter.drawEllipse(QPointF(0, 0), R, R)
+
+        painter.setFont(QFont("Arial", 5, QFont.Bold))
         painter.setPen(QPen(Qt.white))
-        painter.setFont(QFont("Arial", 7, QFont.Bold))
-        painter.drawText(QRectF(0, 28, 40, 28), Qt.AlignCenter, self.label)
+        painter.drawText(QRectF(-R, -R, R * 2, R * 2), Qt.AlignCenter,
+                         self.nozzle_type[:2])
+
+        if self._hover or self.isSelected():
+            painter.setPen(QPen(QColor(_PALETTE_ORANGE), 1.5, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(0, 0), R + 4, R + 4)
+
+    def hoverEnterEvent(self, event): self._hover = True;  self.update()
+    def hoverLeaveEvent(self, event): self._hover = False; self.update()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        cov_lbl = "Hide Coverage Circle" if self.coverage_visible else "Show Coverage Circle"
+        cov_act = menu.addAction(cov_lbl)
+        t_menu  = menu.addMenu("Change Type")
+        tf_act  = t_menu.addAction(f"TF – Work Area")
+        dp_act  = t_menu.addAction(f"DP – Duct / Plenum")
+        wy_act  = t_menu.addAction(f"3-Way – Pit / Tunnel")
+        menu.addSeparator()
+        del_act = menu.addAction("Delete Nozzle")
+        chosen  = menu.exec_(event.screenPos())
+        if   chosen == cov_act:
+            self.coverage_visible = not self.coverage_visible
+            self.prepareGeometryChange(); self.update()
+        elif chosen == tf_act:  self.nozzle_type = NOZZLE_TF;  self.update()
+        elif chosen == dp_act:  self.nozzle_type = NOZZLE_DP;  self.update()
+        elif chosen == wy_act:  self.nozzle_type = NOZZLE_3WY; self.update()
+        elif chosen == del_act and self._scene_ref:
+            self._scene_ref.remove_nozzle(self)
 
 
-class DetectorItem(QGraphicsItem):
-    """Visual detector symbol (triangle)."""
+class LinkItem(QGraphicsItem):
+    """Draggable fusible link / detector symbol."""
+    ITEM_TYPE = "link"
 
-    def __init__(self, label="Link", color="#e74c3c"):
+    def __init__(self, link_type=None, scene_ref=None):
         super().__init__()
-        self.label = label
-        self.color = QColor(color)
+        self.link_type  = link_type or DETECTOR_TYPES[1]   # default 212°F
+        self._scene_ref = scene_ref
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self._hover = False
 
     def boundingRect(self):
-        return QRectF(-14, -14, 28, 32)
+        return QRectF(-14, -14, 110, 32)
 
     def paint(self, painter, option, widget=None):
-        poly = QPolygonF([QPointF(0, -13), QPointF(13, 11), QPointF(-13, 11)])
-        painter.setBrush(self.color)
-        painter.setPen(QPen(self.color.darker(140), 1.5))
+        painter.setRenderHint(QPainter.Antialiasing)
+        col  = QColor("#e74c3c")
+        sel  = self.isSelected() or self._hover
+        body = QColor(_PALETTE_ORANGE) if self.isSelected() else col
+        poly = QPolygonF([QPointF(0, -12), QPointF(12, 10), QPointF(-12, 10)])
+        painter.setBrush(QBrush(body))
+        painter.setPen(QPen(col.darker(130), 1.5))
         painter.drawPolygon(poly)
         painter.setPen(QPen(Qt.white))
         painter.setFont(QFont("Arial", 6, QFont.Bold))
-        painter.drawText(QRectF(-13, -2, 26, 14), Qt.AlignCenter, self.label[:3])
+        painter.drawText(QRectF(-12, -3, 24, 12), Qt.AlignCenter, "LNK")
+        # Short type label beside symbol
+        short = ""
+        for part in self.link_type.split("–"):
+            if "°" in part or "Link" in part or "Bulb" in part or "Fire" in part:
+                short = part.strip()[:18]; break
+        painter.setPen(QPen(QColor("#333")))
+        painter.setFont(QFont("Arial", 7))
+        painter.drawText(QRectF(16, -8, 90, 16), Qt.AlignLeft | Qt.AlignVCenter, short)
+        if sel:
+            painter.setPen(QPen(QColor(_PALETTE_ORANGE), 1.5, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPolygon(poly)
+
+    def hoverEnterEvent(self, event): self._hover = True;  self.update()
+    def hoverLeaveEvent(self, event): self._hover = False; self.update()
+
+    def contextMenuEvent(self, event):
+        menu     = QMenu()
+        t_menu   = menu.addMenu("Change Link / Detector Type")
+        acts     = [t_menu.addAction(d) for d in DETECTOR_TYPES]
+        menu.addSeparator()
+        del_act  = menu.addAction("Delete Link")
+        chosen   = menu.exec_(event.screenPos())
+        if chosen == del_act and self._scene_ref:
+            self._scene_ref.remove_link(self)
+        else:
+            for act, det in zip(acts, DETECTOR_TYPES):
+                if chosen == act:
+                    self.link_type = det; self.update(); break
+
+
+class CylinderItem(QGraphicsItem):
+    """Draggable cylinder / bottle symbol."""
+    ITEM_TYPE = "cylinder"
+
+    def __init__(self, label="IND-45", scene_ref=None):
+        super().__init__()
+        self.label      = label
+        self._scene_ref = scene_ref
+        self.color      = QColor("#8e44ad")
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self._hover = False
+
+    def boundingRect(self):
+        return QRectF(0, 0, 48, 100)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        col = QColor(_PALETTE_ORANGE) if self.isSelected() else self.color
+        # Body
+        painter.setBrush(QBrush(col))
+        painter.setPen(QPen(col.darker(140), 2))
+        painter.drawRoundedRect(QRectF(8, 14, 32, 74), 7, 7)
+        # Top ellipse cap
+        painter.drawEllipse(QRectF(8, 6, 32, 18))
+        # Valve nub
+        painter.setBrush(QBrush(col.darker(120)))
+        painter.drawRoundedRect(QRectF(18, 2, 12, 10), 3, 3)
+        # Label text
+        painter.setPen(QPen(Qt.white))
+        painter.setFont(QFont("Arial", 7, QFont.Bold))
+        painter.drawText(QRectF(4, 34, 40, 40), Qt.AlignCenter, self.label)
+        if self._hover or self.isSelected():
+            painter.setPen(QPen(QColor(_PALETTE_ORANGE), 1.5, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self.boundingRect().adjusted(-2, -2, 2, 2))
+
+    def hoverEnterEvent(self, event): self._hover = True;  self.update()
+    def hoverLeaveEvent(self, event): self._hover = False; self.update()
+
+    def contextMenuEvent(self, event):
+        menu    = QMenu()
+        m_menu  = menu.addMenu("Change Model")
+        acts    = [m_menu.addAction(f"{c['model']} ({c['lbs']} lb)") for c in CYLINDERS]
+        menu.addSeparator()
+        del_act = menu.addAction("Delete Cylinder")
+        chosen  = menu.exec_(event.screenPos())
+        if chosen == del_act and self._scene_ref:
+            self._scene_ref.remove_cylinder(self)
+        else:
+            for act, c in zip(acts, CYLINDERS):
+                if chosen == act:
+                    self.label = c["model"]; self.update(); break
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -556,15 +726,17 @@ class BoothScene(QGraphicsScene):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._zone_items: list[ZoneItem] = []
-        self._det_items  = []
-        self._cyl_items  = []
-        self._booth_shell: BoothShellItem = None
+        self._zone_items: list[ZoneItem]     = []
+        self._nozzle_items: list[NozzleItem] = []
+        self._link_items: list[LinkItem]     = []
+        self._cyl_items: list[CylinderItem]  = []
+        self._booth_shell: BoothShellItem    = None
         self._booth_L = 0.0
         self._booth_W = 0.0
         self._booth_H = 9.0
+        self._coverage_visible = True
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── Booth shell ──────────────────────────────────────────────────────────
 
     def set_booth_outline(self, length_ft, width_ft, height_ft=9.0):
         self._booth_L = length_ft
@@ -577,10 +749,14 @@ class BoothScene(QGraphicsScene):
         else:
             self._booth_shell.set_dims(length_ft, width_ft, height_ft)
 
-    def add_zone(self, zone_data: ZoneData):
+    # ── Zones ────────────────────────────────────────────────────────────────
+
+    def add_zone(self, zone_data: ZoneData, spawn_nozzles=True):
         item = ZoneItem(zone_data, self)
         self.addItem(item)
         self._zone_items.append(item)
+        if spawn_nozzles:
+            self._spawn_zone_nozzles(zone_data)
         self.zones_changed.emit()
         return item
 
@@ -589,25 +765,117 @@ class BoothScene(QGraphicsScene):
         self.removeItem(item)
         self.zones_changed.emit()
 
-    def add_cylinder(self, label, color, x_ft, y_ft):
-        item = CylinderItem(label, color)
-        item.setPos(x_ft * PX_PER_FT, y_ft * PX_PER_FT)
-        self.addItem(item)
-        self._cyl_items.append(item)
-
-    def add_detector(self, label, color, x_ft, y_ft):
-        item = DetectorItem(label, color)
-        item.setPos(x_ft * PX_PER_FT, y_ft * PX_PER_FT)
-        self.addItem(item)
-        self._det_items.append(item)
-
-    def clear_cylinders(self):
-        for it in self._cyl_items:
-            self.removeItem(it)
-        self._cyl_items.clear()
-
     def all_zones(self) -> list[ZoneData]:
         return [it.zone for it in self._zone_items]
+
+    def _spawn_zone_nozzles(self, z: ZoneData):
+        """Auto-place NozzleItems at the calculated grid positions for a zone."""
+        nc = z.nozzle_count
+        if nc <= 0:
+            return
+        w_px = z.length * PX_PER_FT
+        h_px = z.height * PX_PER_FT
+        dx   = _ddx(z.width)
+        dy   = _ddy(z.width)   # negative
+        sx   = z.x * PX_PER_FT
+        sy   = z.y * PX_PER_FT
+        hang = 10   # px below ceiling
+
+        if z.zone_type in (ZONE_WORK, ZONE_PLEN):
+            if z.zone_type == ZONE_WORK:
+                minfo = z.module_info
+                nL = minfo[1] if minfo else 1
+                nW = minfo[2] if minfo else 1
+            else:
+                rows, cols = _nozzle_grid(nc)
+                nL, nW = cols, rows
+            placed = 0
+            for row in range(nW):
+                for col in range(nL):
+                    if placed >= nc:
+                        break
+                    # Place nozzle at centre of each module on the ceiling plane
+                    col_frac = (col + 0.5) / nL
+                    row_frac = (row + 0.5) / nW
+                    cx = sx + col_frac * w_px + row_frac * dx
+                    cy = sy + row_frac * dy    + hang
+                    self.add_nozzle(z.nozzle_type, cx, cy)
+                    placed += 1
+        elif z.zone_type == ZONE_DUCT:
+            for i in range(nc):
+                nx = sx + w_px * (i + 1) / (nc + 1)
+                ny = sy + h_px / 2
+                self.add_nozzle(z.nozzle_type, nx, ny)
+
+    # ── Nozzles ──────────────────────────────────────────────────────────────
+
+    def add_nozzle(self, nozzle_type=NOZZLE_TF, sx=0.0, sy=0.0):
+        item = NozzleItem(nozzle_type, self, self._coverage_visible)
+        item.setPos(sx, sy)
+        self.addItem(item)
+        self._nozzle_items.append(item)
+        return item
+
+    def remove_nozzle(self, item: NozzleItem):
+        self._nozzle_items = [n for n in self._nozzle_items if n is not item]
+        self.removeItem(item)
+
+    def clear_nozzles(self):
+        for n in list(self._nozzle_items):
+            self.removeItem(n)
+        self._nozzle_items.clear()
+
+    def all_nozzles(self):
+        return list(self._nozzle_items)
+
+    def set_coverage_visible(self, visible: bool):
+        self._coverage_visible = visible
+        for n in self._nozzle_items:
+            n.coverage_visible = visible
+            n.prepareGeometryChange()
+            n.update()
+
+    # ── Links / detectors ────────────────────────────────────────────────────
+
+    def add_link(self, link_type=None, sx=0.0, sy=0.0):
+        item = LinkItem(link_type, self)
+        item.setPos(sx, sy)
+        self.addItem(item)
+        self._link_items.append(item)
+        return item
+
+    def remove_link(self, item: LinkItem):
+        self._link_items = [l for l in self._link_items if l is not item]
+        self.removeItem(item)
+
+    def clear_links(self):
+        for l in list(self._link_items):
+            self.removeItem(l)
+        self._link_items.clear()
+
+    def all_links(self):
+        return list(self._link_items)
+
+    # ── Cylinders ────────────────────────────────────────────────────────────
+
+    def add_cylinder(self, label="IND-45", sx=0.0, sy=0.0):
+        item = CylinderItem(label, self)
+        item.setPos(sx, sy)
+        self.addItem(item)
+        self._cyl_items.append(item)
+        return item
+
+    def remove_cylinder(self, item: CylinderItem):
+        self._cyl_items = [c for c in self._cyl_items if c is not item]
+        self.removeItem(item)
+
+    def clear_cylinders(self):
+        for c in list(self._cyl_items):
+            self.removeItem(c)
+        self._cyl_items.clear()
+
+    def all_cylinders(self):
+        return list(self._cyl_items)
 
     # ── Internal ────────────────────────────────────────────────────────────
 
@@ -968,6 +1236,21 @@ class PaintBoothDesigner(QDialog):
         ]:
             a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
         tb.addSeparator()
+        for label, slot in [
+            ("＋ TF Nozzle",   lambda: self._add_nozzle(NOZZLE_TF)),
+            ("＋ DP Nozzle",   lambda: self._add_nozzle(NOZZLE_DP)),
+            ("＋ 3-Way Nozzle",lambda: self._add_nozzle(NOZZLE_3WY)),
+            ("＋ Link/Detector",self._add_link),
+            ("＋ Cylinder",    self._add_cylinder),
+        ]:
+            a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
+        tb.addSeparator()
+        self._cov_action = QAction("Coverage: ON", self)
+        self._cov_action.setCheckable(True)
+        self._cov_action.setChecked(True)
+        self._cov_action.triggered.connect(self._toggle_coverage)
+        tb.addAction(self._cov_action)
+        tb.addSeparator()
         fit_a = QAction("Fit View", self); fit_a.triggered.connect(self._canvas.fit if hasattr(self, "_canvas") else lambda: None)
         tb.addAction(fit_a)
         root.addWidget(tb)
@@ -1115,6 +1398,24 @@ class PaintBoothDesigner(QDialog):
                           num_pull_stations=self.sp_pull.value(),
                           has_elec_actuator=self.chk_elec.isChecked())
 
+    def _add_nozzle(self, nozzle_type):
+        """Drop a nozzle at the centre of the current view."""
+        centre = self._canvas.mapToScene(self._canvas.viewport().rect().center())
+        self._scene.add_nozzle(nozzle_type, centre.x(), centre.y())
+
+    def _add_link(self):
+        centre = self._canvas.mapToScene(self._canvas.viewport().rect().center())
+        self._scene.add_link(self.det_combo.currentText(), centre.x(), centre.y())
+
+    def _add_cylinder(self):
+        centre = self._canvas.mapToScene(self._canvas.viewport().rect().center())
+        model  = self.cyl_combo.currentData() or "IND-45"
+        self._scene.add_cylinder(model, centre.x(), centre.y())
+
+    def _toggle_coverage(self, checked):
+        self._scene.set_coverage_visible(checked)
+        self._cov_action.setText("Coverage: ON" if checked else "Coverage: OFF")
+
     # ── Save / Open ─────────────────────────────────────────────────────────
 
     def _save(self):
@@ -1140,7 +1441,15 @@ class PaintBoothDesigner(QDialog):
             "detector":     self.det_combo.currentText(),
             "pull_stations":self.sp_pull.value(),
             "elec_actuator":self.chk_elec.isChecked(),
+            "coverage_on":  self._cov_action.isChecked(),
             "zones":        [z.to_dict() for z in self._scene.all_zones()],
+            "nozzles":      [{"type": n.nozzle_type, "x": n.pos().x(), "y": n.pos().y(),
+                               "cov": n.coverage_visible}
+                             for n in self._scene.all_nozzles()],
+            "links":        [{"type": l.link_type, "x": l.pos().x(), "y": l.pos().y()}
+                             for l in self._scene.all_links()],
+            "cylinders":    [{"label": c.label, "x": c.pos().x(), "y": c.pos().y()}
+                             for c in self._scene.all_cylinders()],
         }
         try:
             with open(self._save_path, "w", encoding="utf-8") as f:
@@ -1177,13 +1486,40 @@ class PaintBoothDesigner(QDialog):
         self.sp_pull.setValue(data.get("pull_stations", 1))
         self.chk_elec.setChecked(data.get("elec_actuator", False))
 
-        # Clear and reload zones
+        # Clear canvas items
         for item in list(self._scene._zone_items):
             self._scene.remove_zone(item)
+        self._scene.clear_nozzles()
+        self._scene.clear_links()
+        self._scene.clear_cylinders()
         ZoneData._id_counter = 0
+
+        # Reload zones (no auto-spawn — nozzles loaded separately)
         for zd in data.get("zones", []):
             z = ZoneData.from_dict(zd)
-            self._scene.add_zone(z)
+            self._scene.add_zone(z, spawn_nozzles=False)
+
+        # Reload nozzles
+        for nd in data.get("nozzles", []):
+            self._scene.add_nozzle(nd.get("type", NOZZLE_TF),
+                                   nd.get("x", 0.0), nd.get("y", 0.0))
+            self._scene.all_nozzles()[-1].coverage_visible = nd.get("cov", True)
+
+        # Reload links
+        for ld in data.get("links", []):
+            self._scene.add_link(ld.get("type"), ld.get("x", 0.0), ld.get("y", 0.0))
+
+        # Reload cylinders
+        for cd in data.get("cylinders", []):
+            self._scene.add_cylinder(cd.get("label", "IND-45"),
+                                     cd.get("x", 0.0), cd.get("y", 0.0))
+
+        # Restore coverage toggle
+        cov = data.get("coverage_on", True)
+        self._cov_action.setChecked(cov)
+        self._scene.set_coverage_visible(cov)
+        self._cov_action.setText("Coverage: ON" if cov else "Coverage: OFF")
+
         self._apply_booth_dims()
         self._refresh_bom()
 
