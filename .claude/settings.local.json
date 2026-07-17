@@ -63,7 +63,29 @@
       "Bash(ls \"C:\\\\Users\\\\General Manager\\\\OneDrive - Defense Fire Protection\\\\Takeoff\\\\\")",
       "PowerShell(Get-Command python3, py, python -ErrorAction SilentlyContinue)",
       "PowerShell($py = \"C:\\\\Users\\\\Kevin\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python313\\\\python.exe\"; & $py --version; & $py -m pip --version 2>&1)",
-      "PowerShell($env:PATH -split \";\" | Where-Object { $_ -match \"python|py\" -or $_ -match \"Python\" })"
+      "PowerShell($env:PATH -split \";\" | Where-Object { $_ -match \"python|py\" -or $_ -match \"Python\" })",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gh release *)",
+      "Bash(git commit *)",
+      "PowerShell(& \"C:\\\\Users\\\\Kevin\\\\OneDrive - Defense Fire Protection\\\\Takeoff\\\\dist\\\\DFP TakeoffPro\\\\DFP TakeoffPro.exe\" 2>&1)",
+      "PowerShell(& \"C:\\\\Program Files\\\\Inno Setup 7\\\\ISCC.exe\" \"C:\\\\Users\\\\Kevin\\\\OneDrive - Defense Fire Protection\\\\Takeoff\\\\installer.iss\" 2>&1)",
+      "Bash(py --version)",
+      "Bash(py -c ' *)",
+      "Bash(py -c \"import ast; ast.parse\\(open\\('paint_booth_designer.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(py -c \"from paint_booth_designer import PaintBoothDesigner; print\\('import OK'\\)\")",
+      "Bash(py -m PyInstaller DFP_TakeoffPro.spec)",
+      "Bash(py -m PyInstaller DFP_TakeoffPro.spec -y)",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Inno Setup 6\\\\ISCC.exe\" \"C:\\\\Users\\\\Kevin\\\\OneDrive - Defense Fire Protection\\\\Takeoff\\\\installer.iss\")",
+      "PowerShell(& \"C:\\\\Program Files\\\\Inno Setup 7\\\\ISCC.exe\" \"C:\\\\Users\\\\Kevin\\\\OneDrive - Defense Fire Protection\\\\Takeoff\\\\installer.iss\")",
+      "Bash(gh release create 1.1.2 installer_output/DFP_TakeoffPro_Setup_1.1.2.exe --title v1.1.2 --notes '- Paint booth designer: 3D isometric view matching kitchen designer style *)",
+      "Bash(py -c \"from paint_booth_designer import PaintBoothDesigner; print\\('OK'\\)\")",
+      "mcp__plugin_pdf-viewer_pdf__display_pdf",
+      "mcp__plugin_pdf-viewer_pdf__list_pdfs",
+      "mcp__plugin_pdf-viewer_pdf__read_pdf_bytes",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('paint_booth_designer.py','r',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell(& \"C:\\\\Program Files \\(x86\\)\\\\Inno Setup 6\\\\ISCC.exe\" \"C:\\\\Users\\\\Kevin\\\\OneDrive - Defense Fire Protection\\\\Takeoff\\\\installer.iss\" 2>&1)"
     ]
   }
 }

@@ -1959,6 +1959,11 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._open_suppression_designer)
         tb.addAction(a)
 
+        a = QAction("Paint Booth Designer", self)
+        a.setToolTip("Design dry chemical suppression for vehicle spray booths (Badger Industry Guard)")
+        a.triggered.connect(self._open_paint_booth_designer)
+        tb.addAction(a)
+
         # ── Estimating ────────────────────────────────────────────────────
         tb.addSeparator()
         a = QAction("PMA Quote", self)
@@ -2426,6 +2431,20 @@ class MainWindow(QMainWindow):
             os.startfile(path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to export PDF:\n{e}")
+
+    def _open_paint_booth_designer(self):
+        from paint_booth_designer import PaintBoothDesigner
+        proj_name = ""
+        if self._project_id:
+            for p in db.get_projects():
+                if p["id"] == self._project_id:
+                    proj_name = p["name"]; break
+        dlg = PaintBoothDesigner(self, project_name=proj_name)
+        self._paint_booth_dlg = dlg
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.showMaximized()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _open_suppression_designer(self):
         from suppression_designer import SuppressionDesigner

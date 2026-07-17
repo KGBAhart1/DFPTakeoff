@@ -35,6 +35,22 @@ try:
 except ImportError:
     APP_VERSION = "1.0.0"
 
+try:
+    import fitz
+    _FITZ_OK = True
+except ImportError:
+    _FITZ_OK = False
+
+
+def _submittals_dir():
+    if getattr(sys, 'frozen', False):
+        base = os.path.join(os.path.expanduser("~"), "Documents", "DFP TakeoffPro")
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "Submittals")
+    os.makedirs(p, exist_ok=True)
+    return p
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS — sourced from Badger DIOM P/N 60-900007-001
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,7 +152,7 @@ _PALETTE_ORANGE = "#ff7002"
 
 # ── Isometric 3-D projection helpers (mirrors suppression_designer.py) ────────
 _ISO_ANG = math.radians(32)
-_ISO_DSF = 0.40   # depth scale factor
+_ISO_DSF = 0.25   # depth scale factor (compressed so deep booths don't stretch)
 
 def _ddx(depth_ft):
     """Rightward screen-pixel shift per foot of depth."""
@@ -472,49 +488,49 @@ class BoothShellItem(QGraphicsItem):
         bbl = QPointF(dx,       h_px+dy )
         bbr = QPointF(w_px+dx,  h_px+dy )
 
-        ceiling_col = QColor("#c8d8e8")
-        side_col    = QColor("#b0c0d0")
-        edge_col    = QColor("#6a7a8a")
-        edge_pen    = QPen(edge_col, 1.8)
-        dash_pen    = QPen(QColor("#9aaaba"), 1, Qt.DashLine)
+        edge_col = QColor("#6a7a8a")
+        dash_pen = QPen(QColor("#9aaaba"), 1, Qt.DashLine)
+        edge_pen = QPen(edge_col, 1.8)
 
-        # Back hidden edges
+        # All face fills are very light — let the edges do the work
+        ceil_fill  = QColor(180, 200, 220, 50)
+        side_fill  = QColor(160, 180, 200, 40)
+
+        # Hidden back edges (dashed)
         painter.setPen(dash_pen); painter.setBrush(Qt.NoBrush)
         painter.drawLine(btl, bbl)
         painter.drawLine(btl, btr)
         painter.drawLine(bbl, bbr)
+        painter.drawLine(btr, bbr)   # far-right vertical edge
 
-        # Ceiling / top face
-        painter.setBrush(QBrush(ceiling_col))
+        # Ceiling — very light fill
+        painter.setBrush(QBrush(ceil_fill))
         painter.setPen(edge_pen)
         painter.drawPolygon(QPolygonF([ftl, ftr, btr, btl]))
 
-        # Right side wall
-        painter.setBrush(QBrush(side_col))
+        # Right side — slightly darker light fill
+        painter.setBrush(QBrush(side_fill))
         painter.drawPolygon(QPolygonF([ftr, fbr, bbr, btr]))
 
-        # Front wall — transparent interior so zones show through
-        painter.setBrush(QBrush(QColor(255, 255, 255, 0)))
+        # Front face — no fill, just a bold outline so zones show through
+        painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(edge_col, 2.5))
         painter.drawPolygon(QPolygonF([ftl, ftr, fbr, fbl]))
 
-        # Floor
+        # Floor front edge
         painter.setPen(QPen(edge_col.darker(120), 1.5))
         painter.drawLine(fbl, fbr)
 
         # Dimension labels
         painter.setPen(QPen(QColor("#444"), 1))
         painter.setFont(QFont("Arial", 8))
-        # Length below front face
         painter.drawText(QRectF(w_px/2 - 40, h_px + 5, 80, 16),
                          Qt.AlignCenter, f"{L:.0f}′ long")
-        # Height on left
         painter.save()
         painter.translate(-26, h_px / 2)
         painter.rotate(-90)
         painter.drawText(QRectF(-30, -8, 60, 16), Qt.AlignCenter, f"{H:.0f}′ tall")
         painter.restore()
-        # Depth on top-right
         painter.drawText(QRectF(w_px + dx/2 - 25, dy/2 - 8, 70, 16),
                          Qt.AlignLeft, f"{W:.0f}′ deep")
 
@@ -531,6 +547,7 @@ class NozzleItem(QGraphicsItem):
         self.nozzle_type     = nozzle_type
         self._scene_ref      = scene_ref
         self.coverage_visible = coverage_visible
+        self.zone_uid        = None   # set when auto-spawned; None = manually placed
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
@@ -799,13 +816,15 @@ class BoothScene(QGraphicsScene):
                     row_frac = (row + 0.5) / nW
                     cx = sx + col_frac * w_px + row_frac * dx
                     cy = sy + row_frac * dy    + hang
-                    self.add_nozzle(z.nozzle_type, cx, cy)
+                    n = self.add_nozzle(z.nozzle_type, cx, cy)
+                    n.zone_uid = z.uid
                     placed += 1
         elif z.zone_type == ZONE_DUCT:
             for i in range(nc):
                 nx = sx + w_px * (i + 1) / (nc + 1)
                 ny = sy + h_px / 2
-                self.add_nozzle(z.nozzle_type, nx, ny)
+                n = self.add_nozzle(z.nozzle_type, nx, ny)
+                n.zone_uid = z.uid
 
     # ── Nozzles ──────────────────────────────────────────────────────────────
 
@@ -886,7 +905,13 @@ class BoothScene(QGraphicsScene):
         dlg = ZoneDialog(item.zone, self.views()[0] if self.views() else None)
         if dlg.exec_() == QDialog.Accepted:
             dlg.apply_to(item.zone)
+            item.prepareGeometryChange()
             item.update()
+            # Remove auto-spawned nozzles for this zone then respawn
+            for n in [n for n in self._nozzle_items if n.zone_uid == item.zone.uid]:
+                self.removeItem(n)
+            self._nozzle_items = [n for n in self._nozzle_items if n.zone_uid != item.zone.uid]
+            self._spawn_zone_nozzles(item.zone)
             self.zones_changed.emit()
 
     def _delete_zone(self, item: ZoneItem):
@@ -1006,7 +1031,7 @@ class ZoneDialog(QDialog):
         self.nozzle_combo.setCurrentText(nozzle_default.get(zone_type, NOZZLE_DP))
 
         tips = {
-            ZONE_WORK: "Max 1,260 ft³ per TF nozzle · Max height 10 ft",
+            ZONE_WORK: "Max 1,260 ft³ per TF nozzle · Max height 24 ft (Table 4-2)",
             ZONE_PLEN: "Nozzle centered overhead, tip 0-4.75\" from ceiling",
             ZONE_DUCT: "Max 28 ft per DP nozzle · Max round duct Ø 48\"",
         }
@@ -1160,25 +1185,29 @@ class BOMPanel(QWidget):
         # Summary
         cyl_summary = ", ".join(f"{qty}× {m}" for m, qty in cyls_needed.items())
         noz_summary = ", ".join(f"{qty}× {t}" for t, qty in nozzles.items())
+        cap = self._MAX_NOZZLES.get(cylinder_model, 4)
         self.summary_lbl.setText(
-            f"<b>Cylinders:</b> {cyl_summary or '—'}<br>"
+            f"<b>Cylinders:</b> {cyl_summary or '—'} ({cap} nozzles/cylinder max)<br>"
             f"<b>Nozzles:</b> {noz_summary or '—'}<br>"
             f"<b>Total Nozzles:</b> {total_nozzles}"
         )
 
+    # Max nozzles per cylinder per DIOM §4-5.2 (Tables 4-6 through 4-20).
+    # IND-21 = DC-21 (21 lb), IND-45 = DC-45 (45 lb), IND-70 = DC-70 (70 lb).
+    _MAX_NOZZLES = {"IND-21": 2, "IND-45": 4, "IND-70": 6}
+
     def _recommend_cylinders(self, zones, preferred_model):
-        """Simple cylinder recommendation: DC-21 per 2 nozzles, DC-45 per 4, DC-70 for large."""
-        nozzle_totals = {}
-        for z in zones:
-            nt = z.nozzle_type
-            nozzle_totals[nt] = nozzle_totals.get(nt, 0) + z.nozzle_count
-        total = sum(nozzle_totals.values())
-        if total == 0:
+        """
+        Cylinder count = ceil(total_nozzles / max_nozzles_per_cylinder).
+        Limits per DIOM: IND-21 → 2 nozzles, IND-45 → 4, IND-70 → 6.
+        """
+        if not zones:
             return {}
-        # User's preferred model governs — report how many needed
-        caps = {"IND-21": 2, "IND-45": 4, "IND-70": 4}
-        cap = caps.get(preferred_model, 4)
-        num = max(1, math.ceil(total / cap))
+        total_nozzles = sum(z.nozzle_count for z in zones)
+        if total_nozzles == 0:
+            return {}
+        cap = self._MAX_NOZZLES.get(preferred_model, 4)
+        num = max(1, math.ceil(total_nozzles / cap))
         return {preferred_model: num}
 
     def _det_part(self, det_type):
@@ -1188,6 +1217,78 @@ class BOMPanel(QWidget):
                 if pn_idx >= 0:
                     return det_type[pn_idx + 4:].strip()
         return "—"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Project info dialog
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PaintBoothProjectInfoDialog(QDialog):
+    def __init__(self, meta=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Project Information")
+        self.setMinimumWidth(420)
+        m = meta or {}
+        layout = QVBoxLayout(self); layout.setSpacing(8)
+
+        def _row(label, widget):
+            row = QHBoxLayout()
+            lbl = QLabel(label); lbl.setFixedWidth(110)
+            lbl.setStyleSheet("font-weight:bold;font-size:11px;")
+            row.addWidget(lbl); row.addWidget(widget); layout.addLayout(row)
+
+        self._customer = QLineEdit(m.get("customer", ""))
+        self._customer.setPlaceholderText("e.g. ABC Auto Body – Main St")
+        _row("Customer:", self._customer)
+
+        self._location = QLineEdit(m.get("location", ""))
+        self._location.setPlaceholderText("e.g. 123 Main St, Anytown AB")
+        _row("Location:", self._location)
+
+        self._job = QLineEdit(m.get("job_number", ""))
+        self._job.setPlaceholderText("e.g. DFP-2026-001")
+        _row("Job Number:", self._job)
+
+        self._designer = QLineEdit(m.get("designer", ""))
+        self._designer.setPlaceholderText("Your name")
+        _row("Designer:", self._designer)
+
+        rev_widget = QWidget()
+        rev_row = QHBoxLayout(rev_widget); rev_row.setContentsMargins(0,0,0,0); rev_row.setSpacing(6)
+        self._revision = QLineEdit(m.get("revision", "A"))
+        self._revision.setFixedWidth(50); self._revision.setPlaceholderText("A")
+        rev_date_lbl = QLabel("Date:"); rev_date_lbl.setStyleSheet("font-size:11px;")
+        self._rev_date = QLineEdit(m.get("rev_date", datetime.date.today().strftime("%Y-%m-%d")))
+        self._rev_date.setPlaceholderText("YYYY-MM-DD")
+        rev_row.addWidget(self._revision); rev_row.addWidget(rev_date_lbl)
+        rev_row.addWidget(self._rev_date); rev_row.addStretch()
+        _row("Revision:", rev_widget)
+
+        self._notes = QTextEdit(m.get("notes", ""))
+        self._notes.setPlaceholderText("Any additional notes…")
+        self._notes.setFixedHeight(72)
+        layout.addWidget(QLabel("Notes:")); layout.addWidget(self._notes)
+
+        btns = QHBoxLayout()
+        ok = QPushButton("OK"); ok.setDefault(True)
+        ok.setStyleSheet(f"background:{_PALETTE_DARK};color:white;font-weight:bold;"
+                         "padding:6px 20px;border-radius:3px;")
+        cancel = QPushButton("Cancel")
+        cancel.setStyleSheet("padding:6px 20px;border-radius:3px;")
+        ok.clicked.connect(self.accept); cancel.clicked.connect(self.reject)
+        btns.addStretch(); btns.addWidget(cancel); btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def values(self):
+        return {
+            "customer":   self._customer.text().strip(),
+            "location":   self._location.text().strip(),
+            "job_number": self._job.text().strip(),
+            "designer":   self._designer.text().strip(),
+            "revision":   self._revision.text().strip() or "A",
+            "rev_date":   self._rev_date.text().strip(),
+            "notes":      self._notes.toPlainText().strip(),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1204,6 +1305,7 @@ class PaintBoothDesigner(QDialog):
         self.setMinimumSize(1100, 700)
         self._project_name = project_name
         self._save_path = None
+        self._project_meta = {}
 
         self._scene = BoothScene()
         self._scene.zones_changed.connect(self._refresh_bom)
@@ -1223,9 +1325,10 @@ class PaintBoothDesigner(QDialog):
                          f"QToolButton{{color:white;padding:4px 8px;border-radius:3px;}}"
                          f"QToolButton:hover{{background:#3a3f40;}}")
         for label, slot in [
-            ("💾 Save",       self._save),
-            ("📂 Open",       self._open),
-            ("📄 Export PDF", self._export_pdf),
+            ("💾 Save",         self._save),
+            ("📂 Open",         self._open),
+            ("📋 Project Info", self._edit_project_info),
+            ("📄 Export PDF",   self._export_pdf),
         ]:
             a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
         tb.addSeparator()
@@ -1275,6 +1378,7 @@ class PaintBoothDesigner(QDialog):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
+        splitter.setSizes([260, 9999, 340])
 
         root.addWidget(splitter)
 
@@ -1353,7 +1457,7 @@ class PaintBoothDesigner(QDialog):
         note = QLabel(
             "<b>Coverage Reference (NFPA 17 / DIOM):</b><br>"
             "• TF Nozzle: max <b>1,260 ft³</b>/nozzle<br>"
-            "• Max booth height: <b>10 ft</b><br>"
+            "• Max booth height: <b>24 ft</b> (Table 4-2)<br>"
             "• DP Nozzle: max <b>28 ft</b> duct/nozzle<br>"
             "• Pipe: <b>3/4\" NPT</b> min 150 lb fittings<br>"
             "• All systems: balanced piping required<br>"
@@ -1433,6 +1537,7 @@ class PaintBoothDesigner(QDialog):
         data = {
             "version":      APP_VERSION,
             "project_name": self._project_name,
+            "project_meta": self._project_meta,
             "booth_L":      self.sp_booth_L.value(),
             "booth_W":      self.sp_booth_W.value(),
             "booth_H":      self.sp_booth_H.value(),
@@ -1474,6 +1579,7 @@ class PaintBoothDesigner(QDialog):
             QMessageBox.critical(self, "Open Error", str(e))
 
     def _load_data(self, data):
+        self._project_meta = data.get("project_meta", {})
         self.sp_booth_L.setValue(data.get("booth_L", 30.0))
         self.sp_booth_W.setValue(data.get("booth_W", 14.0))
         self.sp_booth_H.setValue(data.get("booth_H", 9.0))
@@ -1523,148 +1629,376 @@ class PaintBoothDesigner(QDialog):
         self._apply_booth_dims()
         self._refresh_bom()
 
+    # ── Project Info ─────────────────────────────────────────────────────────
+
+    def _edit_project_info(self):
+        dlg = PaintBoothProjectInfoDialog(self._project_meta, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._project_meta = dlg.values()
+
     # ── PDF Export ──────────────────────────────────────────────────────────
 
     def _export_pdf(self):
-        default = os.path.join(
-            _submittals_dir(),
-            f"PaintBooth_{self._project_name or 'Design'}_{datetime.date.today()}.pdf"
-        )
+        try:
+            default = os.path.join(
+                _submittals_dir(),
+                f"PaintBooth_{self._project_name or 'Design'}_{datetime.date.today()}.pdf"
+            )
+        except Exception:
+            default = ""
         path, _ = QFileDialog.getSaveFileName(self, "Export PDF", default, "PDF (*.pdf)")
         if not path:
             return
         try:
-            self._do_export_pdf(path)
-            QMessageBox.information(self, "Exported", f"PDF saved to:\n{path}")
-            try:
-                os.startfile(path)
-            except Exception:
-                pass
+            ok, result = self._build_submittal_pdf(path)
+            if ok:
+                QMessageBox.information(self, "Exported", f"PDF saved to:\n{path}")
+                try:
+                    os.startfile(path)
+                except Exception:
+                    pass
+            else:
+                QMessageBox.critical(self, "Export Error", result)
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
-    def _do_export_pdf(self, path):
+    def _build_submittal_pdf(self, path):
+        if not _FITZ_OK:
+            return False, ("PyMuPDF (fitz) is not installed.\n"
+                           "Run: pip install pymupdf")
+
+        import tempfile, datetime as _dt
+        from PyQt5.QtCore import QRectF as _QRectF, Qt as _Qt
+
+        meta     = self._project_meta or {}
+        customer = meta.get("customer", "") or self._project_name or "—"
+        location = meta.get("location", "") or "—"
+        job_no   = meta.get("job_number", "") or "—"
+        designer = meta.get("designer", "") or "—"
+        rev      = meta.get("revision", "A") or "A"
+        rev_d    = meta.get("rev_date", "") or ""
+        notes    = (meta.get("notes", "") or "").strip()
+
+        zones    = self._scene.all_zones()
+        cyl_text = self.cyl_combo.currentText()
+        det_text = self.det_combo.currentText()
+        booth_L  = self.sp_booth_L.value()
+        booth_W  = self.sp_booth_W.value()
+        booth_H  = self.sp_booth_H.value()
+        booth_tp = self.type_combo.currentText()
+
+        # ── Palette ──
+        red  = (0.75, 0.17, 0.11)   # DFP red
+        dark = (0.14, 0.17, 0.15)   # near-black
+        org  = (1.0,  0.44, 0.01)   # DFP orange
+
+        W, H         = 792, 612                      # landscape letter
+        HEADER_H     = 52;  FOOTER_H = 36
+        BORDER       = 18;  SIDEBAR_W = 205
+        DX1 = BORDER;       DY1 = HEADER_H + BORDER
+        DX2 = W - SIDEBAR_W - BORDER
+        DY2 = H - FOOTER_H - BORDER
+        DRAW_W = DX2 - DX1; DRAW_H = DY2 - DY1
+        SX = W - SIDEBAR_W + 6
+
+        tmp_files = []
+
         try:
-            from reportlab.lib.pagesizes import letter, landscape
-            from reportlab.lib.units import inch
-            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            from reportlab.lib import colors
-            _rl = True
-        except ImportError:
-            _rl = False
+            doc = fitz.open()
 
-        if not _rl:
-            # Fallback: save canvas as pixmap
-            pixmap = QPixmap(self.size())
-            self.render(pixmap)
-            # Save as PNG fallback
-            png_path = path.replace(".pdf", ".png")
-            pixmap.save(png_path)
-            QMessageBox.information(self, "Note",
-                f"reportlab not installed — saved as PNG:\n{png_path}")
-            return
+            # ─────────────────────────────────────────────────────────────────
+            # PAGE 1 — Design drawing
+            # ─────────────────────────────────────────────────────────────────
 
-        from reportlab.lib.pagesizes import letter, landscape
-        from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib import colors
+            # Render isometric canvas to image
+            scene_rect = self._scene.itemsBoundingRect()
+            if scene_rect.isNull() or scene_rect.isEmpty():
+                scene_rect = _QRectF(0, 0, 800, 600)
+            scene_rect = scene_rect.adjusted(-60, -60, 60, 60)
 
-        doc = SimpleDocTemplate(path, pagesize=landscape(letter),
-                                leftMargin=0.5*inch, rightMargin=0.5*inch,
-                                topMargin=0.5*inch, bottomMargin=0.5*inch)
-        styles = getSampleStyleSheet()
-        story  = []
+            sw = scene_rect.width(); sh = scene_rect.height() if scene_rect.height() > 0 else 1
+            scene_aspect = sw / sh
+            draw_aspect  = DRAW_W / DRAW_H
+            if scene_aspect >= draw_aspect:
+                img_w = max(200, int(DRAW_W * 2))
+                img_h = max(150, int(img_w / scene_aspect))
+            else:
+                img_h = max(150, int(DRAW_H * 2))
+                img_w = max(200, int(img_h * scene_aspect))
 
-        # Title
-        title_style = ParagraphStyle("Title", parent=styles["Title"], fontSize=18,
-                                     textColor=colors.HexColor(_PALETTE_DARK))
-        story.append(Paragraph("Paint Booth Dry Chemical Suppression Design", title_style))
-        story.append(Paragraph(
-            f"Project: {self._project_name or '—'}  |  "
-            f"Booth Type: {self.type_combo.currentText()}  |  "
-            f"Date: {datetime.date.today()}",
-            styles["Normal"]
-        ))
-        story.append(Spacer(1, 0.15*inch))
+            from PyQt5.QtGui import QImage
+            img = QImage(img_w, img_h, QImage.Format_RGB32)
+            img.fill(QColor("white"))
+            p = QPainter(img)
+            p.setRenderHint(QPainter.Antialiasing)
+            self._scene.render(p, _QRectF(0, 0, img_w, img_h), scene_rect, _Qt.IgnoreAspectRatio)
+            p.end()
+            tmp1 = path + "_tmp0.png"; img.save(tmp1); tmp_files.append(tmp1)
 
-        # Booth summary
-        story.append(Paragraph("<b>Booth Dimensions</b>", styles["Heading2"]))
-        booth_data = [
-            ["Length", f"{self.sp_booth_L.value():.1f} ft"],
-            ["Width",  f"{self.sp_booth_W.value():.1f} ft"],
-            ["Height", f"{self.sp_booth_H.value():.1f} ft"],
-            ["Cylinder", self.cyl_combo.currentText()],
-            ["Detection", self.det_combo.currentText()],
-        ]
-        t = Table(booth_data, colWidths=[2.0*inch, 4.0*inch])
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#eeeeee")),
-            ("FONTNAME",   (0,0), (0,-1), "Helvetica-Bold"),
-            ("GRID",       (0,0), (-1,-1), 0.5, colors.grey),
-            ("FONTSIZE",   (0,0), (-1,-1), 10),
-            ("ROWBACKGROUNDS", (0,0), (-1,-1), [colors.white, colors.HexColor("#f8f8f8")]),
-        ]))
-        story.append(t)
-        story.append(Spacer(1, 0.12*inch))
+            pg = doc.new_page(width=W, height=H)
+            self._pdf_header(pg, W, H, HEADER_H, BORDER, SIDEBAR_W,
+                             customer, location, "Paint Booth Suppression System", red, dark)
+            pg.draw_rect(fitz.Rect(DX1, DY1, DX2, DY2), color=dark, width=1.2)
+            pg.insert_image(fitz.Rect(DX1, DY1, DX2, DY2), filename=tmp1)
+            self._pdf_footer(pg, W, H, BORDER, FOOTER_H, SIDEBAR_W,
+                             customer, location, 1, 2, rev, red, dark)
+            self._pdf_rev_stamp(pg, W, HEADER_H, SIDEBAR_W, BORDER, rev, rev_d, red)
 
-        # Zones table
-        story.append(Paragraph("<b>Suppression Zones</b>", styles["Heading2"]))
-        zones = self._scene.all_zones()
-        if zones:
-            zone_tbl_data = [["Zone", "Type", "L×W×H (ft)", "Volume (ft³)", "Nozzle Type", "Nozzles", "Warnings"]]
-            for z in zones:
-                warns = "; ".join(z.warnings()) or "✓ OK"
-                zone_tbl_data.append([
-                    z.label, z.zone_type,
-                    f"{z.length:.1f} × {z.width:.1f} × {z.height:.1f}",
-                    f"{z.volume:.0f}" if z.zone_type != ZONE_DUCT else "—",
-                    z.nozzle_type, str(z.nozzle_count), warns,
-                ])
-            col_w = [1.4, 1.1, 1.6, 1.0, 1.0, 0.6, 3.0]
-            zt = Table(zone_tbl_data, colWidths=[x*inch for x in col_w])
-            zt.setStyle(TableStyle([
-                ("BACKGROUND",     (0,0), (-1,0), colors.HexColor(_PALETTE_DARK)),
-                ("TEXTCOLOR",      (0,0), (-1,0), colors.white),
-                ("FONTNAME",       (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTSIZE",       (0,0), (-1,-1), 9),
-                ("GRID",           (0,0), (-1,-1), 0.5, colors.grey),
-                ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f5f5")]),
-            ]))
-            story.append(zt)
-            story.append(Spacer(1, 0.12*inch))
+            # ── Sidebar page 1: booth specs + zones ──
+            sy = DY1 + 4
+            pg.insert_text((SX, sy + 10), "BOOTH SPECIFICATIONS",
+                           fontsize=9, color=red, fontname="helv"); sy += 22
+            pg.draw_line((SX, sy), (W - BORDER, sy), color=dark, width=0.5); sy += 8
 
-        # BOM table
-        story.append(Paragraph("<b>Bill of Materials</b>", styles["Heading2"]))
-        bom_rows = [["Item", "Part Number", "Qty"]]
-        for row in range(self._bom.tbl.rowCount()):
-            bom_rows.append([
-                self._bom.tbl.item(row, 0).text() if self._bom.tbl.item(row, 0) else "",
-                self._bom.tbl.item(row, 1).text() if self._bom.tbl.item(row, 1) else "",
-                self._bom.tbl.item(row, 2).text() if self._bom.tbl.item(row, 2) else "",
-            ])
-        bom_t = Table(bom_rows, colWidths=[4.5*inch, 2.0*inch, 0.6*inch])
-        bom_t.setStyle(TableStyle([
-            ("BACKGROUND",     (0,0), (-1,0), colors.HexColor(_PALETTE_ORANGE)),
-            ("TEXTCOLOR",      (0,0), (-1,0), colors.white),
-            ("FONTNAME",       (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE",       (0,0), (-1,-1), 9),
-            ("GRID",           (0,0), (-1,-1), 0.5, colors.grey),
-            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f9f9f9")]),
-        ]))
-        story.append(bom_t)
-        story.append(Spacer(1, 0.15*inch))
+            for label, value in [
+                ("Type",      booth_tp),
+                ("Length",    f"{booth_L:.1f} ft"),
+                ("Width",     f"{booth_W:.1f} ft"),
+                ("Height",    f"{booth_H:.1f} ft"),
+                ("Cylinder",  cyl_text),
+                ("Detection", det_text),
+            ]:
+                pg.insert_text((SX,      sy), label + ":",
+                               fontsize=7, color=(0.3, 0.3, 0.3), fontname="helv")
+                pg.insert_text((SX + 60, sy), value,
+                               fontsize=7, color=dark, fontname="helv")
+                sy += 11
 
-        # Compliance note
-        story.append(Paragraph(
-            "<b>Design Basis:</b> Badger Industry Guard Dry Chemical System for Vehicle Spray Booths, "
-            "P/N 60-900007-001 (Jan 2007). UL Listing File No. EX 4864 / ULC CEX 515. "
-            "NFPA 17 (Standard for Dry Chemical Systems) / NFPA 33 (Spray Application). "
-            "All systems must be designed, installed, inspected, and maintained by qualified personnel. "
-            "Verify all quantities and configurations with the current DIOM and AHJ before installation.",
-            ParagraphStyle("Note", parent=styles["Normal"], fontSize=8,
-                           textColor=colors.HexColor("#666666"))
-        ))
+            if zones:
+                sy += 6
+                pg.draw_line((SX, sy), (W - BORDER, sy), color=dark, width=0.5); sy += 8
+                pg.insert_text((SX, sy), "ZONES",
+                               fontsize=8, color=dark, fontname="helv"); sy += 12
 
-        doc.build(story)
+                for z in zones:
+                    if sy > H - FOOTER_H - 10:
+                        break
+                    label_str = z.label
+                    pg.insert_text((SX, sy), label_str,
+                                   fontsize=7, color=dark, fontname="helv")
+                    pg.insert_text((SX, sy + 9), f"  {z.zone_type}  {z.length:.0f}×{z.width:.0f}×{z.height:.0f} ft",
+                                   fontsize=6, color=(0.35, 0.35, 0.35), fontname="helv")
+                    pg.insert_text((SX, sy + 17), f"  {z.nozzle_count} nozzle(s)",
+                                   fontsize=6, color=(0.35, 0.35, 0.35), fontname="helv")
+                    if z.zone_type == ZONE_WORK:
+                        mi = z.module_info
+                        if mi:
+                            tot, nL, nW, mL, mW = mi
+                            pg.insert_text((SX, sy + 25),
+                                           f"  {nL}×{nW} modules ({mL:.1f}×{mW:.1f} ft)",
+                                           fontsize=6, color=(0.25, 0.45, 0.65), fontname="helv")
+                            sy += 9
+                    sy += 29
+                    if sy < H - FOOTER_H - 4:
+                        pg.draw_line((SX + 2, sy - 3), (W - BORDER - 2, sy - 3),
+                                     color=(0.8, 0.8, 0.8), width=0.3)
+
+            # logo (above footer, bottom of sidebar)
+            logo_path = self._get_logo_path()
+            if logo_path:
+                try:
+                    logo_rect = fitz.Rect(SX, H - FOOTER_H - 88, W - BORDER, H - FOOTER_H - 4)
+                    pg.insert_image(logo_rect, filename=logo_path, keep_proportion=True)
+                except Exception:
+                    pass
+
+            # notes
+            if notes and sy < H - FOOTER_H - 40:
+                sy += 4
+                pg.draw_line((SX, sy), (W - BORDER, sy), color=dark, width=0.5); sy += 8
+                pg.insert_text((SX, sy), "NOTES", fontsize=8, color=dark, fontname="helv"); sy += 11
+                for word_line in notes.split("\n"):
+                    words = word_line.split(); line = ""
+                    for w in words:
+                        if len(line) + len(w) + 1 > 38:
+                            if sy > H - FOOTER_H - 10:
+                                break
+                            pg.insert_text((SX, sy), line.strip(),
+                                           fontsize=7, color=(0.2, 0.2, 0.2), fontname="helv")
+                            sy += 10; line = ""
+                        line += w + " "
+                    if line.strip() and sy <= H - FOOTER_H - 10:
+                        pg.insert_text((SX, sy), line.strip(),
+                                       fontsize=7, color=(0.2, 0.2, 0.2), fontname="helv")
+                        sy += 10
+
+            # ─────────────────────────────────────────────────────────────────
+            # PAGE 2 — Bill of Materials
+            # ─────────────────────────────────────────────────────────────────
+            pg2 = doc.new_page(width=W, height=H)
+            self._pdf_header(pg2, W, H, HEADER_H, BORDER, SIDEBAR_W,
+                             customer, location, "Bill of Materials", red, dark)
+            self._pdf_footer(pg2, W, H, BORDER, FOOTER_H, SIDEBAR_W,
+                             customer, location, 2, 2, rev, red, dark)
+            self._pdf_rev_stamp(pg2, W, HEADER_H, SIDEBAR_W, BORDER, rev, rev_d, red)
+
+            # BOM table body
+            bom_x   = BORDER + 4
+            bom_y   = DY1 + 8
+            col_w_bom = [DRAW_W * 0.58, DRAW_W * 0.26, DRAW_W * 0.16]
+            hdrs    = ["Description", "Part Number", "Qty"]
+            row_h   = 14
+
+            # Header row
+            pg2.draw_rect(fitz.Rect(bom_x, bom_y, bom_x + DRAW_W, bom_y + row_h),
+                          color=dark, fill=dark)
+            cx = bom_x + 4
+            for i, hdr in enumerate(hdrs):
+                pg2.insert_text((cx, bom_y + 10), hdr,
+                                fontsize=8, color=(1, 1, 1), fontname="helv")
+                cx += col_w_bom[i]
+            bom_y += row_h
+
+            # Data rows
+            for row in range(self._bom.tbl.rowCount()):
+                name  = self._bom.tbl.item(row, 0).text() if self._bom.tbl.item(row, 0) else ""
+                pn    = self._bom.tbl.item(row, 1).text() if self._bom.tbl.item(row, 1) else ""
+                qty   = self._bom.tbl.item(row, 2).text() if self._bom.tbl.item(row, 2) else ""
+                fill  = (0.97, 0.97, 0.97) if row % 2 == 0 else (1, 1, 1)
+                pg2.draw_rect(fitz.Rect(bom_x, bom_y, bom_x + DRAW_W, bom_y + row_h),
+                              color=(0.8, 0.8, 0.8), fill=fill, width=0.3)
+                cx = bom_x + 4
+                for i, txt in enumerate([name, pn, qty]):
+                    pg2.insert_text((cx, bom_y + 10), txt,
+                                    fontsize=8, color=dark, fontname="helv")
+                    cx += col_w_bom[i]
+                bom_y += row_h
+
+            # Project info block on right sidebar of page 2
+            sy2 = DY1 + 4
+            pg2.insert_text((SX, sy2 + 10), "PROJECT INFORMATION",
+                            fontsize=9, color=red, fontname="helv"); sy2 += 22
+            pg2.draw_line((SX, sy2), (W - BORDER, sy2), color=dark, width=0.5); sy2 += 8
+            for label, value in [
+                ("Customer", customer),
+                ("Location", location),
+                ("Job No.",  job_no),
+                ("Designer", designer),
+                ("Revision", f"{rev}  {rev_d}"),
+                ("Date",     _dt.date.today().strftime("%Y-%m-%d")),
+            ]:
+                pg2.insert_text((SX,      sy2), label + ":",
+                                fontsize=7, color=(0.3, 0.3, 0.3), fontname="helv")
+                pg2.insert_text((SX + 54, sy2), value,
+                                fontsize=7, color=dark, fontname="helv")
+                sy2 += 11
+
+            # Compliance note
+            sy2 += 14
+            pg2.draw_line((SX, sy2), (W - BORDER, sy2), color=dark, width=0.5); sy2 += 8
+            pg2.insert_text((SX, sy2), "DESIGN BASIS", fontsize=8, color=dark, fontname="helv"); sy2 += 12
+            note_lines = [
+                "Badger Industry Guard",
+                "Dry Chemical System",
+                "P/N 60-900007-001",
+                "(Jan 2007)",
+                "UL EX 4864 / ULC CEX 515",
+                "NFPA 17 / NFPA 33",
+            ]
+            for nl in note_lines:
+                if sy2 > H - FOOTER_H - 10:
+                    break
+                pg2.insert_text((SX, sy2), nl, fontsize=6,
+                                color=(0.35, 0.35, 0.35), fontname="helv")
+                sy2 += 9
+
+            sy2 += 8
+            pg2.draw_line((SX, sy2), (W - BORDER, sy2), color=dark, width=0.5); sy2 += 8
+            disclaimer = ("All quantities must be verified by a "
+                          "qualified installer against current DIOM "
+                          "and local AHJ requirements.")
+            words2 = disclaimer.split(); line2 = ""
+            for w in words2:
+                if len(line2) + len(w) + 1 > 34:
+                    if sy2 > H - FOOTER_H - 10:
+                        break
+                    pg2.insert_text((SX, sy2), line2.strip(),
+                                    fontsize=6, color=(0.4, 0.4, 0.4), fontname="helv")
+                    sy2 += 9; line2 = ""
+                line2 += w + " "
+            if line2.strip() and sy2 <= H - FOOTER_H - 10:
+                pg2.insert_text((SX, sy2), line2.strip(),
+                                fontsize=6, color=(0.4, 0.4, 0.4), fontname="helv")
+
+            # logo page 2
+            if logo_path:
+                try:
+                    logo_rect = fitz.Rect(SX, H - FOOTER_H - 88, W - BORDER, H - FOOTER_H - 4)
+                    pg2.insert_image(logo_rect, filename=logo_path, keep_proportion=True)
+                except Exception:
+                    pass
+
+            doc.save(path)
+            doc.close()
+            return True, path
+
+        except Exception as e:
+            return False, str(e)
+        finally:
+            for tmp in tmp_files:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+
+    # ── PDF helpers ──────────────────────────────────────────────────────────
+
+    def _get_logo_path(self):
+        try:
+            import json as _json
+            settings_path = os.path.join(
+                os.path.expanduser("~"), "Documents", "DFP TakeoffPro", "settings.json"
+            )
+            if os.path.isfile(settings_path):
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    s = _json.load(f)
+                lp = (s.get("logo_path") or "").strip()
+                if lp and os.path.isfile(lp):
+                    return lp
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _pdf_header(pg, W, H, HEADER_H, BORDER, SIDEBAR_W,
+                    customer, location, subtitle, red, dark):
+        pg.draw_rect(fitz.Rect(0, 0, W, HEADER_H), color=red, fill=red)
+        pg.insert_text((BORDER, 18),  "DEFENSE FIRE PROTECTION",
+                       fontsize=13, color=(1, 1, 1), fontname="helv")
+        pg.insert_text((BORDER, 35),  subtitle,
+                       fontsize=8,  color=(1, 1, 1), fontname="helv")
+        sx = W - SIDEBAR_W + 4
+        pg.insert_text((sx, 18), f"Customer: {customer}",
+                       fontsize=8, color=(1, 1, 1), fontname="helv")
+        pg.insert_text((sx, 32), f"Location: {location}",
+                       fontsize=7, color=(1, 1, 1), fontname="helv")
+
+    @staticmethod
+    def _pdf_footer(pg, W, H, BORDER, FOOTER_H, SIDEBAR_W,
+                    customer, location, page_num, total_pages, rev, red, dark):
+        import datetime as _dt
+        tb_y = H - FOOTER_H
+        pg.draw_rect(fitz.Rect(0, tb_y, W, H), color=dark, fill=dark)
+        pg.insert_text((BORDER,   tb_y + 13), customer,
+                       fontsize=8, color=(1, 1, 1), fontname="helv")
+        pg.insert_text((BORDER,   tb_y + 25), location,
+                       fontsize=7, color=(0.85, 0.85, 0.85), fontname="helv")
+        pg.insert_text((W - 200,  tb_y + 13), "Defense Fire Protection",
+                       fontsize=7, color=(1, 1, 1), fontname="helv")
+        pg.insert_text((W - 200,  tb_y + 23),
+                       _dt.date.today().strftime("Date: %Y-%m-%d"),
+                       fontsize=6, color=(0.9, 0.9, 0.9), fontname="helv")
+        pg.insert_text((W - 100,  tb_y + 13), f"Page {page_num} of {total_pages}",
+                       fontsize=7, color=(1, 1, 1), fontname="helv")
+        pg.insert_text((W - 60,   tb_y + 25), f"REV {rev}",
+                       fontsize=7, color=(1, 1, 1), fontname="helv")
+
+    @staticmethod
+    def _pdf_rev_stamp(pg, W, HEADER_H, SIDEBAR_W, BORDER, rev, rev_d, red):
+        pg.draw_rect(fitz.Rect(W - SIDEBAR_W - 80, 4, W - SIDEBAR_W - 4, HEADER_H - 4),
+                     color=(1, 1, 1), fill=(1, 1, 1), width=0.8)
+        pg.insert_text((W - SIDEBAR_W - 76, 18), f"REV  {rev}",
+                       fontsize=11, color=red, fontname="helv")
+        if rev_d:
+            pg.insert_text((W - SIDEBAR_W - 76, 32), rev_d,
+                           fontsize=7, color=(0.3, 0.3, 0.3), fontname="helv")
