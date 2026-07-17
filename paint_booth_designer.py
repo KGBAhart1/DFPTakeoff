@@ -75,30 +75,68 @@ NOZZLE_DESC  = {
 }
 NOZZLE_COLOR_HEX = {NOZZLE_TF: "#2980b9", NOZZLE_DP: "#27ae60", NOZZLE_3WY: "#e67e22"}
 
-# Zone types
-ZONE_WORK = "Work Area"
-ZONE_PLEN = "Plenum"
-ZONE_DUCT = "Exhaust Duct"
+# Zone types — Figure 4-14 / Table 4-13 (DIOM P/N 60-900007-001)
+ZONE_WORK   = "Work Area"
+ZONE_DUCT   = "Exhaust Duct"
+ZONE_PIT    = "Pit (Straight)"             # D/P nozzle, max 40 ft/nozzle
+# 6 plenum / pit types from Figure 4-14:
+ZONE_CF_BOX = "Cross Flow (Box)"            # row 1 — D/P, 16×4×18 ft/nozzle
+ZONE_CF_DT  = "Cross Flow (Drive Thru)"     # row 2 — D/P, 15×4×12 ft/nozzle, U-shape
+ZONE_RAISED = "Raised Floor"                # row 3 — D/P, 30×15×1 ft/nozzle
+ZONE_SD_EXH = "Side Exhaust"               # row 4 — D/P, 4×4×40 ft/nozzle
+ZONE_PIT_T  = "Pit with Tunnel"             # row 5 — 3-Way, legs≤18 ft, tunnel≤18 ft
+ZONE_PIT_VT = "Pit w/ Vert. Transition"    # row 6 — 3-Way, legs≤18 ft, vert≤14 ft
+# Legacy alias kept for backward compatibility with saved files
+ZONE_PLEN   = "Plenum"
 
 ZONE_FILL = {
-    ZONE_WORK: QColor(41, 128, 185, 35),
-    ZONE_PLEN: QColor(39, 174, 96,  35),
-    ZONE_DUCT: QColor(230, 126, 34, 35),
+    ZONE_WORK:   QColor(41,  128, 185, 35),
+    ZONE_DUCT:   QColor(230, 126, 34,  35),
+    ZONE_PIT:    QColor(120,  80, 40,  50),
+    ZONE_CF_BOX: QColor(39,  174, 96,  35),
+    ZONE_CF_DT:  QColor(26,  188, 120, 35),
+    ZONE_RAISED: QColor(155,  89, 182, 35),
+    ZONE_SD_EXH: QColor(52,  152, 219, 35),
+    ZONE_PIT_T:  QColor(120,  80, 40,  50),
+    ZONE_PIT_VT: QColor(100,  60, 30,  50),
+    ZONE_PLEN:   QColor(39,  174, 96,  35),   # legacy
 }
 ZONE_BORDER_COL = {
-    ZONE_WORK: QColor(41,  128, 185),
-    ZONE_PLEN: QColor(39,  174, 96),
-    ZONE_DUCT: QColor(230, 126, 34),
+    ZONE_WORK:   QColor(41,  128, 185),
+    ZONE_DUCT:   QColor(230, 126, 34),
+    ZONE_PIT:    QColor(140,  90, 40),
+    ZONE_CF_BOX: QColor(39,  174, 96),
+    ZONE_CF_DT:  QColor(26,  188, 120),
+    ZONE_RAISED: QColor(155,  89, 182),
+    ZONE_SD_EXH: QColor(52,  152, 219),
+    ZONE_PIT_T:  QColor(140,  90, 40),
+    ZONE_PIT_VT: QColor(110,  65, 25),
+    ZONE_PLEN:   QColor(39,  174, 96),        # legacy
 }
 
-# Coverage limits (§4-5.1)
-MAX_WORK_VOL_FT3   = 1260.0   # ft³ per TF nozzle (§4-5.1.1)
-MAX_WORK_HEIGHT_FT = 24.0     # ft — per DIOM §4-5.1.1 Table 4-2
-MAX_DUCT_LEN_FT    = 28.0     # ft per DP nozzle (§4-5.1.3)
-MAX_DUCT_DIA_IN    = 48.0     # inches — round duct
-MAX_DUCT_PERIM_IN  = 150.8    # inches — rectangular duct perimeter
-MAX_NOZZLE_OFFSET  = 2.75     # ft — nozzle may be offset this far from module centre
-NOZZLE_TIP_MAX_IN  = 4.75     # inches from ceiling (TF nozzle)
+# Per-nozzle module limits from DIOM Table 4-13 / Figure 4-14
+# (max_L_ft, max_W_ft, max_H_ft)
+PLEN_MODULE = {
+    ZONE_CF_BOX: (16.0, 4.0,  18.0),
+    ZONE_CF_DT:  (15.0, 4.0,  12.0),
+    ZONE_RAISED: (30.0, 15.0,  1.0),
+    ZONE_SD_EXH: (40.0, 4.0,   4.0),
+    ZONE_PLEN:   (15.0, 15.0, 99.0),   # legacy generic
+}
+
+# Coverage limits
+MAX_WORK_VOL_FT3    = 1260.0  # ft³ per TF nozzle (§4-5.1.1)
+MAX_WORK_HEIGHT_FT  = 24.0    # ft — per DIOM §4-5.1.1 Table 4-2
+MAX_DUCT_LEN_FT     = 28.0    # ft per DP nozzle (§4-5.1.3)
+MAX_DUCT_DIA_IN     = 48.0    # inches — round duct
+MAX_DUCT_PERIM_IN   = 150.8   # inches — rectangular duct perimeter
+MAX_NOZZLE_OFFSET   = 2.75    # ft — nozzle may be offset from module centre
+NOZZLE_TIP_MAX_IN   = 4.75    # inches from ceiling (TF nozzle)
+MAX_PIT_STRAIGHT_FT = 40.0    # ft per DP nozzle — straight pit
+MAX_PIT_LEG_FT      = 18.0    # ft per main leg per 3-Way nozzle
+MAX_PIT_TUNNEL_FT   = 18.0    # ft per tunnel arm per 3-Way nozzle (Table 4-5)
+MAX_PIT_VERT_FT     = 14.0    # ft vertical stack height per 3-Way nozzle
+MAX_PIT_CROSS_FT    = 4.0     # ft — standard pit/tunnel cross-section width per single nozzle (Table 4-5)
 
 # Side-wall application limits (§4-5.1.2) — DC-45 with 4 TF nozzles
 SIDEWALL_MAX_L, SIDEWALL_MAX_W, SIDEWALL_MAX_H = 28.0, 15.0, 9.17
@@ -232,21 +270,34 @@ class ZoneData:
     _id_counter = 0
 
     def __init__(self, zone_type=ZONE_WORK, length=20.0, width=14.0, height=9.0,
-                 nozzle_type=None, label="", x=0.0, y=0.0, nozzle_override=None):
+                 nozzle_type=None, label="", x=0.0, y=0.0, nozzle_override=None,
+                 tunnel_length=18.0, tunnel_width=None):
         ZoneData._id_counter += 1
         self.uid = ZoneData._id_counter
-        self.zone_type   = zone_type
-        self.length      = float(length)
-        self.width       = float(width)
-        self.height      = float(height)
-        self.nozzle_type = nozzle_type or self._default_nozzle()
-        self.label       = label or f"{zone_type} {self.uid}"
-        self.x           = float(x)   # ft from scene origin
-        self.y           = float(y)
+        self.zone_type     = zone_type
+        self.length        = float(length)
+        self.width         = float(width)
+        self.height        = float(height)
+        self.tunnel_length = float(tunnel_length)  # ZONE_PIT_T only
+        self.tunnel_width  = float(tunnel_width) if tunnel_width is not None else float(width)  # ZONE_PIT_T only
+        self.nozzle_type   = nozzle_type or self._default_nozzle()
+        self.label         = label or f"{zone_type} {self.uid}"
+        self.x             = float(x)   # ft from scene origin
+        self.y             = float(y)
         self.nozzle_override = nozzle_override  # int or None — override auto count
 
     def _default_nozzle(self):
-        return {ZONE_WORK: NOZZLE_TF, ZONE_PLEN: NOZZLE_DP, ZONE_DUCT: NOZZLE_DP}[self.zone_type]
+        return {
+            ZONE_WORK:   NOZZLE_TF,
+            ZONE_DUCT:   NOZZLE_DP,
+            ZONE_CF_BOX: NOZZLE_DP,
+            ZONE_CF_DT:  NOZZLE_DP,
+            ZONE_RAISED: NOZZLE_DP,
+            ZONE_SD_EXH: NOZZLE_DP,
+            ZONE_PIT_T:  NOZZLE_3WY,
+            ZONE_PIT_VT: NOZZLE_3WY,
+            ZONE_PLEN:   NOZZLE_DP,
+        }.get(self.zone_type, NOZZLE_DP)
 
     @property
     def volume(self):
@@ -260,9 +311,30 @@ class ZoneData:
             return _work_area_modules(self.length, self.width, self.height)[0]
         elif self.zone_type == ZONE_DUCT:
             return max(1, math.ceil(self.length / MAX_DUCT_LEN_FT))
-        else:  # Plenum — 1 nozzle covers 15ft L × 15ft W per §4-5.1.4
-            area = self.length * self.width
-            return max(1, math.ceil(area / (15.0 * 15.0)))
+        elif self.zone_type in PLEN_MODULE:
+            # Grid of nozzles based on per-nozzle module dimensions (Table 4-13)
+            mL, mW, _ = PLEN_MODULE[self.zone_type]
+            nL = max(1, math.ceil(self.length / mL))
+            nW = max(1, math.ceil(self.width  / mW))
+            return nL * nW
+        elif self.zone_type == ZONE_PIT:
+            n_len = max(1, math.ceil(self.length / MAX_PIT_STRAIGHT_FT))
+            n_wid = max(1, math.ceil(self.width  / MAX_PIT_CROSS_FT))
+            return n_len * n_wid
+        elif self.zone_type == ZONE_PIT_T:
+            tw = getattr(self, "tunnel_width", self.width)
+            n_main = (max(1, math.ceil(self.length / (MAX_PIT_LEG_FT * 2)))
+                      * max(1, math.ceil(self.width / MAX_PIT_CROSS_FT)))
+            n_tun  = (max(1, math.ceil(self.tunnel_length / MAX_PIT_TUNNEL_FT))
+                      * max(1, math.ceil(tw / MAX_PIT_CROSS_FT)))
+            return max(n_main, n_tun)
+        elif self.zone_type == ZONE_PIT_VT:
+            n_main = (max(1, math.ceil(self.length / (MAX_PIT_LEG_FT * 2)))
+                      * max(1, math.ceil(self.width / MAX_PIT_CROSS_FT)))
+            n_vert = max(1, math.ceil(self.tunnel_length / MAX_PIT_VERT_FT))
+            return max(n_main, n_vert)
+        else:
+            return 1
 
     @property
     def module_info(self):
@@ -280,13 +352,65 @@ class ZoneData:
         w = []
         if self.zone_type == ZONE_WORK:
             if self.height > 24.0:
-                w.append(f"[{self.label}] Height {self.height:.1f} ft exceeds 24 ft max (DIOM §4-5.1.1)")
+                w.append(f"[{self.label}] Height {self.height:.1f} ft exceeds 24 ft max (Table 4-2)")
             vol_per = self.volume / max(1, self.nozzle_count)
             if vol_per > MAX_WORK_VOL_FT3:
-                w.append(f"[{self.label}] Volume per nozzle {vol_per:.0f} ft³ exceeds 1,260 ft³ max")
+                w.append(f"[{self.label}] Volume/nozzle {vol_per:.0f} ft³ exceeds 1,260 ft³ max")
         elif self.zone_type == ZONE_DUCT:
             if self.length / max(1, self.nozzle_count) > MAX_DUCT_LEN_FT:
-                w.append(f"[{self.label}] Each duct nozzle covers >{MAX_DUCT_LEN_FT:.0f} ft — add another DP nozzle")
+                w.append(f"[{self.label}] Duct segment exceeds {MAX_DUCT_LEN_FT:.0f} ft max per DP nozzle")
+        elif self.zone_type == ZONE_PIT:
+            n_len = max(1, math.ceil(self.length / MAX_PIT_STRAIGHT_FT))
+            n_wid = max(1, math.ceil(self.width  / MAX_PIT_CROSS_FT))
+            seg = self.length / n_len
+            seg_w = self.width / n_wid
+            if seg > MAX_PIT_STRAIGHT_FT:
+                w.append(f"[{self.label}] Pit segment {seg:.0f} ft exceeds {MAX_PIT_STRAIGHT_FT:.0f} ft max per DP nozzle")
+            if seg_w > MAX_PIT_CROSS_FT:
+                w.append(f"[{self.label}] Pit cross-section {seg_w:.1f} ft wide exceeds {MAX_PIT_CROSS_FT:.0f} ft max per DP nozzle")
+        elif self.zone_type in PLEN_MODULE:
+            mL, mW, mH = PLEN_MODULE[self.zone_type]
+            if self.height > mH:
+                w.append(f"[{self.label}] Height {self.height:.1f} ft exceeds {mH:.0f} ft max (Figure 4-14)")
+            nL = max(1, math.ceil(self.length / mL))
+            nW = max(1, math.ceil(self.width  / mW))
+            seg_L = self.length / nL
+            seg_W = self.width  / nW
+            if seg_L > mL:
+                w.append(f"[{self.label}] Module length {seg_L:.1f} ft exceeds {mL:.0f} ft max")
+            if seg_W > mW:
+                w.append(f"[{self.label}] Module width {seg_W:.1f} ft exceeds {mW:.0f} ft max")
+        elif self.zone_type == ZONE_PIT_T:
+            tw = getattr(self, "tunnel_width", self.width)
+            n_main_len = max(1, math.ceil(self.length / (MAX_PIT_LEG_FT * 2)))
+            n_main_wid = max(1, math.ceil(self.width  / MAX_PIT_CROSS_FT))
+            leg = self.length / n_main_len / 2
+            leg_w = self.width / n_main_wid
+            if leg > MAX_PIT_LEG_FT:
+                w.append(f"[{self.label}] Pit leg {leg:.0f} ft exceeds {MAX_PIT_LEG_FT:.0f} ft max per 3-Way")
+            if leg_w > MAX_PIT_CROSS_FT:
+                w.append(f"[{self.label}] Pit cross-section {leg_w:.1f} ft wide exceeds {MAX_PIT_CROSS_FT:.0f} ft max per 3-Way")
+            n_tun_len = max(1, math.ceil(self.tunnel_length / MAX_PIT_TUNNEL_FT))
+            n_tun_wid = max(1, math.ceil(tw / MAX_PIT_CROSS_FT))
+            tun = self.tunnel_length / n_tun_len
+            tun_w = tw / n_tun_wid
+            if tun > MAX_PIT_TUNNEL_FT:
+                w.append(f"[{self.label}] Tunnel {tun:.0f} ft exceeds {MAX_PIT_TUNNEL_FT:.0f} ft max per 3-Way")
+            if tun_w > MAX_PIT_CROSS_FT:
+                w.append(f"[{self.label}] Tunnel width {tun_w:.1f} ft exceeds {MAX_PIT_CROSS_FT:.0f} ft max per 3-Way")
+        elif self.zone_type == ZONE_PIT_VT:
+            n_main_len = max(1, math.ceil(self.length / (MAX_PIT_LEG_FT * 2)))
+            n_main_wid = max(1, math.ceil(self.width  / MAX_PIT_CROSS_FT))
+            leg = self.length / n_main_len / 2
+            leg_w = self.width / n_main_wid
+            if leg > MAX_PIT_LEG_FT:
+                w.append(f"[{self.label}] Pit leg {leg:.0f} ft exceeds {MAX_PIT_LEG_FT:.0f} ft max per 3-Way")
+            if leg_w > MAX_PIT_CROSS_FT:
+                w.append(f"[{self.label}] Pit cross-section {leg_w:.1f} ft wide exceeds {MAX_PIT_CROSS_FT:.0f} ft max per 3-Way")
+            n_vert = max(1, math.ceil(self.tunnel_length / MAX_PIT_VERT_FT))
+            vt = self.tunnel_length / n_vert
+            if vt > MAX_PIT_VERT_FT:
+                w.append(f"[{self.label}] Vert. stack {vt:.0f} ft exceeds {MAX_PIT_VERT_FT:.0f} ft max per 3-Way")
         return w
 
     def to_dict(self):
@@ -324,16 +448,34 @@ class ZoneItem(QGraphicsItem):
         z = self.zone
         w_px = z.length * PX_PER_FT
         h_px = z.height * PX_PER_FT
-        dx = _ddx(z.width)
-        dy = _ddy(z.width)   # negative (up on screen)
-        pad = 24
-        # x: 0 .. w_px+dx  |  y: dy .. h_px  (dy < 0, so extends above origin)
+        dx   = _ddx(z.width)
+        dy   = _ddy(z.width)   # negative (up on screen)
+        pad  = 24
+        if z.zone_type == ZONE_PIT_T:
+            # Extend to cover tunnel going deeper, and widen pad if the tunnel
+            # is wider than the main shaft (tunnel_width can differ from width)
+            tdx = _ddx(z.width + z.tunnel_length)
+            tdy = _ddy(z.width + z.tunnel_length)
+            tw  = getattr(z, "tunnel_width", z.width)
+            extra = max(0.0, (tw - z.width) / 2 * PX_PER_FT)
+            return QRectF(0 - extra, min(dy, tdy) - pad,
+                          w_px + tdx + pad + extra, h_px - min(dy, tdy) + pad)
         return QRectF(0, dy - pad, w_px + dx + pad, h_px - dy + pad)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
-            self.zone.x = self.pos().x() / PX_PER_FT
-            self.zone.y = self.pos().y() / PX_PER_FT
+            new_pos = self.pos()
+            # Delta since last zone position — move associated nozzles with us
+            old_x_px = self.zone.x * PX_PER_FT
+            old_y_px = self.zone.y * PX_PER_FT
+            dx = new_pos.x() - old_x_px
+            dy = new_pos.y() - old_y_px
+            self.zone.x = new_pos.x() / PX_PER_FT
+            self.zone.y = new_pos.y() / PX_PER_FT
+            if (dx != 0 or dy != 0) and hasattr(self._scene_ref, "_nozzle_items"):
+                for n in self._scene_ref._nozzle_items:
+                    if n.zone_uid == self.zone.uid:
+                        n.setPos(n.pos().x() + dx, n.pos().y() + dy)
             if hasattr(self._scene_ref, "_on_zone_moved"):
                 self._scene_ref._on_zone_moved()
         return super().itemChange(change, value)
@@ -347,6 +489,21 @@ class ZoneItem(QGraphicsItem):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
         z = self.zone
+
+        # ── Pit / special plenum zones — delegated renderers ─────────────────
+        if z.zone_type in (ZONE_PIT_T, ZONE_PIT_VT):
+            self._paint_pit(painter, z)
+            return
+        if z.zone_type == ZONE_CF_DT:
+            self._paint_drive_thru(painter, z)
+            return
+        if z.zone_type == ZONE_RAISED:
+            self._paint_raised_floor(painter, z)
+            return
+        if z.zone_type == ZONE_SD_EXH:
+            self._paint_side_exhaust(painter, z)
+            return
+
         w_px = z.length * PX_PER_FT
         h_px = z.height * PX_PER_FT
         dx   = _ddx(z.width)
@@ -444,11 +601,265 @@ class ZoneItem(QGraphicsItem):
             painter.drawText(QRectF(5, h_px - 18, w_px - 10, 14),
                              Qt.AlignLeft, "⚠ " + z.warnings()[0])
 
+    def _paint_pit(self, painter, z):
+        """Draw pit zones as hatched floor-level channels."""
+        border  = ZONE_BORDER_COL[z.zone_type]
+        fill    = ZONE_FILL[z.zone_type]
+        sel_col = QColor(_PALETTE_ORANGE)
+        is_sel  = self.isSelected() or self._hover
+        pen_w   = 2.5 if is_sel else 1.8
+
+        L_px = z.length * PX_PER_FT
+        W_px = z.width  * PX_PER_FT
+        dx   = _ddx(z.width)
+        dy   = _ddy(z.width)   # negative (up)
+
+        def _flat_quad(x0, y0, l_ft, w_ft):
+            """Isometric top-face parallelogram for a ground-plane rectangle."""
+            lp = l_ft * PX_PER_FT
+            ddx_ = _ddx(w_ft); ddy_ = _ddy(w_ft)
+            return QPolygonF([
+                QPointF(x0,        y0),
+                QPointF(x0 + lp,   y0),
+                QPointF(x0 + lp + ddx_, y0 + ddy_),
+                QPointF(x0 + ddx_, y0 + ddy_),
+            ])
+
+        # Build path from the shaft(s)
+        path = QPainterPath()
+
+        # Main shaft
+        shaft = _flat_quad(0, 0, z.length, z.width)
+        path.addPolygon(shaft)
+        path.closeSubpath()
+
+        if z.zone_type == ZONE_PIT_T:
+            # Tunnel branches off perpendicular from center of main shaft's far edge.
+            # "Far edge" is the back side; tunnel goes further in depth direction.
+            t_L  = z.tunnel_length
+            t_W  = getattr(z, "tunnel_width", z.width)
+            # Center of main shaft along its length
+            cx   = L_px / 2 + _ddx(z.width)
+            cy   = _ddy(z.width)
+            # Tunnel is tunnel_width × tunnel_length, centered on that midpoint
+            half = t_W / 2 * PX_PER_FT
+            tunnel = QPolygonF([
+                QPointF(cx - half,              cy),
+                QPointF(cx + half,              cy),
+                QPointF(cx + half + _ddx(t_L),  cy + _ddy(t_L)),
+                QPointF(cx - half + _ddx(t_L),  cy + _ddy(t_L)),
+            ])
+            path.addPolygon(tunnel)
+            path.closeSubpath()
+
+        # Fill
+        fill_col = QColor(border.red(), border.green(), border.blue(), 55)
+        painter.setBrush(QBrush(fill_col))
+        painter.setPen(QPen(sel_col if is_sel else border.darker(110), pen_w))
+        painter.drawPath(path)
+
+        # Cross-hatch to mark it as below-grade
+        hatch_pen = QPen(QColor(border.red(), border.green(), border.blue(), 80), 0.8)
+        painter.setPen(hatch_pen)
+        # Hatch lines along the shaft
+        n_lines = max(2, int(z.length / 4))
+        for i in range(1, n_lines):
+            f = i / n_lines
+            x0_ = f * L_px;        y0_ = 0.0
+            x1_ = x0_ + dx;        y1_ = dy
+            painter.drawLine(QPointF(x0_, y0_), QPointF(x1_, y1_))
+
+        # Labels
+        painter.setPen(QPen(border.darker(150)))
+        painter.setFont(QFont("Arial", 8, QFont.Bold))
+        painter.drawText(QRectF(4, -18, L_px - 8, 16), Qt.AlignLeft | Qt.AlignVCenter, z.label)
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QPen(border.darker(130)))
+        if z.zone_type == ZONE_PIT_T:
+            tw = getattr(z, "tunnel_width", z.width)
+            info = f"Main {z.length:.0f}′ × Tunnel {z.tunnel_length:.0f}′L × {tw:.0f}′W"
+        else:
+            info = f"{z.length:.0f}′ long × {z.width:.0f}′ wide"
+        painter.drawText(QRectF(4, -5, L_px - 8, 14), Qt.AlignLeft | Qt.AlignVCenter, info)
+        noz_txt = f"{z.nozzle_count}× {z.nozzle_type}"
+        painter.drawText(QRectF(4, 8, L_px - 8, 14), Qt.AlignLeft | Qt.AlignVCenter, noz_txt)
+        if z.warnings():
+            painter.setPen(QPen(QColor("#e74c3c"), 1))
+            painter.setFont(QFont("Arial", 7, QFont.Bold))
+            painter.drawText(QRectF(4, 20, L_px - 8, 14), Qt.AlignLeft, "⚠ " + z.warnings()[0])
+
+    def _paint_drive_thru(self, painter, z):
+        """Cross Flow Drive-Thru — U-shape (open on two ends, side walls only)."""
+        border = ZONE_BORDER_COL.get(z.zone_type, QColor(26, 188, 120))
+        is_sel = self.isSelected() or self._hover
+        pen_w  = 2.5 if is_sel else 1.8
+        sel_col = QColor(_PALETTE_ORANGE)
+
+        L_px = z.length * PX_PER_FT
+        H_px = z.height * PX_PER_FT
+        dx   = _ddx(z.width)
+        dy   = _ddy(z.width)
+
+        # Draw as a standard 3-D box but with dashed front/back faces to show open ends
+        fill_col = QColor(border.red(), border.green(), border.blue(), 40)
+        painter.setBrush(QBrush(fill_col))
+        painter.setPen(QPen(sel_col if is_sel else border.darker(110), pen_w))
+
+        # Top face
+        top = QPolygonF([QPointF(0, 0), QPointF(L_px, 0),
+                         QPointF(L_px + dx, dy), QPointF(dx, dy)])
+        painter.drawPolygon(top)
+
+        # Left side face (solid — closed end)
+        left = QPolygonF([QPointF(0, 0), QPointF(0, H_px),
+                          QPointF(dx, H_px + dy), QPointF(dx, dy)])
+        painter.drawPolygon(left)
+
+        # Right side face (solid — closed end)
+        right = QPolygonF([QPointF(L_px, 0), QPointF(L_px, H_px),
+                           QPointF(L_px + dx, H_px + dy), QPointF(L_px + dx, dy)])
+        painter.drawPolygon(right)
+
+        # Front and back edges drawn dashed to show open ends
+        dash_pen = QPen(sel_col if is_sel else border, pen_w, Qt.DashLine)
+        painter.setPen(dash_pen)
+        painter.drawLine(QPointF(0, 0), QPointF(0, H_px))           # front-left edge
+        painter.drawLine(QPointF(L_px, 0), QPointF(L_px, H_px))     # front-right edge
+        painter.drawLine(QPointF(dx, dy), QPointF(dx, H_px + dy))   # back-left edge
+        painter.drawLine(QPointF(L_px + dx, dy), QPointF(L_px + dx, H_px + dy))  # back-right
+
+        # Label
+        painter.setPen(QPen(border.darker(150)))
+        painter.setFont(QFont("Arial", 8, QFont.Bold))
+        painter.drawText(QRectF(5, 5, L_px - 10, 16), Qt.AlignLeft | Qt.AlignVCenter, z.label)
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QPen(border.darker(130)))
+        painter.drawText(QRectF(5, 20, L_px - 10, 14), Qt.AlignLeft,
+                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.0f}′  {z.nozzle_count}× {z.nozzle_type}")
+        if z.warnings():
+            painter.setPen(QPen(QColor("#e74c3c"), 1))
+            painter.setFont(QFont("Arial", 7, QFont.Bold))
+            painter.drawText(QRectF(5, 34, L_px - 10, 14), Qt.AlignLeft, "⚠ " + z.warnings()[0])
+
+    def _paint_raised_floor(self, painter, z):
+        """Raised Floor — very flat isometric box."""
+        border = ZONE_BORDER_COL.get(z.zone_type, QColor(155, 89, 182))
+        is_sel = self.isSelected() or self._hover
+        pen_w  = 2.5 if is_sel else 1.8
+        sel_col = QColor(_PALETTE_ORANGE)
+
+        L_px = z.length * PX_PER_FT
+        H_px = max(z.height * PX_PER_FT, 6.0)   # min visual thickness
+        dx   = _ddx(z.width)
+        dy   = _ddy(z.width)
+
+        fill_col = QColor(border.red(), border.green(), border.blue(), 50)
+        painter.setBrush(QBrush(fill_col))
+        painter.setPen(QPen(sel_col if is_sel else border.darker(110), pen_w))
+
+        # Top face (dominant — it's mostly flat)
+        top = QPolygonF([QPointF(0, 0), QPointF(L_px, 0),
+                         QPointF(L_px + dx, dy), QPointF(dx, dy)])
+        painter.drawPolygon(top)
+
+        # Front face (thin)
+        front = QPolygonF([QPointF(0, 0), QPointF(L_px, 0),
+                           QPointF(L_px, H_px), QPointF(0, H_px)])
+        painter.drawPolygon(front)
+
+        # Right face (thin)
+        right = QPolygonF([QPointF(L_px, 0), QPointF(L_px + dx, dy),
+                           QPointF(L_px + dx, H_px + dy), QPointF(L_px, H_px)])
+        painter.drawPolygon(right)
+
+        # Dot grid on top face to suggest floor grating
+        dot_pen = QPen(border.darker(130), 1.5)
+        painter.setPen(dot_pen)
+        cols = max(2, int(z.length / 5))
+        rows = max(2, int(z.width  / 5))
+        for r in range(1, rows):
+            for c in range(1, cols):
+                fx = c / cols; fy = r / rows
+                px = fx * L_px + _ddx(z.width * fy)
+                py = _ddy(z.width * fy)
+                painter.drawPoint(QPointF(px, py))
+
+        # Label
+        painter.setPen(QPen(border.darker(150)))
+        painter.setFont(QFont("Arial", 8, QFont.Bold))
+        painter.drawText(QRectF(5, H_px + 2, L_px - 10, 16), Qt.AlignLeft, z.label)
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QPen(border.darker(130)))
+        painter.drawText(QRectF(5, H_px + 16, L_px - 10, 14), Qt.AlignLeft,
+                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.1f}′  {z.nozzle_count}× {z.nozzle_type}")
+        if z.warnings():
+            painter.setPen(QPen(QColor("#e74c3c"), 1))
+            painter.setFont(QFont("Arial", 7, QFont.Bold))
+            painter.drawText(QRectF(5, H_px + 30, L_px - 10, 14), Qt.AlignLeft, "⚠ " + z.warnings()[0])
+
+    def _paint_side_exhaust(self, painter, z):
+        """Side Exhaust — narrow tall channel drawn as a vertical isometric slab."""
+        border = ZONE_BORDER_COL.get(z.zone_type, QColor(52, 152, 219))
+        is_sel = self.isSelected() or self._hover
+        pen_w  = 2.5 if is_sel else 1.8
+        sel_col = QColor(_PALETTE_ORANGE)
+
+        L_px = z.length * PX_PER_FT
+        H_px = z.height * PX_PER_FT
+        dx   = _ddx(z.width)
+        dy   = _ddy(z.width)
+
+        fill_col = QColor(border.red(), border.green(), border.blue(), 40)
+        painter.setBrush(QBrush(fill_col))
+        painter.setPen(QPen(sel_col if is_sel else border.darker(110), pen_w))
+
+        # Front face (tall, narrow)
+        front = QPolygonF([QPointF(0, 0), QPointF(L_px, 0),
+                           QPointF(L_px, H_px), QPointF(0, H_px)])
+        painter.drawPolygon(front)
+
+        # Top face (shallow depth)
+        top = QPolygonF([QPointF(0, 0), QPointF(L_px, 0),
+                         QPointF(L_px + dx, dy), QPointF(dx, dy)])
+        painter.drawPolygon(top)
+
+        # Right face
+        right = QPolygonF([QPointF(L_px, 0), QPointF(L_px + dx, dy),
+                           QPointF(L_px + dx, H_px + dy), QPointF(L_px, H_px)])
+        painter.drawPolygon(right)
+
+        # Horizontal stripes on front face to suggest louver vents
+        stripe_pen = QPen(QColor(border.red(), border.green(), border.blue(), 90), 0.8)
+        painter.setPen(stripe_pen)
+        n_stripes = max(3, int(z.height / 2))
+        for i in range(1, n_stripes):
+            y = i / n_stripes * H_px
+            painter.drawLine(QPointF(2, y), QPointF(L_px - 2, y))
+
+        # Label
+        painter.setPen(QPen(border.darker(150)))
+        painter.setFont(QFont("Arial", 8, QFont.Bold))
+        painter.drawText(QRectF(5, 5, L_px - 10, 16), Qt.AlignLeft | Qt.AlignVCenter, z.label)
+        painter.setFont(QFont("Arial", 7))
+        painter.setPen(QPen(border.darker(130)))
+        painter.drawText(QRectF(5, 20, L_px - 10, 14), Qt.AlignLeft,
+                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.0f}′  {z.nozzle_count}× {z.nozzle_type}")
+        if z.warnings():
+            painter.setPen(QPen(QColor("#e74c3c"), 1))
+            painter.setFont(QFont("Arial", 7, QFont.Bold))
+            painter.drawText(QRectF(5, 34, L_px - 10, 14), Qt.AlignLeft, "⚠ " + z.warnings()[0])
+
     def contextMenuEvent(self, event):
         menu = QMenu()
-        menu.addAction("Edit Zone…",   lambda: self._scene_ref._edit_zone(self))
-        menu.addAction("Delete Zone",  lambda: self._scene_ref._delete_zone(self))
-        menu.exec_(event.screenPos())
+        edit_act = menu.addAction("Edit Zone…")
+        del_act  = menu.addAction("Delete Zone")
+        chosen   = menu.exec_(event.screenPos())
+        # Deferred via QTimer — deleting `self` synchronously while still inside
+        # its own contextMenuEvent (which Qt is mid-dispatch on) can crash.
+        if chosen == edit_act:
+            QTimer.singleShot(0, lambda: self._scene_ref._edit_zone(self))
+        elif chosen == del_act:
+            QTimer.singleShot(0, lambda: self._scene_ref._delete_zone(self))
 
 
 class BoothShellItem(QGraphicsItem):
@@ -616,7 +1027,9 @@ class NozzleItem(QGraphicsItem):
         elif chosen == dp_act:  self.nozzle_type = NOZZLE_DP;  self.update()
         elif chosen == wy_act:  self.nozzle_type = NOZZLE_3WY; self.update()
         elif chosen == del_act and self._scene_ref:
-            self._scene_ref.remove_nozzle(self)
+            # Defer the actual scene removal — deleting `self` synchronously while
+            # still inside its own contextMenuEvent can crash Qt's event dispatch.
+            QTimer.singleShot(0, lambda: self._scene_ref.remove_nozzle(self))
 
 
 class LinkItem(QGraphicsItem):
@@ -671,7 +1084,7 @@ class LinkItem(QGraphicsItem):
         del_act  = menu.addAction("Delete Link")
         chosen   = menu.exec_(event.screenPos())
         if chosen == del_act and self._scene_ref:
-            self._scene_ref.remove_link(self)
+            QTimer.singleShot(0, lambda: self._scene_ref.remove_link(self))
         else:
             for act, det in zip(acts, DETECTOR_TYPES):
                 if chosen == act:
@@ -727,7 +1140,7 @@ class CylinderItem(QGraphicsItem):
         del_act = menu.addAction("Delete Cylinder")
         chosen  = menu.exec_(event.screenPos())
         if chosen == del_act and self._scene_ref:
-            self._scene_ref.remove_cylinder(self)
+            QTimer.singleShot(0, lambda: self._scene_ref.remove_cylinder(self))
         else:
             for act, c in zip(acts, CYLINDERS):
                 if chosen == act:
@@ -779,6 +1192,11 @@ class BoothScene(QGraphicsScene):
 
     def remove_zone(self, item: ZoneItem):
         self._zone_items = [z for z in self._zone_items if z is not item]
+        # Clean up nozzles auto-spawned for this zone — otherwise they're left
+        # orphaned in the scene, referencing a zone uid that no longer exists.
+        for n in [n for n in self._nozzle_items if n.zone_uid == item.zone.uid]:
+            self.removeItem(n)
+        self._nozzle_items = [n for n in self._nozzle_items if n.zone_uid != item.zone.uid]
         self.removeItem(item)
         self.zones_changed.emit()
 
@@ -824,6 +1242,67 @@ class BoothScene(QGraphicsScene):
                 nx = sx + w_px * (i + 1) / (nc + 1)
                 ny = sy + h_px / 2
                 n = self.add_nozzle(z.nozzle_type, nx, ny)
+                n.zone_uid = z.uid
+        elif z.zone_type == ZONE_PIT:
+            for i in range(nc):
+                f  = (i + 0.5) / nc
+                nx = sx + f * w_px + _ddx(z.width) * 0.5
+                ny = sy + _ddy(z.width) * 0.5
+                n  = self.add_nozzle(z.nozzle_type, nx, ny)
+                n.zone_uid = z.uid
+        elif z.zone_type in PLEN_MODULE:
+            # Grid layout based on DIOM module limits
+            mL, mW, _ = PLEN_MODULE[z.zone_type]
+            nL = max(1, math.ceil(z.length / mL))
+            nW = max(1, math.ceil(z.width  / mW))
+            for r in range(nW):
+                for c in range(nL):
+                    fx = (c + 0.5) / nL
+                    fy = (r + 0.5) / nW
+                    nx = sx + fx * w_px + _ddx(z.width * fy)
+                    ny = sy + fy * _ddy(z.width)
+                    n  = self.add_nozzle(z.nozzle_type, nx, ny)
+                    n.zone_uid = z.uid
+        elif z.zone_type == ZONE_PIT_T:
+            # 3-Way nozzles go on whichever branch (main legs or tunnel) needs
+            # the most modules — placed along that branch's own direction so
+            # a nozzle driven by tunnel width actually sits in the tunnel.
+            tw = getattr(z, "tunnel_width", z.width)
+            n_main_len = max(1, math.ceil(z.length / (MAX_PIT_LEG_FT * 2)))
+            n_main_wid = max(1, math.ceil(z.width  / MAX_PIT_CROSS_FT))
+            n_tun_len  = max(1, math.ceil(z.tunnel_length / MAX_PIT_TUNNEL_FT))
+            n_tun_wid  = max(1, math.ceil(tw / MAX_PIT_CROSS_FT))
+
+            if n_tun_len * n_tun_wid >= n_main_len * n_main_wid:
+                # Place along the tunnel branch (junction of main shaft, extending
+                # in the tunnel's own depth direction — same diagonal it's drawn on)
+                cx0 = sx + w_px / 2 + _ddx(z.width)
+                cy0 = sy + _ddy(z.width)
+                t_L = z.tunnel_length
+                for r in range(n_tun_wid):
+                    for c in range(n_tun_len):
+                        fx = (c + 0.5) / n_tun_len
+                        fy = (r + 0.5) / n_tun_wid
+                        nx = cx0 + _ddx(t_L * fx) + (fy - 0.5) * tw * PX_PER_FT
+                        ny = cy0 + _ddy(t_L * fx)
+                        n  = self.add_nozzle(z.nozzle_type, nx, ny)
+                        n.zone_uid = z.uid
+            else:
+                for r in range(n_main_wid):
+                    for c in range(n_main_len):
+                        fx = (c + 0.5) / n_main_len
+                        fy = (r + 0.5) / n_main_wid
+                        nx = sx + fx * w_px + _ddx(z.width * fy)
+                        ny = sy + fy * _ddy(z.width)
+                        n  = self.add_nozzle(z.nozzle_type, nx, ny)
+                        n.zone_uid = z.uid
+        elif z.zone_type == ZONE_PIT_VT:
+            # 3-Way nozzles placed at junction points
+            for i in range(nc):
+                f  = (i + 0.5) / nc
+                nx = sx + f * w_px + _ddx(z.width)
+                ny = sy + _ddy(z.width)
+                n  = self.add_nozzle(z.nozzle_type, nx, ny)
                 n.zone_uid = z.uid
 
     # ── Nozzles ──────────────────────────────────────────────────────────────
@@ -967,7 +1446,11 @@ class ZoneDialog(QDialog):
         layout.addRow("Label:", self.lbl_edit)
 
         self.type_combo = QComboBox()
-        self.type_combo.addItems([ZONE_WORK, ZONE_PLEN, ZONE_DUCT])
+        self.type_combo.addItems([
+            ZONE_WORK, ZONE_DUCT,
+            ZONE_CF_BOX, ZONE_CF_DT, ZONE_RAISED, ZONE_SD_EXH,
+            ZONE_PIT, ZONE_PIT_T, ZONE_PIT_VT,
+        ])
         if z:
             self.type_combo.setCurrentText(z.zone_type)
         self.type_combo.currentTextChanged.connect(self._on_type_changed)
@@ -981,9 +1464,17 @@ class ZoneDialog(QDialog):
         self.sp_L = _spin(z.length if z else 20.0)
         self.sp_W = _spin(z.width  if z else 14.0)
         self.sp_H = _spin(z.height if z else 9.0)
+        tl_default = z.tunnel_length if (z and hasattr(z, "tunnel_length")) else 18.0
+        self.sp_T = _spin(tl_default, mn=1.0, mx=200.0)
+        tw_default = z.tunnel_width if (z and hasattr(z, "tunnel_width")) else (z.width if z else 4.0)
+        self.sp_TW = _spin(tw_default, mn=1.0, mx=200.0)
         layout.addRow("Length (L):", self.sp_L)
         self.sp_W_row = layout.addRow("Width (W):",  self.sp_W)
         self.sp_H_row = layout.addRow("Height (H):", self.sp_H)
+        self._sp_T_label = QLabel("Tunnel Length:")
+        self._sp_T_row   = layout.addRow(self._sp_T_label, self.sp_T)
+        self._sp_TW_label = QLabel("Tunnel Width:")
+        self._sp_TW_row   = layout.addRow(self._sp_TW_label, self.sp_TW)
 
         self.nozzle_combo = QComboBox()
         self.nozzle_combo.addItems([NOZZLE_TF, NOZZLE_DP, NOZZLE_3WY])
@@ -1016,45 +1507,78 @@ class ZoneDialog(QDialog):
         self._on_type_changed(self.type_combo.currentText())
 
     def _on_type_changed(self, zone_type):
-        is_duct = zone_type == ZONE_DUCT
-        # W and H less relevant for duct (width = duct diameter, H = duct height)
-        lbl_map = {
-            ZONE_WORK: ("Length (L):", "Width (W):",  "Height (H):"),
-            ZONE_PLEN: ("Length (L):", "Width (W):",  "Height (H):"),
-            ZONE_DUCT: ("Duct Length (L):", "Duct Width/Dia.:", "Duct Height:"),
+        nozzle_default = {
+            ZONE_WORK:   NOZZLE_TF,
+            ZONE_DUCT:   NOZZLE_DP,
+            ZONE_CF_BOX: NOZZLE_DP,
+            ZONE_CF_DT:  NOZZLE_DP,
+            ZONE_RAISED: NOZZLE_DP,
+            ZONE_SD_EXH: NOZZLE_DP,
+            ZONE_PIT:    NOZZLE_DP,
+            ZONE_PIT_T:  NOZZLE_3WY,
+            ZONE_PIT_VT: NOZZLE_3WY,
+            ZONE_PLEN:   NOZZLE_DP,
         }
-        lbls = lbl_map.get(zone_type, ("Length:", "Width:", "Height:"))
-        # Update labels in form — find by row widget
-        for row, lbl in enumerate([lbls[0], lbls[1], lbls[2]]):
-            pass  # QFormLayout doesn't expose row labels easily; rely on tooltips
-        nozzle_default = {ZONE_WORK: NOZZLE_TF, ZONE_PLEN: NOZZLE_DP, ZONE_DUCT: NOZZLE_DP}
         self.nozzle_combo.setCurrentText(nozzle_default.get(zone_type, NOZZLE_DP))
 
+        # Preset sensible defaults for pit cross-section
+        is_pit = zone_type in (ZONE_PIT, ZONE_PIT_T, ZONE_PIT_VT)
+        if is_pit:
+            if self.sp_W.value() > 8.0:
+                self.sp_W.setValue(4.0)
+            if self.sp_H.value() > 8.0:
+                self.sp_H.setValue(4.0)
+
+        # Show/hide tunnel/vert-stack length row
+        show_tunnel = zone_type in (ZONE_PIT_T, ZONE_PIT_VT)
+        if zone_type == ZONE_PIT_VT:
+            self._sp_T_label.setText("Vert. Stack Ht:")
+        else:
+            self._sp_T_label.setText("Tunnel Length:")
+        self.sp_T.setVisible(show_tunnel)
+        self._sp_T_label.setVisible(show_tunnel)
+
+        # Tunnel width only applies to the horizontal tunnel (Pit with Tunnel)
+        show_tunnel_w = zone_type == ZONE_PIT_T
+        self.sp_TW.setVisible(show_tunnel_w)
+        self._sp_TW_label.setVisible(show_tunnel_w)
+
         tips = {
-            ZONE_WORK: "Max 1,260 ft³ per TF nozzle · Max height 24 ft (Table 4-2)",
-            ZONE_PLEN: "Nozzle centered overhead, tip 0-4.75\" from ceiling",
-            ZONE_DUCT: "Max 28 ft per DP nozzle · Max round duct Ø 48\"",
+            ZONE_WORK:   "Max 1,260 ft³ per TF nozzle · Max height 24 ft (Table 4-2)",
+            ZONE_DUCT:   "Max 28 ft per DP nozzle · Max round duct Ø 48\"",
+            ZONE_CF_BOX: "Cross Flow Box · Module per D/P nozzle: 16 ft L × 4 ft W × 18 ft H",
+            ZONE_CF_DT:  "Cross Flow Drive-Thru (U-shape) · Module: 15 ft L × 4 ft W × 12 ft H",
+            ZONE_RAISED: "Raised Floor · Module per D/P nozzle: 30 ft L × 15 ft W × 1 ft H",
+            ZONE_SD_EXH: "Side Exhaust · Module per D/P nozzle: 40 ft L × 4 ft W × 4 ft H",
+            ZONE_PIT:    "Straight downdraft pit · Max 40 ft per DP nozzle · Typical cross-section 4×4 ft",
+            ZONE_PIT_T:  "Pit with Tunnel · Main legs max 18 ft each · Tunnel max 18 ft per 3-Way nozzle",
+            ZONE_PIT_VT: "Pit w/ Vert. Transition · Main legs max 18 ft · Vert. stack max 14 ft per 3-Way nozzle",
+            ZONE_PLEN:   "Legacy generic plenum — use a Figure 4-14 type for new designs",
         }
         self._info.setText(tips.get(zone_type, ""))
 
     def apply_to(self, z: ZoneData):
-        z.label       = self.lbl_edit.text().strip() or z.label
-        z.zone_type   = self.type_combo.currentText()
-        z.length      = self.sp_L.value()
-        z.width       = self.sp_W.value()
-        z.height      = self.sp_H.value()
-        z.nozzle_type = self.nozzle_combo.currentText()
+        z.label         = self.lbl_edit.text().strip() or z.label
+        z.zone_type     = self.type_combo.currentText()
+        z.length        = self.sp_L.value()
+        z.width         = self.sp_W.value()
+        z.height        = self.sp_H.value()
+        z.tunnel_length = self.sp_T.value()
+        z.tunnel_width  = self.sp_TW.value()
+        z.nozzle_type   = self.nozzle_combo.currentText()
         ov = self.sp_override.value()
         z.nozzle_override = ov if ov > 0 else None
 
     def get_zone(self):
         z = ZoneData(
-            zone_type   = self.type_combo.currentText(),
-            length      = self.sp_L.value(),
-            width       = self.sp_W.value(),
-            height      = self.sp_H.value(),
-            nozzle_type = self.nozzle_combo.currentText(),
-            label       = self.lbl_edit.text().strip(),
+            zone_type     = self.type_combo.currentText(),
+            length        = self.sp_L.value(),
+            width         = self.sp_W.value(),
+            height        = self.sp_H.value(),
+            tunnel_length = self.sp_T.value(),
+            tunnel_width  = self.sp_TW.value(),
+            nozzle_type   = self.nozzle_combo.currentText(),
+            label         = self.lbl_edit.text().strip(),
         )
         ov = self.sp_override.value()
         z.nozzle_override = ov if ov > 0 else None
@@ -1163,7 +1687,6 @@ class BOMPanel(QWidget):
         items.append(("Remote Manual Release Pull Station", "87-120110-001", max(1, num_pull_stations)))
         items.append(('Microswitch Kit (for shutdowns)', "B120039", 2))
         items.append(('1/16" Control Cable (500 ft roll)', "219649", 1))
-        items.append(('Crimping Tool', "253538", 1))
         if has_elec_actuator:
             items.append(("Electrical Actuator", "B100034", num_systems))
 
@@ -1333,9 +1856,15 @@ class PaintBoothDesigner(QDialog):
             a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
         tb.addSeparator()
         for label, slot in [
-            ("＋ Work Area",    lambda: self._add_zone(ZONE_WORK)),
-            ("＋ Plenum",       lambda: self._add_zone(ZONE_PLEN)),
-            ("＋ Exhaust Duct", lambda: self._add_zone(ZONE_DUCT)),
+            ("＋ Work Area",       lambda: self._add_zone(ZONE_WORK)),
+            ("＋ Exhaust Duct",    lambda: self._add_zone(ZONE_DUCT)),
+            ("＋ CF Box",          lambda: self._add_zone(ZONE_CF_BOX)),
+            ("＋ CF Drive-Thru",   lambda: self._add_zone(ZONE_CF_DT)),
+            ("＋ Raised Floor",    lambda: self._add_zone(ZONE_RAISED)),
+            ("＋ Side Exhaust",    lambda: self._add_zone(ZONE_SD_EXH)),
+            ("＋ Straight Pit",    lambda: self._add_zone(ZONE_PIT)),
+            ("＋ Pit w/ Tunnel",   lambda: self._add_zone(ZONE_PIT_T)),
+            ("＋ Pit w/ Vert.",    lambda: self._add_zone(ZONE_PIT_VT)),
         ]:
             a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
         tb.addSeparator()
@@ -1481,11 +2010,28 @@ class PaintBoothDesigner(QDialog):
         QTimer.singleShot(50, self._canvas.fit)
 
     def _add_zone(self, zone_type):
+        _zone_defaults = {
+            ZONE_CF_BOX: (16.0, 4.0,  18.0),
+            ZONE_CF_DT:  (15.0, 4.0,  12.0),
+            ZONE_RAISED: (30.0, 15.0,  1.0),
+            ZONE_SD_EXH: (40.0, 4.0,   4.0),
+            ZONE_PIT:    (40.0, 4.0,   4.0),
+            ZONE_PIT_T:  (36.0, 4.0,   4.0),
+            ZONE_PIT_VT: (36.0, 4.0,   4.0),
+        }
+        if zone_type in _zone_defaults:
+            default_L, default_W, default_H = _zone_defaults[zone_type]
+        elif zone_type == ZONE_DUCT:
+            default_L, default_W, default_H = 14.0, 3.0, 3.0
+        else:
+            default_L = 20.0
+            default_W = self.sp_booth_W.value()
+            default_H = self.sp_booth_H.value()
         z = ZoneData(
             zone_type = zone_type,
-            length    = 20.0 if zone_type != ZONE_DUCT else 14.0,
-            width     = self.sp_booth_W.value() if zone_type in (ZONE_WORK, ZONE_PLEN) else 3.0,
-            height    = self.sp_booth_H.value(),
+            length    = default_L,
+            width     = default_W,
+            height    = default_H,
         )
         dlg = ZoneDialog(z, self)
         if dlg.exec_() == QDialog.Accepted:
