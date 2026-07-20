@@ -624,7 +624,21 @@ class HoodItem(QGraphicsItem):
         return super().itemChange(change, value)
 
     def contextMenuEvent(self, event):
-        result=_context_menu_base(self, event, ["Edit Hood…"])
+        result=_context_menu_base(self, event, ["Edit Hood…", "Bring to Front", "Send to Back"])
+        if result=="Bring to Front":
+            sc=self.scene()
+            others=[i for i in sc.items() if getattr(i,"ITEM_TYPE","")=="hood" and i is not self]
+            top=max((i.zValue() for i in others), default=0.0)
+            self.setZValue(top+1)
+            if sc: sc.layout_changed.emit()
+            return
+        elif result=="Send to Back":
+            sc=self.scene()
+            others=[i for i in sc.items() if getattr(i,"ITEM_TYPE","")=="hood" and i is not self]
+            bot=min((i.zValue() for i in others), default=0.0)
+            self.setZValue(bot-1)
+            if sc: sc.layout_changed.emit()
+            return
         if result=="Edit Hood…":
             dlg=HoodEditDialog(self)
             if dlg.exec_()==QDialog.Accepted:
@@ -691,7 +705,21 @@ class DuctItem(QGraphicsItem):
         return super().itemChange(change, value)
 
     def contextMenuEvent(self, event):
-        result=_context_menu_base(self, event, ["Edit Duct…"])
+        result=_context_menu_base(self, event, ["Edit Duct…", "Bring to Front", "Send to Back"])
+        if result=="Bring to Front":
+            sc=self.scene()
+            others=[i for i in sc.items() if getattr(i,"ITEM_TYPE","")=="duct" and i is not self]
+            top=max((i.zValue() for i in others), default=0.5)
+            self.setZValue(top+1)
+            if sc: sc.layout_changed.emit()
+            return
+        elif result=="Send to Back":
+            sc=self.scene()
+            others=[i for i in sc.items() if getattr(i,"ITEM_TYPE","")=="duct" and i is not self]
+            bot=min((i.zValue() for i in others), default=0.5)
+            self.setZValue(bot-1)
+            if sc: sc.layout_changed.emit()
+            return
         if result=="Edit Duct…":
             dlg=DuctEditDialog(self)
             if dlg.exec_()==QDialog.Accepted:

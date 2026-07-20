@@ -1,5 +1,5 @@
 {
-  "version": "1.1.4",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.1.4/DFP_TakeoffPro_Setup_1.1.4.exe",
-  "notes": "Paint booth: independent tunnel width on Pit w/ Tunnel zones with width-aware DIOM nozzle coverage, removed crimping tool from material list, fixed crash on item delete."
+  "version": "1.1.5",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.1.5/DFP_TakeoffPro_Setup_1.1.5.exe",
+  "notes": "Kitchen suppression: added Bring to Front / Send to Back to Hood and Duct right-click menus (previously appliance-only)."
 }
