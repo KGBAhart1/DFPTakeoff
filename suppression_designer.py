@@ -80,19 +80,129 @@ from PyQt5.QtWidgets import (
     QGroupBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QMenu, QApplication, QCheckBox, QLineEdit,
     QComboBox, QScrollArea, QTextEdit, QButtonGroup, QSpinBox,
-    QTabWidget, QInputDialog, QFileDialog,
+    QTabWidget, QInputDialog, QFileDialog, QLayout, QSizePolicy,
 )
 from PyQt5.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF, QImage, QPolygonF,
     QPainterPath, QRadialGradient, QPixmap,
 )
-from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, pyqtSignal
+from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, pyqtSignal, QRect, QPoint, QSize
 try:
     from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
     _PRINT_AVAILABLE = True
 except ImportError:
     _PRINT_AVAILABLE = False
 import fitz
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FlowLayout — wraps child widgets onto additional rows instead of squeezing/
+#  truncating them, used for button toolbars so labels stay fully readable at
+#  any window width. Drop-in for QHBoxLayout (supports addWidget/addStretch).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6):
+        super().__init__(parent)
+        self._hspacing = hspacing
+        self._vspacing = vspacing
+        self._items = []
+        if margin >= 0:
+            self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def addStretch(self, stretch=0):
+        pass  # no-op — FlowLayout has no concept of stretch; items just wrap
+
+    def horizontalSpacing(self):
+        return self._hspacing
+
+    def verticalSpacing(self):
+        return self._vspacing
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left()+m.right(), m.top()+m.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(left, top, -right, -bottom)
+        x, y = effective.x(), effective.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._hspacing
+            if next_x - self._hspacing > effective.right() and line_height > 0:
+                x = effective.x()
+                y = y + line_height + self._vspacing
+                next_x = x + hint.width() + self._hspacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + bottom
+
+
+class FlowBar(QWidget):
+    """Self-contained button-bar widget: children wrap onto extra rows instead
+    of being squeezed/truncated, and the bar keeps its own height in sync with
+    the wrapped row count on every resize (Qt's heightForWidth does not
+    reliably propagate through nested layouts/QTabWidget on its own)."""
+    def __init__(self, parent=None, hspacing=6, vspacing=6, margin=0):
+        super().__init__(parent)
+        self._flow = FlowLayout(self, hspacing=hspacing, vspacing=vspacing)
+        if margin >= 0:
+            self._flow.setContentsMargins(margin, margin, margin, margin)
+        sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+
+    def addWidget(self, w):
+        self._flow.addWidget(w)
+
+    def addStretch(self, stretch=0):
+        pass  # no-op — FlowLayout has no concept of stretch; items just wrap
+
+    def setContentsMargins(self, *a):
+        self._flow.setContentsMargins(*a)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        h = self._flow.heightForWidth(self.width())
+        if h > 0 and self.minimumHeight() != h:
+            self.setMinimumHeight(h); self.setMaximumHeight(h)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Constants & data
@@ -104,6 +214,11 @@ DSF       = 0.40
 APP_BOX_H = 10    # inches — cooking-surface box height
 PIPE_W      = 3
 SNAP_RADIUS = 14   # scene-unit snap distance for pipe endpoints
+
+# Vertical layout when auto-placing an appliance under a hood (click-to-place,
+# report import, and Build Drawing all go through this)
+NOZZLE_BELOW_HOOD_PX     = 18    # gap between hood's bottom edge and its plenum nozzles (~0.5cm on screen)
+APPLIANCE_BELOW_NOZZLE_PX = 168  # gap between plenum nozzles and the appliance top (unchanged from before)
 
 HOOD_COL  = QColor(215, 218, 222)
 PIPE_COL  = QColor(30, 100, 180)
@@ -1108,8 +1223,11 @@ class ApplianceItem(QGraphicsItem):
             painter.drawPolygon(grd_poly)
             painter.setPen(QPen(QColor(255,255,255,50),2))
             painter.drawLine(tp(grd_u0+0.02,0.10), tp(grd_u1-0.02,0.10))  # sheen
-            # Burner rings
-            cols = 2; rows = math.ceil(n_burners/cols)
+            # Burner rings — the burner zone is narrow on 2-burner combos, so
+            # stack front-to-back (1 col × 2 rows) instead of side-by-side;
+            # 4-burner combos keep the 2×2 grid.
+            cols = 1 if n_burners == 2 else 2
+            rows = math.ceil(n_burners/cols)
             cw = (brn_u1-brn_u0)/cols; ch_v = 1.0/rows if rows>1 else 1.0
             bi = 0
             for row in range(rows):
@@ -2894,11 +3012,12 @@ class SuppressionScene(QGraphicsScene):
         if t=="appliance":
             item=ApplianceItem(spec["key"],spec["w_in"],spec["d_in"],spec.get("h_in",30),spec.get("name"))
             hs=self.hoods()
-            app_y=(hs[0].scenePos().y()+hs[0].h_px+160) if hs else pt.y()
+            # Nozzles sit a small visible gap below the hood; appliance keeps the
+            # same distance below the nozzles as before (or well above appliance if no hood)
+            hood_nz_scene = (hs[0].scenePos().y()+hs[0].h_px+NOZZLE_BELOW_HOOD_PX) if hs else pt.y()-120
+            app_y = (hood_nz_scene + APPLIANCE_BELOW_NOZZLE_PX) if hs else pt.y()
             item.setPos(pt.x()-item.w_px/2, app_y)
             self.addItem(item)
-            # Nozzles as children — sit just inside the hood bottom face (or well above appliance if no hood)
-            hood_nz_scene = (hs[0].scenePos().y() + hs[0].h_px - 8) if hs else item.scenePos().y() - 120
             nz_local_y = hood_nz_scene - item.scenePos().y()   # negative = above item origin
             defn=effective_defn(spec["key"], self._active_mfr); nq=defn["nq"]; nt=defn["nt"] or "1N"
             base_defn = APPLIANCE_DEFS.get(spec["key"], {})
@@ -3844,6 +3963,27 @@ _WXD_RE   = re.compile(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
 _NOZ_RE   = re.compile(r"(\d+)\s*nozzles?", re.IGNORECASE)
 _HOODLEN_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*['’′]")
 
+def _tank_token(model_str):
+    """Extract the model-code token from a MANUFACTURERS[...]['tanks'] 'model' string
+    (e.g. 'RG-6G  (6 gal / 22.7 L — 18 fp)' -> 'RG-6G'; 'Model 275 (...)' -> '275')."""
+    parts = model_str.split()
+    return parts[1] if parts and parts[0].lower() == "model" else parts[0]
+
+def _match_cylinder_tank(mfr_key, value):
+    """Best-effort match of a report's cylinder code (e.g. 'RG-6G') to a tank
+    entry in MANUFACTURERS. Searches the guessed manufacturer first, then all."""
+    if not value:
+        return None
+    v = re.sub(r"\s+", "", value).upper()
+    search_mfrs = ([mfr_key] if mfr_key in MANUFACTURERS else []) + \
+                  [mk for mk in MANUFACTURERS if mk != mfr_key]
+    for mk in search_mfrs:
+        for tank in MANUFACTURERS[mk]["tanks"]:
+            token = re.sub(r"\s+", "", _tank_token(tank["model"])).upper()
+            if token == v or token in v or v in token:
+                return mk, tank
+    return None
+
 def parse_kitchen_report(pdf_path):
     """Extract hood + appliance info from a DFP kitchen inspection report PDF.
     Best-effort text parsing — returns a dict for review/editing before any
@@ -3857,7 +3997,8 @@ def parse_kitchen_report(pdf_path):
     except Exception as e:
         return {"error": str(e)}
 
-    result = {"mfr_guess": None, "hood_len_ft": None, "system_name": None, "appliances": []}
+    result = {"mfr_guess": None, "hood_len_ft": None, "system_name": None,
+               "cylinder_value": None, "cylinder_guess": None, "appliances": []}
 
     # Property name → suggested system/tab name
     for i, ln in enumerate(lines):
@@ -3881,6 +4022,13 @@ def parse_kitchen_report(pdf_path):
             m = _HOODLEN_RE.search(lines[i+1])
             if m:
                 result["hood_len_ft"] = float(m.group(1))
+            break
+
+    # Cylinder size — value line follows "Total Chemical volume / weight:" (e.g. "RG-6G")
+    for i, ln in enumerate(lines):
+        if ln.strip().lower().startswith("total chemical volume") and i+1 < len(lines):
+            result["cylinder_value"] = lines[i+1].strip()
+            result["cylinder_guess"] = _match_cylinder_tank(result["mfr_guess"], result["cylinder_value"])
             break
 
     # Cooking appliances — collect lines under the section header, splitting
@@ -3919,20 +4067,31 @@ def parse_kitchen_report(pdf_path):
     return result
 
 
-class ImportReportDialog(QDialog):
-    """Review/edit parsed report data before it's used to build a starting drawing."""
-    def __init__(self, parsed, parent=None):
+class DrawingBuilderDialog(QDialog):
+    """Review/edit a hood + appliance list, then build a starting drawing from it.
+    Doubles as: (1) the post-import review screen for a parsed report (pass
+    `parsed`), and (2) a from-scratch drawing builder (pass None/empty) where
+    appliances are added one at a time via "+ Add Appliance" — list order
+    (top to bottom) becomes left-to-right placement on the drawing."""
+    def __init__(self, parsed=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Import Kitchen Report — Review Before Building")
-        self.setMinimumWidth(760); self.setMinimumHeight(520)
+        parsed = parsed or {}
+        self._from_report = bool(parsed.get("appliances") or parsed.get("hood_len_ft") or parsed.get("mfr_guess"))
+        self.setWindowTitle("Import Kitchen Report — Review Before Building" if self._from_report
+                             else "Build Drawing — Add Appliances")
+        self.setMinimumWidth(820); self.setMinimumHeight(560)
         l = QVBoxLayout(self); l.setSpacing(10); l.setContentsMargins(16,16,16,16)
 
-        l.addWidget(QLabel("<b>Review the extracted hood and appliance info below, adjust anything "
-                            "that looks wrong, then build the starting drawing.</b>"))
+        if self._from_report:
+            l.addWidget(QLabel("<b>Review the extracted hood and appliance info below, adjust anything "
+                                "that looks wrong, then build the starting drawing.</b>"))
+        else:
+            l.addWidget(QLabel("<b>Set up the hood, then use “+ Add Appliance” to build the lineup — "
+                                "rows are placed left to right on the drawing in list order.</b>"))
 
         # ── Hood / system row ────────────────────────────────────────────────
         top = QFormLayout(); top.setSpacing(8)
-        self.sys_name = QLineEdit(parsed.get("system_name") or "Imported System")
+        self.sys_name = QLineEdit(parsed.get("system_name") or ("Imported System" if self._from_report else "System 1"))
         top.addRow("System tab name:", self.sys_name)
         self.mfr_combo = QComboBox()
         for mk, mfr in MANUFACTURERS.items():
@@ -3942,6 +4101,16 @@ class ImportReportDialog(QDialog):
             idx = self.mfr_combo.findData(guess)
             if idx >= 0: self.mfr_combo.setCurrentIndex(idx)
         top.addRow("Manufacturer:", self.mfr_combo)
+        self._cyl_guess = parsed.get("cylinder_guess")   # (mfr_key, tank_dict) or None
+        self.cyl_combo = QComboBox()
+        self._populate_cylinders(self.mfr_combo.currentData())
+        top.addRow("Cylinder:", self.cyl_combo)
+        if parsed.get("cylinder_value") and not self._cyl_guess:
+            note = QLabel(f"⚠ Couldn't match cylinder code \"{parsed['cylinder_value']}\" from report — please pick manually.")
+            note.setStyleSheet("color:#c0392b;font-size:10px;")
+            top.addRow("", note)
+        self.mfr_combo.currentIndexChanged.connect(
+            lambda: self._populate_cylinders(self.mfr_combo.currentData()))
         hood_row = QHBoxLayout()
         self.hood_w = QDoubleSpinBox(); self.hood_w.setRange(12,480); self.hood_w.setSuffix("  in")
         self.hood_w.setValue((parsed.get("hood_len_ft") or 8.0)*12.0)
@@ -3950,41 +4119,34 @@ class ImportReportDialog(QDialog):
         hood_row.addWidget(QLabel("Depth:")); hood_row.addWidget(self.hood_d)
         hood_row.addStretch()
         top.addRow("Hood dims:", hood_row)
-        if not parsed.get("hood_len_ft"):
+        if self._from_report and not parsed.get("hood_len_ft"):
             note = QLabel("⚠ Hood length not found in report — defaulted to 8 ft, please verify.")
             note.setStyleSheet("color:#c0392b;font-size:10px;")
             top.addRow("", note)
         l.addLayout(top)
 
         # ── Appliance table ──────────────────────────────────────────────────
-        appliances = parsed.get("appliances", [])
-        self.tbl = QTableWidget(len(appliances), 5)
-        self.tbl.setHorizontalHeaderLabels(["Use", "Report Line", "Appliance Type", "Width (in)", "Depth (in)"])
+        # Col 1 "Report Line" is read-only reference text from a parsed report
+        # (blank for manually-added rows). Col 2 "Label" is an optional editable
+        # custom on-canvas name — kept separate so imported report text (long,
+        # not meant for the drawing) never becomes the appliance's label.
+        self.tbl = QTableWidget(0, 7)
+        self.tbl.setHorizontalHeaderLabels(
+            ["Use", "Report Line", "Label", "Appliance Type", "Width (in)", "Depth (in)", ""])
         self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.tbl.verticalHeader().setVisible(False)
         self._rows = []
-        names_sorted = sorted(APPLIANCE_DEFS.keys(), key=lambda k: APPLIANCE_DEFS[k]["name"])
-        for r, a in enumerate(appliances):
-            chk = QCheckBox(); chk.setChecked(a["key"] is not None)
-            cw = QWidget(); cl = QHBoxLayout(cw); cl.setContentsMargins(0,0,0,0); cl.addWidget(chk); cl.setAlignment(Qt.AlignCenter)
-            self.tbl.setCellWidget(r, 0, cw)
-            raw_item = QTableWidgetItem(a["raw"]); raw_item.setFlags(Qt.ItemIsEnabled)
-            self.tbl.setItem(r, 1, raw_item)
-            combo = QComboBox()
-            combo.addItem("— choose type —", None)
-            for k in names_sorted:
-                combo.addItem(APPLIANCE_DEFS[k]["name"], k)
-            if a["key"]:
-                idx = combo.findData(a["key"])
-                if idx >= 0: combo.setCurrentIndex(idx)
-            self.tbl.setCellWidget(r, 2, combo)
-            defn = APPLIANCE_DEFS.get(a["key"], {})
-            wsp = QDoubleSpinBox(); wsp.setRange(6,240); wsp.setValue(a["w_in"] or defn.get("dw",24))
-            dsp = QDoubleSpinBox(); dsp.setRange(6,120); dsp.setValue(a["d_in"] or defn.get("dd",24))
-            self.tbl.setCellWidget(r, 3, wsp)
-            self.tbl.setCellWidget(r, 4, dsp)
-            self._rows.append({"chk":chk, "combo":combo, "w":wsp, "d":dsp})
+        self._names_sorted = sorted(APPLIANCE_DEFS.keys(), key=lambda k: APPLIANCE_DEFS[k]["name"])
+        for a in parsed.get("appliances", []):
+            self._add_row(a.get("raw",""), a.get("key"), a.get("w_in"), a.get("d_in"))
         l.addWidget(self.tbl)
+
+        add_bar = QHBoxLayout()
+        add_btn = QPushButton("+ Add Appliance")
+        add_btn.setStyleSheet("padding:5px 14px;")
+        add_btn.clicked.connect(lambda: self._add_row())
+        add_bar.addWidget(add_btn); add_bar.addStretch()
+        l.addLayout(add_bar)
 
         br = QHBoxLayout()
         ok = QPushButton("Build Drawing")
@@ -3994,6 +4156,104 @@ class ImportReportDialog(QDialog):
         br.addStretch(); br.addWidget(ca); br.addWidget(ok)
         l.addLayout(br)
 
+    def _add_row(self, raw="", key=None, w_in=None, d_in=None, name=""):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        chk = QCheckBox(); chk.setChecked(True)
+        cw = QWidget(); cl = QHBoxLayout(cw); cl.setContentsMargins(0,0,0,0); cl.addWidget(chk); cl.setAlignment(Qt.AlignCenter)
+        self.tbl.setCellWidget(r, 0, cw)
+        raw_item = QTableWidgetItem(raw); raw_item.setFlags(Qt.ItemIsEnabled)
+        self.tbl.setItem(r, 1, raw_item)
+        label_edit = QLineEdit(name)
+        label_edit.setPlaceholderText("Optional — custom label on the drawing")
+        self.tbl.setCellWidget(r, 2, label_edit)
+        combo = QComboBox()
+        combo.addItem("— choose type —", None)
+        for k in self._names_sorted:
+            combo.addItem(APPLIANCE_DEFS[k]["name"], k)
+        if key:
+            idx = combo.findData(key)
+            if idx >= 0: combo.setCurrentIndex(idx)
+        defn = APPLIANCE_DEFS.get(key, {})
+        wsp = QDoubleSpinBox(); wsp.setRange(6,240); wsp.setValue(w_in or defn.get("dw",24))
+        dsp = QDoubleSpinBox(); dsp.setRange(6,120); dsp.setValue(d_in or defn.get("dd",24))
+        row = {"chk":chk, "raw_item":raw_item, "label":label_edit, "combo":combo, "w":wsp, "d":dsp,
+               "user_set_dims": w_in is not None or d_in is not None}
+
+        def _on_type_changed(_idx, row=row):
+            k = row["combo"].currentData()
+            if k and not row["user_set_dims"]:
+                d = APPLIANCE_DEFS[k]
+                row["w"].blockSignals(True); row["d"].blockSignals(True)
+                row["w"].setValue(d.get("dw",24)); row["d"].setValue(d.get("dd",24))
+                row["w"].blockSignals(False); row["d"].blockSignals(False)
+        combo.currentIndexChanged.connect(_on_type_changed)
+        wsp.valueChanged.connect(lambda _v, row=row: row.__setitem__("user_set_dims", True))
+        dsp.valueChanged.connect(lambda _v, row=row: row.__setitem__("user_set_dims", True))
+        self.tbl.setCellWidget(r, 3, combo)
+        self.tbl.setCellWidget(r, 4, wsp)
+        self.tbl.setCellWidget(r, 5, dsp)
+
+        # Row actions — reorder / remove (list order = left-to-right on the drawing)
+        act = QWidget(); al = QHBoxLayout(act); al.setContentsMargins(0,0,0,0); al.setSpacing(2)
+        up_btn = QPushButton("▲"); up_btn.setFixedWidth(22); up_btn.setToolTip("Move left")
+        dn_btn = QPushButton("▼"); dn_btn.setFixedWidth(22); dn_btn.setToolTip("Move right")
+        rm_btn = QPushButton("✕"); rm_btn.setFixedWidth(22); rm_btn.setToolTip("Remove")
+        for b in (up_btn, dn_btn, rm_btn): b.setStyleSheet("padding:2px;")
+        up_btn.clicked.connect(lambda: self._move_row(row, -1))
+        dn_btn.clicked.connect(lambda: self._move_row(row, 1))
+        rm_btn.clicked.connect(lambda: self._remove_row(row))
+        al.addWidget(up_btn); al.addWidget(dn_btn); al.addWidget(rm_btn)
+        self.tbl.setCellWidget(r, 6, act)
+
+        self._rows.append(row)
+        return row
+
+    def _remove_row(self, row):
+        i = self._rows.index(row)
+        self.tbl.removeRow(i)
+        self._rows.pop(i)
+
+    def _move_row(self, row, delta):
+        i = self._rows.index(row)
+        j = i + delta
+        if j < 0 or j >= len(self._rows):
+            return
+        # Rows are built from cell widgets, not QTableWidgetItems, so reordering
+        # swaps the underlying values between the two rows rather than moving
+        # actual table rows.
+        a, b = self._rows[i], self._rows[j]
+        a_vals = (a["chk"].isChecked(), a["raw_item"].text(), a["label"].text(),
+                   a["combo"].currentData(), a["w"].value(), a["d"].value())
+        b_vals = (b["chk"].isChecked(), b["raw_item"].text(), b["label"].text(),
+                   b["combo"].currentData(), b["w"].value(), b["d"].value())
+        self._set_row_values(a, b_vals)
+        self._set_row_values(b, a_vals)
+
+    def _set_row_values(self, row, vals):
+        checked, raw, label, key, w, d = vals
+        row["chk"].setChecked(checked)
+        row["raw_item"].setText(raw)
+        row["label"].setText(label)
+        idx = row["combo"].findData(key)
+        row["combo"].setCurrentIndex(idx if idx >= 0 else 0)
+        row["w"].setValue(w)
+        row["d"].setValue(d)
+        row["user_set_dims"] = True
+
+    def _populate_cylinders(self, mfr_key):
+        self.cyl_combo.clear()
+        self.cyl_combo.addItem("— none —", None)
+        for tank in MANUFACTURERS.get(mfr_key, {}).get("tanks", []):
+            self.cyl_combo.addItem(tank["model"], tank)
+        guess = self._cyl_guess
+        if guess and guess[0] == mfr_key:
+            for i in range(self.cyl_combo.count()):
+                data = self.cyl_combo.itemData(i)
+                if data and data.get("model") == guess[1]["model"]:
+                    self.cyl_combo.setCurrentIndex(i)
+                    break
+
     def values(self):
         appliances = []
         for row in self._rows:
@@ -4002,13 +4262,17 @@ class ImportReportDialog(QDialog):
             key = row["combo"].currentData()
             if not key:
                 continue
-            appliances.append({"key": key, "w_in": row["w"].value(), "d_in": row["d"].value()})
+            appliances.append({
+                "key": key, "w_in": row["w"].value(), "d_in": row["d"].value(),
+                "name": row["label"].text().strip() or None,
+            })
         return {
             "system_name": self.sys_name.text().strip() or "Imported System",
             "mfr": self.mfr_combo.currentData(),
             "hood_w_in": self.hood_w.value(),
             "hood_d_in": self.hood_d.value(),
             "appliances": appliances,
+            "cylinder": self.cyl_combo.currentData(),
         }
 
 
@@ -4719,8 +4983,8 @@ class SuppressionDesigner(QDialog):
 
     def _build_ui(self):
         main=QVBoxLayout(self); main.setContentsMargins(0,0,0,0); main.setSpacing(0)
-        tb=QWidget(); tb.setStyleSheet("background:#232728;")
-        tbl=QHBoxLayout(tb); tbl.setContentsMargins(8,5,8,5); tbl.setSpacing(5)
+        tbl=FlowBar(hspacing=5, vspacing=5); tbl.setStyleSheet("background:#232728;")
+        tbl.setContentsMargins(8,5,8,5)
         def _btn(txt,slot,color="#333738",checkable=False):
             b=QPushButton(txt); b.setCheckable(checkable)
             b.setStyleSheet(f"QPushButton{{background:{color};color:#efe6e1;border-radius:3px;"
@@ -4777,6 +5041,7 @@ class SuppressionDesigner(QDialog):
         tbl.addWidget(_sep())
         tbl.addWidget(_btn("Project Info",  self._edit_project_info))
         tbl.addWidget(_btn("New",           self._new_project))
+        tbl.addWidget(_btn("Build Drawing…", self._build_from_list, color="#7d3c98"))
         tbl.addWidget(_btn("Import Report…", self._import_report, color="#7d3c98"))
         tbl.addWidget(_btn("Open",          self._open_project, color="#1a5276"))
         tbl.addWidget(_btn("Save",          self._save_project,  color="#1a5276"))
@@ -4791,7 +5056,7 @@ class SuppressionDesigner(QDialog):
         tbl.addStretch()
         self._mode_lbl=QLabel("  Select  ·  Scroll=zoom  ·  Middle-drag or Ctrl+drag=pan  ·  Del=delete  ·  Right-click=options  ·  Esc=cancel")
         self._mode_lbl.setStyleSheet("color:#888;font-size:10px;"); tbl.addWidget(self._mode_lbl)
-        main.addWidget(tb)
+        main.addWidget(tbl)
         body=QSplitter(Qt.Horizontal)
         body.setStyleSheet("QSplitter::handle{background:#d0c8c0;width:4px;}")
         self._palette=AppliancePalette()
@@ -5210,38 +5475,62 @@ class SuppressionDesigner(QDialog):
         if not parsed.get("appliances") and not parsed.get("hood_len_ft"):
             ans = QMessageBox.question(self, "Nothing Extracted",
                 "Couldn't find recognizable hood/appliance info in this report.\n\n"
-                "You can still continue and build the drawing from scratch. Continue anyway?",
+                "You can still continue and build the drawing manually. Continue anyway?",
                 QMessageBox.Yes | QMessageBox.No)
             if ans != QMessageBox.Yes:
                 return
-        dlg = ImportReportDialog(parsed, self)
+        dlg = DrawingBuilderDialog(parsed, self)
         if dlg.exec_() != QDialog.Accepted:
             return
-        vals = dlg.values()
         try:
-            sys_info = self._add_system(vals["system_name"])
-            scene = sys_info["scene"]
-            scene.set_active_mfr(vals["mfr"])
-            self._sys_panel.refresh(scene)
-            hood = scene.add_hood(vals["hood_w_in"], vals["hood_d_in"], "Hood 1",
-                                   True, 14, 14, "Zone 1")
-            x = hood.scenePos().x() + 20
-            gap = 10
-            for a in vals["appliances"]:
-                defn = APPLIANCE_DEFS.get(a["key"], {})
-                w_px = (a["w_in"] or defn.get("dw", 24)) * PX
-                cx = x + w_px/2
-                scene.place_appliance(a["key"], cx, 0, w_in=a["w_in"], d_in=a["d_in"])
-                x += w_px + gap
-            self._canvas.fit_all()
+            self._build_system_from_vals(dlg.values())
         except Exception as e:
             _log_error("_import_report:build", e)
             QMessageBox.critical(self, "Import Failed", f"Report was read but the drawing could not be built:\n{e}")
+
+    def _build_from_list(self):
+        """Build a starting drawing from scratch via the guided appliance-list
+        dialog (same UI as report review, just starting blank)."""
+        dlg = DrawingBuilderDialog(None, self)
+        if dlg.exec_() != QDialog.Accepted:
             return
+        try:
+            self._build_system_from_vals(dlg.values())
+        except Exception as e:
+            _log_error("_build_from_list:build", e)
+            QMessageBox.critical(self, "Build Failed", f"Could not build the drawing:\n{e}")
+
+    def _build_system_from_vals(self, vals):
+        """Shared by _import_report and _build_from_list: create a new system
+        tab and populate it with the hood/appliances/cylinder from a
+        DrawingBuilderDialog.values() dict. List order = left-to-right."""
+        sys_info = self._add_system(vals["system_name"])
+        scene = sys_info["scene"]
+        scene.set_active_mfr(vals["mfr"])
+        self._sys_panel.refresh(scene)
+        hood = scene.add_hood(vals["hood_w_in"], vals["hood_d_in"], "Hood 1",
+                               True, 14, 14, "Zone 1")
+        x = hood.scenePos().x() + 20
+        gap = 10
+        for a in vals["appliances"]:
+            defn = APPLIANCE_DEFS.get(a["key"], {})
+            w_px = (a["w_in"] or defn.get("dw", 24)) * PX
+            cx = x + w_px/2
+            scene.place_appliance(a["key"], cx, 0, w_in=a["w_in"], d_in=a["d_in"], name=a.get("name"))
+            x += w_px + gap
+        tank = vals.get("cylinder")
+        if tank:
+            scene.set_mode_place("bottle", {
+                "gal": tank.get("gal"), "label": _tank_token(tank["model"]),
+                "max_flow": tank.get("max_flow"), "mfr_key": vals["mfr"],
+            })
+            scene._place_at(QPointF(hood.scenePos().x()-90, hood.scenePos().y()+hood.h_px+20))
+        self._canvas.fit_all()
         self._dirty = True
         self._update_title()
+        cyl_note = f", cylinder {_tank_token(tank['model'])}" if tank else ""
         self._status.setText(
-            f"  Imported {len(vals['appliances'])} appliance(s) from report — "
+            f"  Built drawing with {len(vals['appliances'])} appliance(s){cyl_note} — "
             f"verify nozzle counts/types against the manual before finalizing.")
 
     def _save_project(self):

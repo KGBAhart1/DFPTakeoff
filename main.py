@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QDoubleSpinBox, QComboBox, QSpinBox,
     QScrollArea, QToolBar, QAction, QStatusBar, QAbstractItemView, QInputDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSlider, QMenu,
-    QFrame, QProgressDialog, QShortcut, QSizePolicy, QCheckBox, QGroupBox,
+    QFrame, QProgressDialog, QShortcut, QSizePolicy, QCheckBox, QGroupBox, QLayout,
 )
 from PyQt5.QtGui  import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySequence
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QThread, pyqtSignal, QTimer
@@ -1129,9 +1129,118 @@ class AssemblyDialog(QDialog):
         self.accept()
 
 
-# 
+#
+# FlowLayout — wraps child widgets onto additional rows instead of squeezing/
+# truncating them. Drop-in for QHBoxLayout (supports addWidget/addStretch).
+#
+
+class FlowLayout(QLayout):
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6):
+        super().__init__(parent)
+        self._hspacing = hspacing
+        self._vspacing = vspacing
+        self._items = []
+        if margin >= 0:
+            self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def addStretch(self, stretch=0):
+        pass  # no-op — FlowLayout has no concept of stretch; items just wrap
+
+    def horizontalSpacing(self):
+        return self._hspacing
+
+    def verticalSpacing(self):
+        return self._vspacing
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left()+m.right(), m.top()+m.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(left, top, -right, -bottom)
+        x, y = effective.x(), effective.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._hspacing
+            if next_x - self._hspacing > effective.right() and line_height > 0:
+                x = effective.x()
+                y = y + line_height + self._vspacing
+                next_x = x + hint.width() + self._hspacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + bottom
+
+
+class FlowBar(QWidget):
+    """Self-contained button-bar widget: children wrap onto extra rows instead
+    of being squeezed/truncated, and the bar keeps its own height in sync with
+    the wrapped row count on every resize (Qt's heightForWidth does not
+    reliably propagate through nested layouts/QTabWidget on its own)."""
+    def __init__(self, parent=None, hspacing=6, vspacing=6, margin=0):
+        super().__init__(parent)
+        self._flow = FlowLayout(self, hspacing=hspacing, vspacing=vspacing)
+        if margin >= 0:
+            self._flow.setContentsMargins(margin, margin, margin, margin)
+        sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        sp.setHeightForWidth(True)
+        self.setSizePolicy(sp)
+
+    def addWidget(self, w):
+        self._flow.addWidget(w)
+
+    def addStretch(self, stretch=0):
+        pass  # no-op — FlowLayout has no concept of stretch; items just wrap
+
+    def setContentsMargins(self, *a):
+        self._flow.setContentsMargins(*a)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        h = self._flow.heightForWidth(self.width())
+        if h > 0 and self.minimumHeight() != h:
+            self.setMinimumHeight(h); self.setMaximumHeight(h)
+
+
+#
 # Library panel (Products + Assemblies tabs)
-# 
+#
 
 class LibraryPanel(QWidget):
     product_selected  = pyqtSignal(object)
@@ -1160,7 +1269,7 @@ class LibraryPanel(QWidget):
         self.prod_list.itemClicked.connect(lambda i: self.product_selected.emit(i.data(Qt.UserRole)))
         self.prod_list.setStyleSheet("QListWidget::item{padding:5px;border-bottom:1px solid #e0e0e0;}QListWidget::item:selected{background:#232728;color:white;}")
         layout.addWidget(self.prod_list)
-        btns = QHBoxLayout()
+        btns = FlowBar(hspacing=4, vspacing=4)
         for lbl2,fn,style in [("+ Add",self._add_prod,"background:#ff7002;color:white;padding:4px;"),
                               ("Edit", self._edit_prod,"padding:4px;"),
                               ("Del",  self._del_prod, "background:#c02b0a;color:white;padding:4px;")]:
@@ -1171,7 +1280,7 @@ class LibraryPanel(QWidget):
         lu_btn.clicked.connect(self._manage_labour_units); btns.addWidget(lu_btn)
         more_btn = QPushButton(""); more_btn.setFixedWidth(28); more_btn.setToolTip("CSV import/export")
         more_btn.clicked.connect(self._show_csv_menu); btns.addWidget(more_btn)
-        layout.addLayout(btns); return w
+        layout.addWidget(btns); return w
 
     def _show_csv_menu(self):
         menu = QMenu(self)
@@ -1185,12 +1294,12 @@ class LibraryPanel(QWidget):
         self.asm_list.itemClicked.connect(lambda i: self.assembly_selected.emit(i.data(Qt.UserRole)))
         self.asm_list.setStyleSheet("QListWidget::item{padding:5px;border-bottom:1px solid #e0e0e0;}QListWidget::item:selected{background:#232728;color:white;}")
         layout.addWidget(self.asm_list)
-        btns = QHBoxLayout()
+        btns = FlowBar(hspacing=4, vspacing=4)
         for lbl2,fn,style in [("+ Add",self._add_asm,"background:#232728;color:white;padding:4px;"),
                               ("Edit", self._edit_asm,"padding:4px;"),
                               ("Del",  self._del_asm, "background:#c02b0a;color:white;padding:4px;")]:
             b = QPushButton(lbl2); b.setStyleSheet(style); b.clicked.connect(fn); btns.addWidget(b)
-        layout.addLayout(btns); return w
+        layout.addWidget(btns); return w
 
     def refresh(self):
         self._all_products = list(db.get_products())
