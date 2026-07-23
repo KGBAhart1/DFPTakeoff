@@ -1,5 +1,5 @@
 {
-  "version": "1.1.5",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.1.5/DFP_TakeoffPro_Setup_1.1.5.exe",
-  "notes": "Kitchen suppression: added Bring to Front / Send to Back to Hood and Duct right-click menus (previously appliance-only)."
+  "version": "1.2.0",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.2.0/DFP_TakeoffPro_Setup_1.2.0.exe",
+  "notes": "Kitchen suppression: import a DFP inspection report PDF to auto-build a starting hood/appliance drawing (with review-before-build dialog), corrected Buckeye BFR nozzle band colors to match the manufacturer guide."
 }

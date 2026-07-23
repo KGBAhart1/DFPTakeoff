@@ -142,13 +142,14 @@ MFR_NOZZLE_TYPES = {
                 "UBroiler(11984)", "Range(14178)", "Duct(16416)", "BackShelf(16853)"],
 }
 
-# Color coding for Buckeye BFR nozzles
+# Color coding for Buckeye BFR nozzles — per manufacturer band-color guide
+# (N-1HP Blue, N-1LP Red, N-2HP Green, N-2LP Yellow, N-2W White)
 BUCKEYE_NOZZLE_COLORS = {
-    "N-1HP": "#c0392b",   # red  — High Pressure 1-flow
-    "N-2HP": "#e74c3c",   # red  — High Pressure 2-flow
-    "N-1LP": "#2980b9",   # blue — Low Pressure 1-flow
-    "N-2LP": "#1a6fa8",   # blue — Low Pressure 2-flow
-    "N-2W":  "#27ae60",   # green — Wide spray 2-flow
+    "N-1HP": "#2980b9",   # blue   — 1 flow point
+    "N-1LP": "#c0392b",   # red    — 1 flow point
+    "N-2HP": "#27ae60",   # green  — 2 flow points
+    "N-2LP": "#f1c40f",   # yellow — 2 flow points
+    "N-2W":  "#ffffff",   # white  — 2 flow points
 }
 
 def _nozzle_color(nozzle_type):
@@ -523,12 +524,16 @@ def draw_box3d(painter, x, y, w, h, d_in, base_col, label="", label_col=None):
 
 def draw_arrow(painter, x1, y1, x2, y2, col=None, width=PIPE_W):
     col=col or PIPE_COL
+    # Thin outline behind the arrow so light/white colors (e.g. Buckeye N-2W)
+    # stay visible against the white canvas background.
+    painter.setPen(QPen(QColor("#666"),width+1.4,Qt.SolidLine,Qt.RoundCap))
+    painter.drawLine(QPointF(x1,y1),QPointF(x2,y2))
     painter.setPen(QPen(col,width,Qt.SolidLine,Qt.RoundCap))
     painter.drawLine(QPointF(x1,y1),QPointF(x2,y2))
     ang=math.atan2(y2-y1,x2-x1); sz=width*3.2
     p1=QPointF(x2-sz*math.cos(ang-0.42),y2-sz*math.sin(ang-0.42))
     p2=QPointF(x2-sz*math.cos(ang+0.42),y2-sz*math.sin(ang+0.42))
-    painter.setPen(Qt.NoPen); painter.setBrush(QBrush(col))
+    painter.setPen(QPen(QColor("#666"),1)); painter.setBrush(QBrush(col))
     painter.drawPolygon(QPolygonF([QPointF(x2,y2),p1,p2]))
 
 def draw_bottle(painter, x, y, w, h, col):
@@ -1902,15 +1907,17 @@ class AppNozzleItem(QGraphicsItem):
         painter.setRenderHint(QPainter.Antialiasing)
         col = _nozzle_color(self.nozzle_type)
         dx,dy=[v*self.ARROW_LEN for v in self._vec()]
-        # Base dot at connection point
-        painter.setBrush(QBrush(col)); painter.setPen(Qt.NoPen)
+        # Base dot at connection point — thin outline keeps light/white bands
+        # (e.g. Buckeye N-2W) visible against the white canvas
+        painter.setBrush(QBrush(col)); painter.setPen(QPen(QColor("#666"),1))
         painter.drawEllipse(-5,-5,10,10)
         # Direction arrow
         draw_arrow(painter,0,0,dx,dy,col,width=3)
         # Label
         if _item_show_label(self):
             lx, ly = self._label_pos()
-            painter.setPen(col); painter.setFont(QFont("Arial", 9, QFont.Bold))
+            painter.setPen(QColor("#333") if col.lightnessF()>0.85 else col)
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
             painter.drawText(QRectF(lx,ly,58,16),Qt.AlignLeft,self.nozzle_type)
         if self.isSelected():
             painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
@@ -1995,12 +2002,14 @@ class FreeNozzleItem(QGraphicsItem):
         painter.setRenderHint(QPainter.Antialiasing)
         col = _nozzle_color(self.nozzle_type)
         dx,dy=[v*self.ARROW_LEN for v in self._vec()]
-        painter.setBrush(QBrush(col)); painter.setPen(Qt.NoPen)
+        # Thin outline keeps light/white bands (e.g. Buckeye N-2W) visible on white canvas
+        painter.setBrush(QBrush(col)); painter.setPen(QPen(QColor("#666"),1))
         painter.drawEllipse(-4,-4,8,8)
         draw_arrow(painter,0,0,dx,dy,col,width=3)
         if _item_show_label(self):
             lx, ly = self._label_pos()
-            painter.setPen(col); painter.setFont(QFont("Arial", 9, QFont.Bold))
+            painter.setPen(QColor("#333") if col.lightnessF()>0.85 else col)
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
             painter.drawText(QRectF(lx,ly,58,16),Qt.AlignLeft,self.nozzle_type)
         if self.isSelected():
             painter.setPen(QPen(QColor("#ff7002"),2,Qt.DashLine)); painter.setBrush(Qt.NoBrush)
@@ -2941,6 +2950,13 @@ class SuppressionScene(QGraphicsScene):
         if t!="appliance": self.addItem(item)
         self.set_mode_select(); self.layout_changed.emit()
 
+    def place_appliance(self, key, x, y, w_in=None, d_in=None, h_in=30, name=None):
+        """Programmatic equivalent of a click-to-place appliance — used by report import.
+        y is ignored when a hood is already present (appliance auto-drops below it),
+        matching normal click-to-place behaviour."""
+        self.set_mode_place("appliance", {"key":key,"w_in":w_in,"d_in":d_in,"h_in":h_in,"name":name})
+        self._place_at(QPointF(x, y))
+
     # ── Pipe-draw helpers ────────────────────────────────────────────────────────
 
     def _snap_point(self, pt):
@@ -3746,6 +3762,256 @@ class AppSettingsDialog(QDialog):
         self.accept()
 
 
+def _closest_appliance_key(candidates, w_in, d_in):
+    """Pick the APPLIANCE_DEFS key whose (dw,dd) is closest to the parsed dims."""
+    if not candidates:
+        return None
+    if w_in is None or d_in is None:
+        return candidates[0]
+    def _dist(k):
+        d = APPLIANCE_DEFS[k]
+        return (d["dw"]-w_in)**2 + (d["dd"]-d_in)**2
+    return min(candidates, key=_dist)
+
+def _guess_appliance_key(desc, w_in, d_in):
+    """Best-effort mapping from a free-text service-report appliance line to an
+    APPLIANCE_DEFS key. Returns None when nothing reasonable matches — the
+    import review dialog lets the user pick manually in that case.
+    Only the leading "Type" segment (before the first " - ") is matched —
+    later segments are brand/model text (e.g. "Oven - U.S. Range - ...") that
+    can otherwise collide with appliance keywords like "range"."""
+    t = desc.split(" - ")[0].lower()
+    if "range" in t:
+        m = re.search(r"range\s*(\d+)", t)
+        burners = int(m.group(1)) if m else 6
+        n = min([2,4,6,8,10], key=lambda a: abs(a-burners))
+        return f"range_{n}"
+    if "henny" in t:
+        return "henny_penny"
+    if "fryer" in t:
+        return _closest_appliance_key(["fryer_sm","fryer_md","fryer_lg"], w_in, d_in)
+    if "round" in t and "griddle" in t:
+        return "round_griddle"
+    if "clamshell" in t:
+        return "clamshell"
+    if "griddle" in t:
+        return _closest_appliance_key(["griddle_sm","griddle_lg"], w_in, d_in)
+    if "tilt" in t and "skillet" in t:
+        return "tilt_skillet"
+    if "lava" in t:
+        return "lava_charbroiler"
+    if "mesquite" in t:
+        return "mesq_charbroiler"
+    if "charbroiler" in t or "broiler" in t:
+        if "chain" in t:
+            return "chain_broiler_o" if "open" in t else "chain_broiler_c"
+        if "upright" in t:
+            return "upright_broiler"
+        if "radiant" in t and "gas" in t:
+            return "radiant_gas"
+        if "elec" in t:
+            return "elec_charbroiler"
+        return "charbroiler"
+    if "wok" in t:
+        m = re.search(r"wok\D*(\d+)", t)
+        n = max(1, min(5, int(m.group(1)))) if m else 1
+        return f"wok_{n}" if n > 1 else "wok"
+    if "grillworks" in t:
+        return "grillworks_3" if "3" in t else "grillworks_2"
+    if "pizza" in t:
+        return "chain_pizza_oven"
+    if "salamander" in t:
+        return "salamander"
+    if "cheese" in t and "melt" in t:
+        return "cheese_melter"
+    if "soup" in t:
+        return "soup_stove"
+    if "tandoor" in t:
+        return "tandoor_oven"
+    if "gyro" in t:
+        return "gyro"
+    if "ecology" in t or "precipitator" in t:
+        return "ecology_unit"
+    if "bell" in t and "burner" in t:
+        return "bell_10"
+    if "oven" in t:
+        return "convection_oven"
+    if "table" in t:
+        return "table"
+    return None
+
+_WXD_RE   = re.compile(r"(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+_NOZ_RE   = re.compile(r"(\d+)\s*nozzles?", re.IGNORECASE)
+_HOODLEN_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*['’′]")
+
+def parse_kitchen_report(pdf_path):
+    """Extract hood + appliance info from a DFP kitchen inspection report PDF.
+    Best-effort text parsing — returns a dict for review/editing before any
+    drawing is built. Never raises; returns {} plus an 'error' key on failure."""
+    try:
+        doc = fitz.open(pdf_path)
+        lines = []
+        for page in doc:
+            lines.extend(l.strip() for l in page.get_text().splitlines())
+        doc.close()
+    except Exception as e:
+        return {"error": str(e)}
+
+    result = {"mfr_guess": None, "hood_len_ft": None, "system_name": None, "appliances": []}
+
+    # Property name → suggested system/tab name
+    for i, ln in enumerate(lines):
+        if ln == "Property:" and i+1 < len(lines):
+            result["system_name"] = lines[i+1]
+            break
+
+    # System brand → manufacturer guess
+    for i, ln in enumerate(lines):
+        if ln.strip().lower() == "system brand" and i+1 < len(lines):
+            brand = lines[i+1].lower()
+            for mk, mfr in MANUFACTURERS.items():
+                if mfr["name"].split()[0].lower() in brand:
+                    result["mfr_guess"] = mk
+                    break
+            break
+
+    # Hood length — value line follows the "...Hood Info..." label line
+    for i, ln in enumerate(lines):
+        if "hood info" in ln.lower() and i+1 < len(lines):
+            m = _HOODLEN_RE.search(lines[i+1])
+            if m:
+                result["hood_len_ft"] = float(m.group(1))
+            break
+
+    # Cooking appliances — collect lines under the section header, splitting
+    # into per-appliance blocks on each "Appliances" marker line, joining any
+    # wrapped continuation lines back into one description string.
+    try:
+        start = next(i for i, ln in enumerate(lines) if "cooking appliances" in ln.lower())
+    except StopIteration:
+        start = None
+    if start is not None:
+        blocks = []
+        cur = None
+        for ln in lines[start+1:]:
+            if ln == "Appliances":
+                cur = []; blocks.append(cur); continue
+            if cur is None:
+                continue
+            if ln.lower().startswith("appliance coverage") or ln.lower().startswith("duct & plenum"):
+                break
+            if ln.lower().startswith("remarks identified"):
+                continue
+            cur.append(ln)
+        for block in blocks:
+            desc = " ".join(block).strip()
+            if not desc:
+                continue
+            wm = _WXD_RE.search(desc)
+            w_in = float(wm.group(1)) if wm else None
+            d_in = float(wm.group(2)) if wm else None
+            nm = _NOZ_RE.search(desc)
+            nq = int(nm.group(1)) if nm else None
+            key = _guess_appliance_key(desc, w_in, d_in)
+            result["appliances"].append({
+                "raw": desc, "key": key, "w_in": w_in, "d_in": d_in, "nq": nq,
+            })
+    return result
+
+
+class ImportReportDialog(QDialog):
+    """Review/edit parsed report data before it's used to build a starting drawing."""
+    def __init__(self, parsed, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Kitchen Report — Review Before Building")
+        self.setMinimumWidth(760); self.setMinimumHeight(520)
+        l = QVBoxLayout(self); l.setSpacing(10); l.setContentsMargins(16,16,16,16)
+
+        l.addWidget(QLabel("<b>Review the extracted hood and appliance info below, adjust anything "
+                            "that looks wrong, then build the starting drawing.</b>"))
+
+        # ── Hood / system row ────────────────────────────────────────────────
+        top = QFormLayout(); top.setSpacing(8)
+        self.sys_name = QLineEdit(parsed.get("system_name") or "Imported System")
+        top.addRow("System tab name:", self.sys_name)
+        self.mfr_combo = QComboBox()
+        for mk, mfr in MANUFACTURERS.items():
+            self.mfr_combo.addItem(mfr["name"], mk)
+        guess = parsed.get("mfr_guess")
+        if guess:
+            idx = self.mfr_combo.findData(guess)
+            if idx >= 0: self.mfr_combo.setCurrentIndex(idx)
+        top.addRow("Manufacturer:", self.mfr_combo)
+        hood_row = QHBoxLayout()
+        self.hood_w = QDoubleSpinBox(); self.hood_w.setRange(12,480); self.hood_w.setSuffix("  in")
+        self.hood_w.setValue((parsed.get("hood_len_ft") or 8.0)*12.0)
+        self.hood_d = QDoubleSpinBox(); self.hood_d.setRange(12,120); self.hood_d.setValue(48); self.hood_d.setSuffix("  in")
+        hood_row.addWidget(QLabel("Width:")); hood_row.addWidget(self.hood_w)
+        hood_row.addWidget(QLabel("Depth:")); hood_row.addWidget(self.hood_d)
+        hood_row.addStretch()
+        top.addRow("Hood dims:", hood_row)
+        if not parsed.get("hood_len_ft"):
+            note = QLabel("⚠ Hood length not found in report — defaulted to 8 ft, please verify.")
+            note.setStyleSheet("color:#c0392b;font-size:10px;")
+            top.addRow("", note)
+        l.addLayout(top)
+
+        # ── Appliance table ──────────────────────────────────────────────────
+        appliances = parsed.get("appliances", [])
+        self.tbl = QTableWidget(len(appliances), 5)
+        self.tbl.setHorizontalHeaderLabels(["Use", "Report Line", "Appliance Type", "Width (in)", "Depth (in)"])
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tbl.verticalHeader().setVisible(False)
+        self._rows = []
+        names_sorted = sorted(APPLIANCE_DEFS.keys(), key=lambda k: APPLIANCE_DEFS[k]["name"])
+        for r, a in enumerate(appliances):
+            chk = QCheckBox(); chk.setChecked(a["key"] is not None)
+            cw = QWidget(); cl = QHBoxLayout(cw); cl.setContentsMargins(0,0,0,0); cl.addWidget(chk); cl.setAlignment(Qt.AlignCenter)
+            self.tbl.setCellWidget(r, 0, cw)
+            raw_item = QTableWidgetItem(a["raw"]); raw_item.setFlags(Qt.ItemIsEnabled)
+            self.tbl.setItem(r, 1, raw_item)
+            combo = QComboBox()
+            combo.addItem("— choose type —", None)
+            for k in names_sorted:
+                combo.addItem(APPLIANCE_DEFS[k]["name"], k)
+            if a["key"]:
+                idx = combo.findData(a["key"])
+                if idx >= 0: combo.setCurrentIndex(idx)
+            self.tbl.setCellWidget(r, 2, combo)
+            defn = APPLIANCE_DEFS.get(a["key"], {})
+            wsp = QDoubleSpinBox(); wsp.setRange(6,240); wsp.setValue(a["w_in"] or defn.get("dw",24))
+            dsp = QDoubleSpinBox(); dsp.setRange(6,120); dsp.setValue(a["d_in"] or defn.get("dd",24))
+            self.tbl.setCellWidget(r, 3, wsp)
+            self.tbl.setCellWidget(r, 4, dsp)
+            self._rows.append({"chk":chk, "combo":combo, "w":wsp, "d":dsp})
+        l.addWidget(self.tbl)
+
+        br = QHBoxLayout()
+        ok = QPushButton("Build Drawing")
+        ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        ca = QPushButton("Cancel"); ca.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ca); br.addWidget(ok)
+        l.addLayout(br)
+
+    def values(self):
+        appliances = []
+        for row in self._rows:
+            if not row["chk"].isChecked():
+                continue
+            key = row["combo"].currentData()
+            if not key:
+                continue
+            appliances.append({"key": key, "w_in": row["w"].value(), "d_in": row["d"].value()})
+        return {
+            "system_name": self.sys_name.text().strip() or "Imported System",
+            "mfr": self.mfr_combo.currentData(),
+            "hood_w_in": self.hood_w.value(),
+            "hood_d_in": self.hood_d.value(),
+            "appliances": appliances,
+        }
+
+
 class HoodDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent); self.setWindowTitle("Add Hood"); self.setMinimumWidth(320)
@@ -4511,6 +4777,7 @@ class SuppressionDesigner(QDialog):
         tbl.addWidget(_sep())
         tbl.addWidget(_btn("Project Info",  self._edit_project_info))
         tbl.addWidget(_btn("New",           self._new_project))
+        tbl.addWidget(_btn("Import Report…", self._import_report, color="#7d3c98"))
         tbl.addWidget(_btn("Open",          self._open_project, color="#1a5276"))
         tbl.addWidget(_btn("Save",          self._save_project,  color="#1a5276"))
         tbl.addWidget(_btn("Save As",       self._save_project_as))
@@ -4923,6 +5190,59 @@ class SuppressionDesigner(QDialog):
         self._add_system("System 1")
         self._dirty = False
         self._update_title()
+
+    def _import_report(self):
+        """Import a DFP kitchen inspection report PDF and use it to build a starting
+        drawing (new system tab) — best-effort extraction, reviewed/edited by the
+        user before anything is placed on the canvas."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import Kitchen Report", "", "PDF Files (*.pdf)")
+        if not path:
+            return
+        try:
+            parsed = parse_kitchen_report(path)
+        except Exception as e:
+            _log_error("_import_report:parse", e)
+            QMessageBox.critical(self, "Import Failed", f"Could not read this PDF:\n{e}")
+            return
+        if parsed.get("error"):
+            QMessageBox.critical(self, "Import Failed", f"Could not read this PDF:\n{parsed['error']}")
+            return
+        if not parsed.get("appliances") and not parsed.get("hood_len_ft"):
+            ans = QMessageBox.question(self, "Nothing Extracted",
+                "Couldn't find recognizable hood/appliance info in this report.\n\n"
+                "You can still continue and build the drawing from scratch. Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+        dlg = ImportReportDialog(parsed, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        try:
+            sys_info = self._add_system(vals["system_name"])
+            scene = sys_info["scene"]
+            scene.set_active_mfr(vals["mfr"])
+            self._sys_panel.refresh(scene)
+            hood = scene.add_hood(vals["hood_w_in"], vals["hood_d_in"], "Hood 1",
+                                   True, 14, 14, "Zone 1")
+            x = hood.scenePos().x() + 20
+            gap = 10
+            for a in vals["appliances"]:
+                defn = APPLIANCE_DEFS.get(a["key"], {})
+                w_px = (a["w_in"] or defn.get("dw", 24)) * PX
+                cx = x + w_px/2
+                scene.place_appliance(a["key"], cx, 0, w_in=a["w_in"], d_in=a["d_in"])
+                x += w_px + gap
+            self._canvas.fit_all()
+        except Exception as e:
+            _log_error("_import_report:build", e)
+            QMessageBox.critical(self, "Import Failed", f"Report was read but the drawing could not be built:\n{e}")
+            return
+        self._dirty = True
+        self._update_title()
+        self._status.setText(
+            f"  Imported {len(vals['appliances'])} appliance(s) from report — "
+            f"verify nozzle counts/types against the manual before finalizing.")
 
     def _save_project(self):
         """Save to current file; prompt for path if not yet saved. Returns True on success."""
