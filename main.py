@@ -2073,6 +2073,13 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._open_paint_booth_designer)
         tb.addAction(a)
 
+        a = QAction("Drawing Designer", self)
+        a.setToolTip("Draw scaled floor plans, place electrical/low-voltage/furniture symbols, "
+                     "and export quote-ready PDFs. Includes freeform wiring diagram and fire "
+                     "alarm one-line diagram tabs.")
+        a.triggered.connect(self._open_drawing_designer)
+        tb.addAction(a)
+
         # ── Estimating ────────────────────────────────────────────────────
         tb.addSeparator()
         a = QAction("PMA Quote", self)
@@ -2566,6 +2573,22 @@ class MainWindow(QMainWindow):
         # create a modal-within-modal loop that crashes on Windows builds.
         dlg = SuppressionDesigner(self, project_name=proj_name)
         self._suppression_dlg = dlg  # keep reference so GC doesn't destroy it
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _open_drawing_designer(self):
+        from drawing_designer import DrawingDesigner
+        proj_name = ""
+        if self._project_id:
+            for p in db.get_projects():
+                if p["id"] == self._project_id:
+                    proj_name = p["name"]; break
+        # Use show() (modeless) so nested QFileDialog.exec_() calls don't
+        # create a modal-within-modal loop that crashes on Windows builds.
+        dlg = DrawingDesigner(self, project_name=proj_name)
+        self._floor_plan_dlg = dlg  # keep reference so GC doesn't destroy it
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.show()
         dlg.raise_()
