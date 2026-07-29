@@ -1,5 +1,5 @@
 {
-  "version": "1.3.0",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.3.0/DFP_TakeoffPro_Setup_1.3.0.exe",
-  "notes": "Drawing Designer (renamed from Floor Plan Designer): symbols now draw as real distinguishable icons with a printed legend, furniture and stairs have editable real-world dimensions, quick rectangle-room tool, symbols snap to walls/grid on both placement and drag, larger readable export text. One-Line Diagram boxes are now draggable/resizable with an export preview, standalone circuits with hidden panel/booster support, and Autocall FQQ quote import."
+  "version": "1.3.1",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.3.1/DFP_TakeoffPro_Setup_1.3.1.exe",
+  "notes": "Fixes: Drawing Designer's ruler/measure tool now shows its preview line while moving toward the next click (was only visible while dragging). Suppression Designer: manually-added nozzles (e.g. on Ecology Units) now count correctly in the appliance/nozzle list on-screen and in the PDF export, mixed nozzle types on one appliance print one per line, and long customer names/multi-line addresses in the PDF header/footer no longer overlap."
 }

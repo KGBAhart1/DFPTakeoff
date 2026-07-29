@@ -507,6 +507,47 @@ def effective_defn(key, mfr_key="kidde"):
     base.update(overrides)
     return base
 
+
+def _nozzles_for_appliance(a, all_appliances, free_nozzles):
+    """An appliance's own app_nozzles, plus any free-standing nozzles whose
+    nearest appliance (by scene-center distance) is this one.
+
+    Some appliance types — Ecology Units are the main one (nq:0 in
+    APPLIANCE_DEFS, "duct nozzles above+below, design separately") — never
+    get auto-populated app_nozzles at all; the user is expected to place
+    nozzles manually with the free-nozzle tool instead. Without this,
+    those nozzles are invisible to any per-appliance nozzle count/flow
+    even though scene.total_flow() already includes them in its overall
+    total, making the breakdown rows silently disagree with the total."""
+    result = list(a.app_nozzles)
+    if not free_nozzles:
+        return result
+    if len(all_appliances) <= 1:
+        return result + list(free_nozzles)
+    a_center = a.sceneBoundingRect().center()
+    for nz in free_nozzles:
+        npt = nz.scenePos()
+        d_this = (npt.x()-a_center.x())**2 + (npt.y()-a_center.y())**2
+        if all(other is a or d_this <= ((npt.x()-other.sceneBoundingRect().center().x())**2 +
+                                         (npt.y()-other.sceneBoundingRect().center().y())**2)
+               for other in all_appliances):
+            result.append(nz)
+    return result
+
+
+def _nozzle_type_rows(nozzles):
+    """[(nozzle_type, qty, flow_for_that_type), ...] grouped by type, one
+    entry per distinct type — so a mixed-type appliance prints one line per
+    type instead of cramming everything onto a single line."""
+    if not nozzles:
+        return []
+    from collections import Counter
+    counts = Counter(nz.nozzle_type for nz in nozzles)
+    flow_by_type = {}
+    for nz in nozzles:
+        flow_by_type[nz.nozzle_type] = flow_by_type.get(nz.nozzle_type, 0) + nz.flow_points()
+    return [(t, n, flow_by_type[t]) for t, n in counts.items()]
+
 # ── Appliance definitions ─────────────────────────────────────────────────────
 # nt  = Kidde nozzle type label shown on drawing & breakdown table
 #       F=Fryer nozzle (flow 2)  ADP=All-purpose (flow 1)  R=Range (flow 1)
@@ -3791,18 +3832,22 @@ class SystemPanel(QWidget):
                 alts=", ".join(x["model"] for x in rec["alternatives"])
                 rl.setText(f"{rec['total_flow']}/{t['max_flow']} pts  ({m:.0f}% spare)"+(f"\nAlt: {alts}" if alts else ""))
         rows=[]
+        _appliance_list = [ap for ap in scene.appliances() if ap.key != "table"]
+        _free_nozzles = [i for i in scene.items() if getattr(i,"ITEM_TYPE","")=="free_nozzle"]
+        def _fmt_flow(v):
+            return str(int(v)) if v == int(v) else str(v)
         for a in scene.appliances():
-            if a._nozzles_placed:
-                nq = len(a.app_nozzles)
-                nt = a.app_nozzles[0].nozzle_type if a.app_nozzles else "—"
-                flow_val = sum(nz.flow_points() for nz in a.app_nozzles)
+            combined = _nozzles_for_appliance(a, _appliance_list, _free_nozzles)
+            name = a.custom_name or a.defn["name"]
+            if a._nozzles_placed or combined:
+                type_rows = _nozzle_type_rows(combined)
+                if not type_rows:
+                    rows.append((name, "0× —", "0"))
+                for i, (t, n, fl) in enumerate(type_rows):
+                    rows.append((name if i == 0 else "", f"{n}× {t}", _fmt_flow(fl)))
             else:
                 ed = effective_defn(a.key, mk)
-                nq = ed["nq"]; nt = ed["nt"] or "—"; flow_val = ed["flow"]
-            flow_str = str(int(flow_val)) if flow_val == int(flow_val) else str(flow_val)
-            rows.append((a.custom_name or a.defn["name"],
-                         f"{nq}× {nt}",
-                         flow_str))
+                rows.append((name, f"{ed['nq']}× {ed['nt'] or '—'}", _fmt_flow(ed["flow"])))
         hood_nz = MFR_HOOD_NOZZLE.get(mk, MFR_HOOD_NOZZLE["kidde"])
         for hn in scene.hoods():
             p = len(hn.plenum_nozzles)
@@ -4650,6 +4695,20 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
                     sr=sr.united(grandchild.sceneBoundingRect())
             return sr
 
+        def _draw_multiline(pg, x, y, text, fontsize, color, leading=None):
+            """Draw text top-down starting at y, one line per '\\n' in text,
+            and return the y position right after the last line drawn.
+            Customer/location values can be multi-line (e.g. a full mailing
+            address with unit/city on one line and postal/country on the
+            next) — using a fixed y-offset for whatever comes next assumed
+            every field was exactly one line, so a long customer name or a
+            multi-line address would silently run into the text below it."""
+            leading = leading if leading is not None else fontsize+3
+            for line in str(text or "").split("\n"):
+                pg.insert_text((x,y), line, fontsize=fontsize, color=color, fontname="helv")
+                y += leading
+            return y
+
         # Filter to systems that have content
         active=[]
         for sys_name, scene in systems:
@@ -4708,8 +4767,8 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
             pg.draw_rect(fitz.Rect(0,0,W,HEADER_H),color=red,fill=red)
             pg.insert_text((BORDER,18),"DEFENSE FIRE PROTECTION",fontsize=13,color=(1,1,1),fontname="helv")
             pg.insert_text((BORDER,35),"Kitchen Fire Suppression System",fontsize=8,color=(1,1,1),fontname="helv")
-            pg.insert_text((W-SIDEBAR_W+4,18),f"Customer: {customer}",fontsize=8,color=(1,1,1),fontname="helv")
-            pg.insert_text((W-SIDEBAR_W+4,32),f"Location: {location}",fontsize=7,color=(1,1,1),fontname="helv")
+            _hy=_draw_multiline(pg,W-SIDEBAR_W+4,18,f"Customer: {customer}",8,(1,1,1))
+            _draw_multiline(pg,W-SIDEBAR_W+4,_hy+3,f"Location: {location}",7,(1,1,1))
 
             # Drawing area
             pg.draw_rect(fitz.Rect(DX1,DY1,DX2,DY2),color=dark,width=1.2)
@@ -4735,13 +4794,42 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
             sy2+=8
             pg.draw_line((sx2,sy2),(W-BORDER,sy2),color=dark,width=0.5); sy2+=8
             pg.insert_text((sx2,sy2),"APPLIANCE / NOZZLE LIST",fontsize=8,color=dark,fontname="helv"); sy2+=12
+            _appliance_list = [ap for ap in scene.appliances() if ap.key != "table"]
+            _free_nozzles = [i for i in scene.items() if getattr(i,"ITEM_TYPE","")=="free_nozzle"]
             for a in scene.appliances():
                 if a.key == "table": continue
                 if sy2>H-FOOTER_H-10: break
-                ed=effective_defn(a.key,scene.active_mfr)
-                pg.insert_text((sx2,sy2),f"{a.custom_name or a.defn['short']}",fontsize=7,color=dark,fontname="helv")
-                pg.insert_text((sx2+55,sy2),f"{ed['nq']}×{ed['nt'] or '—'}  {ed['flow']}fp",fontsize=7,color=(0.3,0.3,0.3),fontname="helv")
-                sy2+=10
+                # Mirror the on-screen appliance list's logic exactly: once
+                # nozzles have actually been placed/edited for this instance,
+                # show the real live count/type/flow from its nozzles, not
+                # the catalog default — else manually-added nozzles (or a
+                # manually-cleared-to-zero appliance) silently show 0 here
+                # while scene.total_flow() (which always reads app_nozzles
+                # plus free-standing nozzles) is correct, making the two
+                # disagree. Some appliance types (e.g. Ecology Units, nq:0
+                # by definition) never get auto-populated app_nozzles at
+                # all and rely entirely on free-standing nozzles placed
+                # nearby — _nozzles_for_appliance() attributes those to
+                # their closest appliance so they're not silently dropped.
+                combined = _nozzles_for_appliance(a, _appliance_list, _free_nozzles)
+                name = a.custom_name or a.defn["short"]
+                if a._nozzles_placed or combined:
+                    type_rows = _nozzle_type_rows(combined)
+                    if not type_rows:
+                        pg.insert_text((sx2,sy2),name,fontsize=7,color=dark,fontname="helv")
+                        pg.insert_text((sx2+55,sy2),"0× —  0fp",fontsize=7,color=(0.3,0.3,0.3),fontname="helv")
+                        sy2+=10
+                    for i,(t,n,fl) in enumerate(type_rows):
+                        if sy2>H-FOOTER_H-10: break
+                        if i==0:
+                            pg.insert_text((sx2,sy2),name,fontsize=7,color=dark,fontname="helv")
+                        pg.insert_text((sx2+55,sy2),f"{n}×{t}  {fl}fp",fontsize=7,color=(0.3,0.3,0.3),fontname="helv")
+                        sy2+=10
+                else:
+                    ed = effective_defn(a.key, scene.active_mfr)
+                    pg.insert_text((sx2,sy2),name,fontsize=7,color=dark,fontname="helv")
+                    pg.insert_text((sx2+55,sy2),f"{ed['nq']}×{ed['nt'] or '—'}  {ed['flow']}fp",fontsize=7,color=(0.3,0.3,0.3),fontname="helv")
+                    sy2+=10
             _hnz=MFR_HOOD_NOZZLE.get(scene.active_mfr,MFR_HOOD_NOZZLE["kidde"])
             for hn in scene.hoods():
                 if sy2>H-FOOTER_H-10: break
@@ -4865,11 +4953,17 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
             if rev_d:
                 pg.insert_text((W-SIDEBAR_W-76,32),rev_d,fontsize=7,color=(0.3,0.3,0.3),fontname="helv")
 
-            # Footer
+            # Footer — the band here is only FOOTER_H tall with nothing below
+            # it but the page edge, so (unlike the header, which has the
+            # whole drawing area to spill into) stacking a multi-line
+            # customer/address vertically risks pushing the last line or two
+            # completely off the bottom of the page. Condense any embedded
+            # newlines to one line per field instead, matching this footer's
+            # original 2-line design.
             tb_y=H-FOOTER_H
             pg.draw_rect(fitz.Rect(0,tb_y,W,H),color=dark,fill=dark)
-            pg.insert_text((BORDER,tb_y+13),f"{customer}",fontsize=8,color=(1,1,1),fontname="helv")
-            pg.insert_text((BORDER,tb_y+25),f"{location}",fontsize=7,color=(0.85,0.85,0.85),fontname="helv")
+            pg.insert_text((BORDER,tb_y+13),customer.replace("\n",", "),fontsize=8,color=(1,1,1),fontname="helv")
+            pg.insert_text((BORDER,tb_y+25),location.replace("\n",", "),fontsize=7,color=(0.85,0.85,0.85),fontname="helv")
             pg.insert_text((W-200,tb_y+13),"Defense Fire Protection",fontsize=7,color=(1,1,1),fontname="helv")
             pg.insert_text((W-200,tb_y+23),_dt.date.today().strftime("Date: %Y-%m-%d"),fontsize=6,color=(0.9,0.9,0.9),fontname="helv")
             pg.insert_text((W-100,tb_y+13),f"Page {pg_idx+1} of {total_pages}",fontsize=7,color=(1,1,1),fontname="helv")

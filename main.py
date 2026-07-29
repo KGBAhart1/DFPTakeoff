@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSlider, QMenu,
     QFrame, QProgressDialog, QShortcut, QSizePolicy, QCheckBox, QGroupBox, QLayout,
 )
-from PyQt5.QtGui  import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySequence
+from PyQt5.QtGui  import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySequence, QPolygonF
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QThread, pyqtSignal, QTimer
 
 import db, excel_export, estimator
@@ -99,6 +99,7 @@ class PdfCanvas(QLabel):
     scale_measured       = pyqtSignal(QPointF, QPointF) # two page-coord points
     linear_run_completed = pyqtSignal(int, float, str)  # assembly_id, footage, points_json
     run_deleted          = pyqtSignal(int, int)         # run_id, assembly_id
+    measurement_completed = pyqtSignal(str, float)      # "length"|"area", value (ft or sq ft)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -106,6 +107,11 @@ class PdfCanvas(QLabel):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_right_click)
         self.setFocusPolicy(Qt.StrongFocus)
+        # Without this, mouseMoveEvent only fires while a button is held
+        # down — meaning the dashed preview line for the wire-run/measure
+        # tools never followed the cursor during a normal move-then-click
+        # placement (no drag), only if you happened to drag between clicks.
+        self.setMouseTracking(True)
         self._doc = None
         self._page_index = 0
         self._pdf_path = ""
@@ -132,8 +138,15 @@ class PdfCanvas(QLabel):
         self._linear_preview    = None # current snapped mouse position
         # {(pdf_path, page_index): [run_dict, ...]}
         self._page_runs = {}
+        # Ad-hoc ruler/area tool state — a scratch measurement, not a saved
+        # takeoff assembly. Cleared per-page, never written to the DB.
+        self._measure_mode      = None   # None | "length" | "area"
+        self._measure_points    = []     # list of QPointF in page coords
+        self._measure_preview   = None
+        # {(pdf_path, page_index): [{"type":"length"|"area","points":[...],"value":float}, ...]}
+        self._page_measurements = {}
 
-    #  Public API 
+    #  Public API
 
     def load_page(self, doc, page_index, pdf_path=""):
         self._doc = doc
@@ -252,6 +265,20 @@ class PdfCanvas(QLabel):
         self._scale_mode = enabled
         self._scale_pt1 = None
         self._update_cursor()
+        self._paint_overlay()
+
+    # ── Ad-hoc measure (ruler / area) tool API ──────────────────────────────────
+
+    def set_measure_mode(self, mode):
+        """mode: None to turn off, else 'length' or 'area'."""
+        self._measure_mode = mode
+        self._measure_points = []
+        self._measure_preview = None
+        self._update_cursor()
+        self._paint_overlay()
+
+    def clear_measurements_current_page(self):
+        self._page_measurements.pop((self._pdf_path, self._page_index), None)
         self._paint_overlay()
 
     # ── Linear drawing API ────────────────────────────────────────────────────
@@ -452,6 +479,96 @@ class PdfCanvas(QLabel):
                 painter.setPen(QPen(QColor("#ffff00")))
                 painter.drawText(lx, ly - lh, lw, lh, Qt.AlignCenter, lbl)
 
+        # ── Completed scratch measurements (ruler/area tool) ──────────────────
+        MEASURE_COLOR = "#17a2b8"   # teal — visually distinct from takeoff-run orange
+        measurements = self._page_measurements.get((self._pdf_path, self._page_index), [])
+        for meas in measurements:
+            pts = meas["points"]
+            col = QColor(MEASURE_COLOR)
+            if meas["type"] == "area" and len(pts) >= 3:
+                poly = QPolygonF([QPointF(p.x()*self._zoom, p.y()*self._zoom) for p in pts])
+                fill = QColor(col); fill.setAlpha(45)
+                painter.setPen(QPen(col, 2))
+                painter.setBrush(fill)
+                painter.drawPolygon(poly)
+                cx = sum(p.x() for p in pts) / len(pts) * self._zoom
+                cy = sum(p.y() for p in pts) / len(pts) * self._zoom
+                lbl = f'{meas["value"]:.1f} SF'
+            else:
+                pen = QPen(col, 2.5); pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(pen); painter.setBrush(Qt.NoBrush)
+                for i in range(1, len(pts)):
+                    painter.drawLine(int(pts[i-1].x()*self._zoom), int(pts[i-1].y()*self._zoom),
+                                      int(pts[i].x()*self._zoom), int(pts[i].y()*self._zoom))
+                painter.setBrush(col)
+                for p in (pts[0], pts[-1]):
+                    painter.drawEllipse(int(p.x()*self._zoom)-4, int(p.y()*self._zoom)-4, 8, 8)
+                mid = pts[len(pts)//2]
+                cx, cy = mid.x()*self._zoom, mid.y()*self._zoom
+                lbl = f'{meas["value"]:.1f} ft'
+            painter.setPen(QPen(QColor("#ffffff")))
+            painter.setBrush(QColor(0, 0, 0, 150))
+            fm = painter.fontMetrics()
+            lw = fm.horizontalAdvance(lbl) + 6; lh = fm.height() + 2
+            painter.drawRect(int(cx-lw/2), int(cy-lh/2), lw, lh)
+            painter.setPen(QPen(col))
+            painter.drawText(int(cx-lw/2), int(cy-lh/2), lw, lh, Qt.AlignCenter, lbl)
+
+        # ── In-progress measurement preview ───────────────────────────────────
+        if self._measure_mode and self._measure_points:
+            draw_pts = self._measure_points[:]
+            if self._measure_preview:
+                draw_pts.append(self._measure_preview)
+            col = QColor(MEASURE_COLOR)
+            pen = QPen(col, 2, Qt.DashLine); pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen); painter.setBrush(Qt.NoBrush)
+            for i in range(1, len(draw_pts)):
+                painter.drawLine(int(draw_pts[i-1].x()*self._zoom), int(draw_pts[i-1].y()*self._zoom),
+                                  int(draw_pts[i].x()*self._zoom), int(draw_pts[i].y()*self._zoom))
+            if self._measure_mode == "area" and len(draw_pts) >= 2:
+                # Dashed closing edge back to the start, so it's clear where
+                # clicking near the first point will close the polygon.
+                first, last = draw_pts[0], draw_pts[-1]
+                painter.drawLine(int(last.x()*self._zoom), int(last.y()*self._zoom),
+                                  int(first.x()*self._zoom), int(first.y()*self._zoom))
+            painter.setPen(QPen(col, 2)); painter.setBrush(col)
+            for pt in self._measure_points:
+                painter.drawEllipse(int(pt.x()*self._zoom)-5, int(pt.y()*self._zoom)-5, 10, 10)
+            # Start-point highlight for area mode, so the closing target is obvious
+            if self._measure_mode == "area" and self._measure_points:
+                sp = self._measure_points[0]
+                painter.setPen(QPen(QColor("#ffff00"), 2)); painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(int(sp.x()*self._zoom)-9, int(sp.y()*self._zoom)-9, 18, 18)
+            if self._points_per_meter > 0 and len(draw_pts) >= 2:
+                m_per_pt = 1.0 / self._points_per_meter
+                if self._measure_mode == "length":
+                    total_ft = 0.0
+                    for i in range(1, len(draw_pts)):
+                        dx = draw_pts[i].x()-draw_pts[i-1].x(); dy = draw_pts[i].y()-draw_pts[i-1].y()
+                        total_ft += _math.sqrt(dx*dx+dy*dy) * m_per_pt * 3.28084
+                    lbl = f"{total_ft:.1f} ft"
+                elif len(draw_pts) >= 3:
+                    n = len(draw_pts)
+                    shoelace = 0.0
+                    for i in range(n):
+                        x1, y1 = draw_pts[i].x(), draw_pts[i].y()
+                        x2, y2 = draw_pts[(i+1) % n].x(), draw_pts[(i+1) % n].y()
+                        shoelace += x1*y2 - x2*y1
+                    area_m2 = (abs(shoelace)/2.0) * (m_per_pt ** 2)
+                    lbl = f"{area_m2*10.7639:.1f} SF"
+                else:
+                    lbl = None
+                if lbl:
+                    last = draw_pts[-1]
+                    lx = int(last.x()*self._zoom) + 10; ly = int(last.y()*self._zoom) - 10
+                    painter.setPen(QPen(QColor("#ffffff")))
+                    painter.setBrush(QColor(0, 0, 0, 160))
+                    fm = painter.fontMetrics()
+                    lw = fm.horizontalAdvance(lbl) + 6; lh = fm.height() + 2
+                    painter.drawRect(lx, ly - lh, lw, lh)
+                    painter.setPen(QPen(QColor("#ffff00")))
+                    painter.drawText(lx, ly - lh, lw, lh, Qt.AlignCenter, lbl)
+
         painter.end()
         self.setPixmap(pm)
         self.resize(pm.size())
@@ -462,7 +579,7 @@ class PdfCanvas(QLabel):
     def _update_cursor(self):
         if self._pan_start is not None:
             self.setCursor(Qt.ClosedHandCursor)
-        elif self._scale_mode or self._counting_mode or self._linear_mode:
+        elif self._scale_mode or self._counting_mode or self._linear_mode or self._measure_mode:
             self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
@@ -494,6 +611,48 @@ class PdfCanvas(QLabel):
         self._linear_preview = None
         self._paint_overlay()
         self.linear_run_completed.emit(aid, footage, points_json)
+
+    def _finish_measurement(self):
+        """Compute the scratch length/area measurement and keep it drawn on
+        the page (not saved to the DB — this is a ruler/area tool, not a
+        takeoff assembly). Requires a scale to already be set."""
+        import math as _math
+        pts = self._measure_points
+        mode = self._measure_mode
+        if self._points_per_meter <= 0:
+            self._measure_points = []; self._measure_preview = None
+            self._paint_overlay()
+            return
+        m_per_pt = 1.0 / self._points_per_meter
+        if mode == "length":
+            if len(pts) < 2:
+                self._measure_points = []; self._measure_preview = None
+                self._paint_overlay(); return
+            total_ft = 0.0
+            for i in range(1, len(pts)):
+                dx = pts[i].x()-pts[i-1].x(); dy = pts[i].y()-pts[i-1].y()
+                total_ft += _math.sqrt(dx*dx+dy*dy) * m_per_pt * 3.28084
+            value = total_ft
+        else:  # "area"
+            if len(pts) < 3:
+                self._measure_points = []; self._measure_preview = None
+                self._paint_overlay(); return
+            n = len(pts)
+            shoelace = 0.0
+            for i in range(n):
+                x1, y1 = pts[i].x(), pts[i].y()
+                x2, y2 = pts[(i+1) % n].x(), pts[(i+1) % n].y()
+                shoelace += x1*y2 - x2*y1
+            area_pt2 = abs(shoelace) / 2.0
+            area_m2 = area_pt2 * (m_per_pt ** 2)
+            value = area_m2 * 10.7639   # sq ft per sq m
+        key = (self._pdf_path, self._page_index)
+        self._page_measurements.setdefault(key, []).append(
+            {"type": mode, "points": list(pts), "value": value})
+        self._measure_points = []
+        self._measure_preview = None
+        self._paint_overlay()
+        self.measurement_completed.emit(mode, value)
 
     def _find_nearest_run(self, canvas_pos, threshold=12):
         import math as _math
@@ -559,6 +718,22 @@ class PdfCanvas(QLabel):
                 self._linear_points.append(page_pt)
                 self._linear_preview = None
                 self._paint_overlay()
+            elif self._measure_mode:
+                page_pt = self._canvas_to_page(event.pos())
+                if self._measure_points:
+                    page_pt = self._snap_linear(self._measure_points[-1], page_pt, event.modifiers())
+                # Area mode: clicking back near the start point closes the
+                # polygon and finishes the measurement (needs >= 3 points).
+                if (self._measure_mode == "area" and len(self._measure_points) >= 3):
+                    first = self._measure_points[0]
+                    dx = (page_pt.x()-first.x())*self._zoom
+                    dy = (page_pt.y()-first.y())*self._zoom
+                    if (dx*dx+dy*dy) ** 0.5 <= 12:
+                        self._finish_measurement()
+                        return
+                self._measure_points.append(page_pt)
+                self._measure_preview = None
+                self._paint_overlay()
             elif self._counting_mode:
                 page_pt = self._canvas_to_page(event.pos())
                 near = self._find_nearest_mark(event.pos(), threshold=18)
@@ -586,6 +761,9 @@ class PdfCanvas(QLabel):
             # Just finish if we have at least 2 points (start + at least one end point).
             if len(self._linear_points) >= 2:
                 self._finish_linear_run()
+        elif self._measure_mode == "length" and event.button() == Qt.LeftButton:
+            if len(self._measure_points) >= 2:
+                self._finish_measurement()
 
     def mouseMoveEvent(self, event):
         if self._pan_start and (event.buttons() & Qt.LeftButton):
@@ -596,12 +774,23 @@ class PdfCanvas(QLabel):
             page_pt = self._canvas_to_page(event.pos())
             self._linear_preview = self._snap_linear(self._linear_points[-1], page_pt, event.modifiers())
             self._paint_overlay()
+        elif self._measure_mode and self._measure_points:
+            page_pt = self._canvas_to_page(event.pos())
+            self._measure_preview = self._snap_linear(self._measure_points[-1], page_pt, event.modifiers())
+            self._paint_overlay()
 
     def keyPressEvent(self, event):
         if self._linear_mode and event.key() == Qt.Key_Escape:
             self._linear_points = []
             self._linear_preview = None
             self._paint_overlay()
+        elif self._measure_mode and event.key() == Qt.Key_Escape:
+            self._measure_points = []
+            self._measure_preview = None
+            self._paint_overlay()
+        elif (self._measure_mode == "area" and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+              and len(self._measure_points) >= 3):
+            self._finish_measurement()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._pan_start:
@@ -620,6 +809,12 @@ class PdfCanvas(QLabel):
             # Cancel current in-progress run
             self._linear_points = []
             self._linear_preview = None
+            self._paint_overlay()
+            return
+        if self._measure_mode and self._measure_points:
+            # Cancel current in-progress measurement
+            self._measure_points = []
+            self._measure_preview = None
             self._paint_overlay()
             return
         menu = QMenu(self)
@@ -2118,6 +2313,35 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._set_scale_ratio)
         tb.addAction(a)
 
+        # ── Ad-hoc ruler / area tool ─────────────────────────────────────────
+        tb.addSeparator()
+        self.measure_length_action = QAction("Measure Length", self)
+        self.measure_length_action.setCheckable(True)
+        self.measure_length_action.setToolTip(
+            "Click points along a run, double-click to finish and see the total length.\n"
+            "Requires a scale — set one first with 'Measure on Drawing' or 'Set Scale…'.\n"
+            "This is a scratch measurement, not a counted takeoff item."
+        )
+        self.measure_length_action.triggered.connect(lambda c: self._toggle_measure("length", c))
+        tb.addAction(self.measure_length_action)
+
+        self.measure_area_action = QAction("Measure Area", self)
+        self.measure_area_action.setCheckable(True)
+        self.measure_area_action.setToolTip(
+            "Click each corner of the area, then click back near the first point "
+            "(or press Enter) to close it and see the square footage.\n"
+            "Requires a scale — set one first with 'Measure on Drawing' or 'Set Scale…'.\n"
+            "This is a scratch measurement, not a counted takeoff item."
+        )
+        self.measure_area_action.triggered.connect(lambda c: self._toggle_measure("area", c))
+        tb.addAction(self.measure_area_action)
+
+        a = QAction("Clear Measurements (page)", self)
+        a.triggered.connect(self.canvas.clear_measurements_current_page)
+        tb.addAction(a)
+
+        self.canvas.measurement_completed.connect(self._on_measurement_completed)
+
         # Per-type coverage toggles
         tb.addSeparator()
         self._cov_toggles = {}
@@ -2169,6 +2393,9 @@ class MainWindow(QMainWindow):
 
     def _start_measure(self, checked):
         if checked:
+            self.measure_length_action.setChecked(False)
+            self.measure_area_action.setChecked(False)
+            self.canvas.set_measure_mode(None)
             self.canvas.set_scale_mode(True)
             self.statusBar().showMessage(
                 "Measure: click the FIRST point on a known dimension…"
@@ -2176,6 +2403,44 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.set_scale_mode(False)
             self.statusBar().showMessage("Measurement cancelled.")
+
+    def _toggle_measure(self, mode, checked):
+        """Ad-hoc ruler/area tool — a scratch measurement (not a counted
+        takeoff item) for eyeballing a length or square footage on the
+        print. Requires the page scale to already be set."""
+        other_action = self.measure_area_action if mode == "length" else self.measure_length_action
+        if checked:
+            ppm = self.canvas._points_per_meter
+            if self._project_id and self._pdf_path:
+                ppm = db.get_page_scale(self._project_id, self._pdf_path, self._page_index) or ppm
+            if not ppm:
+                (self.measure_length_action if mode == "length" else self.measure_area_action).setChecked(False)
+                QMessageBox.warning(self, "No Scale Set",
+                    "This page has no scale set.\n\n"
+                    "Use 'Measure on Drawing' or 'Set Scale…' before measuring length/area.")
+                return
+            other_action.setChecked(False)
+            self.measure_action.setChecked(False)
+            self.canvas.set_scale_mode(False)
+            if self.count_action.isChecked():
+                self.count_action.setChecked(False)
+                self._toggle_counting(False)
+            self.canvas.set_measure_mode(mode)
+            if mode == "length":
+                self.statusBar().showMessage(
+                    "Measure Length: click each point, double-click to finish  |  "
+                    "Shift = diagonal  |  Esc/right-click = cancel")
+            else:
+                self.statusBar().showMessage(
+                    "Measure Area: click each corner, click back near the start "
+                    "(or press Enter) to close it  |  Esc/right-click = cancel")
+        else:
+            self.canvas.set_measure_mode(None)
+            self.statusBar().showMessage("Measure tool off.")
+
+    def _on_measurement_completed(self, mode, value):
+        unit = "ft" if mode == "length" else "SF"
+        self.statusBar().showMessage(f"Measured {mode}: {value:.1f} {unit}", 8000)
 
     def _on_scale_measured(self, pt1, pt2):
         """Called after user clicks two points; opens ScaleDialog to enter real distance."""
@@ -2287,6 +2552,10 @@ class MainWindow(QMainWindow):
 
     def _toggle_counting(self, checked):
         self._counting_mode = checked
+        if checked and (self.measure_length_action.isChecked() or self.measure_area_action.isChecked()):
+            self.measure_length_action.setChecked(False)
+            self.measure_area_action.setChecked(False)
+            self.canvas.set_measure_mode(None)
         e = self.takeoff_panel._active_entity
         is_linear = e and e["type"] == "assembly" and e["data"].get("is_linear")
 
