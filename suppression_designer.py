@@ -5002,9 +5002,31 @@ class ProjectInfoDialog(QDialog):
         self._customer.setPlaceholderText("e.g. McDonald's – Main St")
         _row("Customer:", self._customer)
 
-        self._location = QLineEdit(m.get("location",""))
-        self._location.setPlaceholderText("e.g. 123 Main St, Anytown AB")
-        _row("Location:", self._location)
+        # Street address and city/province are separate single-line fields
+        # (rather than one free-text "Location" box) so the header/footer
+        # always break between them at the same predictable spot. A pasted
+        # multi-line address into one big field was the original cause of
+        # addresses overlapping other export text — this removes that risk
+        # entirely instead of just handling it after the fact.
+        addr, city = m.get("address", ""), m.get("city_prov", "")
+        if not addr and not city:
+            # Migrate an old-style combined "location" value (which may
+            # itself contain an embedded line break from a paste) into the
+            # two new fields, best-effort, so existing projects still show
+            # something sensible the first time this dialog reopens.
+            legacy = m.get("location", "")
+            if "\n" in legacy:
+                addr, city = legacy.split("\n", 1)
+                city = city.replace("\n", ", ")
+            else:
+                addr = legacy
+        self._address = QLineEdit(addr)
+        self._address.setPlaceholderText("e.g. 123 Main St, Unit 4")
+        _row("Street Address:", self._address)
+
+        self._city_prov = QLineEdit(city)
+        self._city_prov.setPlaceholderText("e.g. Calgary, AB  T2R 1P2")
+        _row("City / Province:", self._city_prov)
 
         self._job = QLineEdit(m.get("job_number",""))
         self._job.setPlaceholderText("e.g. DFP-2026-001")
@@ -5042,9 +5064,18 @@ class ProjectInfoDialog(QDialog):
         layout.addLayout(btns)
 
     def values(self):
+        address = self._address.text().strip()
+        city_prov = self._city_prov.text().strip()
+        # "location" is still what the exporter reads — composed here as
+        # exactly one predictable line break (or none, if city/province was
+        # left blank) instead of whatever an old free-text field happened
+        # to contain.
+        location = f"{address}\n{city_prov}" if (address and city_prov) else (address or city_prov)
         return {
             "customer":   self._customer.text().strip(),
-            "location":   self._location.text().strip(),
+            "location":   location,
+            "address":    address,
+            "city_prov":  city_prov,
             "job_number": self._job.text().strip(),
             "designer":   self._designer.text().strip(),
             "revision":   self._revision.text().strip() or "A",
@@ -5479,7 +5510,8 @@ class SuppressionDesigner(QDialog):
             "meta": self._project_meta,
             "created": self._project_meta.get("_created", datetime.datetime.now().isoformat()),
             "saved":   datetime.datetime.now().isoformat(),
-            "systems": [{"name":s["name"],"scene":s["scene"].to_dict()} for s in self._systems],
+            "systems": [{"name":s["name"],"scene":s["scene"].to_dict(),
+                         "mfr":s["scene"].active_mfr} for s in self._systems],
         }
 
     def _project_from_dict(self, d):
@@ -5497,6 +5529,15 @@ class SuppressionDesigner(QDialog):
         for s in sys_list:
             sys_info = self._add_system(s.get("name","System 1"))
             sys_info["scene"].load_dict(s.get("scene",[]))
+            # Restore directly rather than via set_active_mfr(), which also
+            # re-applies nozzle types/counts for the new manufacturer to
+            # every appliance — correct for an interactive user-initiated
+            # switch, but load_dict() has already reconstructed nozzles
+            # exactly as saved, so re-running that logic here is at best a
+            # no-op and at worst risks altering what was just restored.
+            saved_mfr = s.get("mfr", "kidde")
+            if saved_mfr in MANUFACTURERS:
+                sys_info["scene"]._active_mfr = saved_mfr
         if not self._systems:
             self._add_system("System 1")
         self._tab_widget.setCurrentIndex(0)
