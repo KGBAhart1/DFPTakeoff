@@ -1,5 +1,5 @@
 {
-  "version": "1.3.2",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.3.2/DFP_TakeoffPro_Setup_1.3.2.exe",
-  "notes": "Suppression Designer fixes: the selected manufacturer (Kidde/Badger/Buckeye/Amerex) now persists correctly when you save a project, close the app, and reopen it — it was always resetting to Kidde before, which made the export show the wrong system/nozzle info. Project Info now has separate Street Address and City/Province fields instead of one free-text Location box, so long addresses always break onto a predictable second line on the export instead of overlapping other text."
+  "version": "1.3.3",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.3.3/DFP_TakeoffPro_Setup_1.3.3.exe",
+  "notes": "Toolbar cleanup: the main toolbar and Drawing Designer toolbar now group related tools into hover/click dropdowns (Designers, Quotes, Measure Tools, Coverage Toggles; Floor Plan Tools, Background Trace, One-Line Tools) instead of showing every button at once. Fixed a crash when opening the Coverage dropdown. Added a searchable Help menu (like the main Takeoff and Suppression Designer ones) to the Paint Booth Designer, and upgraded the Drawing Designer's Help button to the same searchable format."
 }

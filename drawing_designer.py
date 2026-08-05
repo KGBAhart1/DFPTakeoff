@@ -133,10 +133,11 @@ from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QLineEdit, QComboBox, QScrollArea,
     QTabWidget, QInputDialog, QFileDialog, QLayout, QSizePolicy,
     QSpinBox, QRadioButton, QButtonGroup, QListWidget, QListWidgetItem,
+    QToolButton,
 )
 from PyQt5.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPainterPath,
-    QCursor, QPixmap,
+    QCursor, QPixmap, QIcon, QImage,
 )
 from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, pyqtSignal, QRect, QPoint, QSize, QTimer
 import fitz
@@ -287,6 +288,83 @@ class FlowBar(QWidget):
             self.setMinimumHeight(h); self.setMaximumHeight(h)
 
 
+TOOLBAR_MENU_STYLE = ("QMenu { background:#232728; color:#efe6e1; border:1px solid #555; }"
+                      "QMenu::item { padding:7px 20px; }"
+                      "QMenu::item:selected { background:#ff7002; color:white; }"
+                      "QMenu::item:disabled { color:#777; }")
+
+
+class HoverMenuButton(QToolButton):
+    """Toolbar dropdown that opens its menu on hover as well as click — groups
+    a cluster of related, mostly tab-specific tools (e.g. every Floor Plan
+    drawing tool, or every Background Trace control) behind one button so
+    they aren't all sitting in the bar at once regardless of which tab is
+    active. Styled to match this toolbar's existing button look."""
+    _instances = []
+
+    def __init__(self, txt, color="#333738", parent=None):
+        super().__init__(parent)
+        self.setText(txt)
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.setStyleSheet(
+            f"QToolButton{{background:{color};color:#efe6e1;border-radius:3px;"
+            f"padding:5px 10px;border:none;font-weight:bold;font-size:11px;}}"
+            f"QToolButton:hover{{background:#ff7002;color:white;}}"
+            f"QToolButton::menu-indicator{{width:0px;}}")
+        HoverMenuButton._instances.append(self)
+
+    def _close_sibling_menus(self):
+        # Clicking or hovering onto one dropdown while a sibling's menu is
+        # still open let Qt forward that same click into the new popup as
+        # part of its native "click outside closes popup" handling, which
+        # nested our showMenu() inside the still-unwinding first popup's
+        # call stack and crashed. Closing any other open menu of ours
+        # synchronously, before Qt gets a chance to do that forwarding,
+        # keeps only one of our popups active at a time.
+        for other in HoverMenuButton._instances:
+            if other is not self:
+                m = other.menu()
+                if m is not None and m.isVisible():
+                    m.hide()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Do NOT call super().mousePressEvent() here — with InstantPopup
+            # that calls showMenu() synchronously, and when a sibling's menu
+            # is already open, Qt can redeliver this same click into this
+            # button while still unwinding the sibling's own popup call
+            # stack (the "click one dropdown to switch straight to another"
+            # behavior). Opening a second menu synchronously in that window
+            # nests one popup's event loop inside the other's and crashes.
+            # Deferring to the next event-loop tick lets the sibling's
+            # popup finish closing first.
+            event.accept()
+            self._close_sibling_menus()
+            QTimer.singleShot(0, self._open_menu_now)
+            return
+        super().mousePressEvent(event)
+
+    def _open_menu_now(self):
+        menu = self.menu()
+        if menu is not None and not menu.isVisible():
+            self.showMenu()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        # Defer to the next event-loop tick instead of calling showMenu()
+        # synchronously here — enterEvent can fire while another popup is
+        # still tearing down its own mouse-grab, and calling showMenu()
+        # inline in that window is what was crashing the app on dismiss.
+        QTimer.singleShot(0, self._maybe_show_menu)
+
+    def _maybe_show_menu(self):
+        menu = self.menu()
+        if menu is not None and not menu.isVisible() and self.underMouse():
+            self._close_sibling_menus()
+            self.showMenu()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Units — internal storage is always feet (float); thickness/widths in inches
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -373,6 +451,83 @@ def polygon_centroid(points):
     return (cx, cy)
 
 
+def hatch_lines_in_polygon(points, angle_deg, spacing):
+    """Generic scanline hatch-fill: returns [((x1,y1),(x2,y2)), ...] segments
+    that fill `points` (a closed simple polygon, any coordinate space) with
+    parallel lines at `angle_deg` spaced `spacing` apart. Used by the PDF
+    Fire Zone export to draw the same hatch textures Qt's pattern brushes
+    give the on-screen view for free — fitz has no built-in pattern brush,
+    so this rotates the polygon so the hatch is horizontal, finds each
+    scanline's edge crossings (even-odd rule), and rotates the resulting
+    segments back."""
+    if len(points) < 3 or spacing <= 0:
+        return []
+    ang = math.radians(angle_deg)
+    ca, sa = math.cos(ang), math.sin(ang)
+    # Rotate polygon into hatch-aligned space (hatch lines become horizontal).
+    rpts = [(x*ca + y*sa, -x*sa + y*ca) for x, y in points]
+    ys = [p[1] for p in rpts]
+    y0, y1 = min(ys), max(ys)
+    n = len(rpts)
+    segments = []
+    y = y0 + spacing/2
+    while y < y1:
+        xs = []
+        for i in range(n):
+            ax, ay = rpts[i]
+            bx, by = rpts[(i+1) % n]
+            if (ay - y) * (by - y) < 0:
+                t = (y - ay) / (by - ay)
+                xs.append(ax + t*(bx - ax))
+        xs.sort()
+        for i in range(0, len(xs) - 1, 2):
+            x1, x2 = xs[i], xs[i+1]
+            # Rotate the two segment endpoints back to the original space.
+            p1 = (x1*ca - y*sa, x1*sa + y*ca)
+            p2 = (x2*ca - y*sa, x2*sa + y*ca)
+            segments.append((p1, p2))
+        y += spacing
+    return segments
+
+
+# Angle(s) in degrees + line spacing (in PDF points, pre symbol/zone scale)
+# for each Fire Zone hatch pattern — mirrors ZONE_QT_PATTERNS' look.
+ZONE_HATCH_SPECS = {
+    "solid": [],
+    "diag1": [(45, 9)],
+    "diag2": [(135, 9)],
+    "cross_diag": [(45, 10), (135, 10)],
+    "horizontal": [(0, 8)],
+    "vertical": [(90, 8)],
+    "grid": [(0, 9), (90, 9)],
+}
+
+
+def point_in_any_zone(zone_items, x_ft, y_ft):
+    """Whether (x_ft,y_ft) falls inside any of `zone_items` (each a
+    FireZoneItem or FireZoneItem-like object with a `.points` list) —
+    standard even-odd ray-casting test. Shared by both the on-screen paint
+    (SymbolItem/RoomLabelItem/FireZoneItem give a symbol/text a clear white
+    halo when inside a zone, so a hatch pattern doesn't run through it) and
+    the Fire Safety Plan PDF export's equivalent halo logic."""
+    for z in zone_items:
+        pts = z.points
+        n = len(pts)
+        if n < 3:
+            continue
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = pts[i]; xj, yj = pts[j]
+            if (yi > y_ft) != (yj > y_ft) and \
+                    x_ft < (xj-xi)*(y_ft-yi)/((yj-yi) or 1e-9) + xi:
+                inside = not inside
+            j = i
+        if inside:
+            return True
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Layers
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -385,10 +540,34 @@ LAYER_ELEC    = "Electrical"
 LAYER_LV      = "Low-Voltage / Data"
 LAYER_FURN    = "Furniture"
 LAYER_STRUCT  = "Structural"
+LAYER_FIRE    = "Fire Safety Plan"
 LAYER_NOTES   = "Notes"
 
 LAYER_ORDER = [LAYER_WALLS, LAYER_DIMS, LAYER_ROOMS, LAYER_OPENING,
-               LAYER_ELEC, LAYER_LV, LAYER_FURN, LAYER_STRUCT, LAYER_NOTES]
+               LAYER_ELEC, LAYER_LV, LAYER_FURN, LAYER_STRUCT, LAYER_FIRE, LAYER_NOTES]
+
+# Preset boundary colors offered for Fire Zone / separation-area polygons,
+# cycled by default so successive zones on one plan are visually distinct.
+ZONE_COLOR_CHOICES = ["#c0392b", "#2980b9", "#27ae60", "#e67e22",
+                       "#8e44ad", "#16a085", "#2c3e50", "#d35400"]
+
+# Fill hatch patterns offered for Fire Zones — same idea as a real Fire Alarm
+# Zone Drawing (see reference sample): a zone that reuses a color on another
+# floor still reads as distinct because the fill texture differs, not just
+# the color. Cycled independently from color so the (color, pattern)
+# combination repeats far less often than either alone.
+ZONE_PATTERN_CHOICES = ["solid", "diag1", "diag2", "cross_diag", "horizontal", "vertical", "grid"]
+ZONE_PATTERN_NAMES = {
+    "solid": "Solid", "diag1": "Diagonal /", "diag2": "Diagonal \\",
+    "cross_diag": "Crosshatch ×", "horizontal": "Horizontal", "vertical": "Vertical", "grid": "Grid",
+}
+# Qt hatch brush styles for on-screen rendering — PDF export draws the
+# equivalent by hand (fitz has no built-in pattern brush).
+ZONE_QT_PATTERNS = {
+    "solid": Qt.SolidPattern, "diag1": Qt.FDiagPattern, "diag2": Qt.BDiagPattern,
+    "cross_diag": Qt.DiagCrossPattern, "horizontal": Qt.HorPattern,
+    "vertical": Qt.VerPattern, "grid": Qt.CrossPattern,
+}
 
 LAYER_COLORS = {
     LAYER_WALLS:   "#3a3d3e",
@@ -399,6 +578,7 @@ LAYER_COLORS = {
     LAYER_LV:      "#2980b9",
     LAYER_FURN:    "#8e7355",
     LAYER_STRUCT:  "#546e7a",
+    LAYER_FIRE:    "#c0392b",
     LAYER_NOTES:   "#27ae60",
 }
 
@@ -518,6 +698,52 @@ SYMBOL_DEFS = {
     # ── Structural ────────────────────────────────────────────────────────────
     "stairs_up":      {"name":"Stairs (up)",     "layer":LAYER_STRUCT, "shape":"stairs","w":36,"d":132,"tag":"UP","dir":"up"},
     "stairs_down":    {"name":"Stairs (down)",   "layer":LAYER_STRUCT, "shape":"stairs","w":36,"d":132,"tag":"DN","dir":"down"},
+
+    # ── Fire Safety Plan — official Calgary Fire Department symbol set for
+    # fire safety plan drawings (National Fire Code of Canada, Alberta
+    # Edition, requires the AHJ's own approved symbols; only symbols
+    # actually used need to appear in the legend — matches how the Symbol
+    # Legend export already works). "You Are Here" isn't part of Calgary's
+    # own set but is near-universal on evacuation diagrams, so it's added.
+    "fsp_exit":        {"name":"Fire Exit",                  "layer":LAYER_FIRE, "shape":"arrow",       "color":"#27ae60", "tag":"EXIT"},
+    "fsp_pull":        {"name":"Fire Pull Station",          "layer":LAYER_FIRE, "shape":"pull_hand",   "color":"#c0392b", "tag":"PS"},
+    "fsp_extinguisher":{"name":"Fire Extinguisher",          "layer":LAYER_FIRE, "shape":"cylinder",    "color":"#c0392b", "tag":"FE"},
+    "fsp_gas_shutoff": {"name":"Gas Meter Shut-off",         "layer":LAYER_FIRE, "shape":"gas_meter",   "color":"#27ae60", "tag":"G"},
+    "fsp_hazard":      {"name":"Hazard",                     "layer":LAYER_FIRE, "shape":"diamond_text","color":"#c0392b", "tag":"HAZ"},
+    "fsp_phone":       {"name":"Firefighter Telephone",      "layer":LAYER_FIRE, "shape":"phone",       "color":"#2980b9", "tag":"T"},
+    "fsp_handicap":    {"name":"Handicap Symbol",            "layer":LAYER_FIRE, "shape":"rect_outline","color":"#2980b9", "tag":""},
+    "fsp_faap":        {"name":"Fire Alarm Annunciator Panel","layer":LAYER_FIRE,"shape":"textbox",     "color":"#c0392b", "tag":"FAAP"},
+    "fsp_facp":        {"name":"Fire Alarm Control Panel",   "layer":LAYER_FIRE, "shape":"textbox",     "color":"#c0392b", "tag":"FACP"},
+    "fsp_cacf":        {"name":"Central Alarm Control Facility","layer":LAYER_FIRE,"shape":"textbox",   "color":"#c0392b", "tag":"CACF"},
+    "fsp_fsp":         {"name":"Fire Safety Plan",           "layer":LAYER_FIRE, "shape":"textbox",     "color":"#c0392b", "tag":"FSP"},
+    "fsp_standpipe":   {"name":"Standpipe Connection",       "layer":LAYER_FIRE, "shape":"standpipe",   "color":"#c0392b", "tag":"STDP"},
+    "fsp_keybox":      {"name":"Fire Dept. Key Box",         "layer":LAYER_FIRE, "shape":"keybox",      "color":"#c0392b", "tag":"F.D.\nKEY"},
+    "fsp_sprinkler_fv":{"name":"Sprinkler Floor Valve",      "layer":LAYER_FIRE, "shape":"gate_valve",  "color":"#c0392b", "tag":"SFV", "pedestal":True},
+    "fsp_elec_vault":  {"name":"Electrical Vault",           "layer":LAYER_FIRE, "shape":"elec_vault",  "color":"#f1c40f", "tag":"E"},
+    "fsp_sprinkler_cv":{"name":"Sprinkler Control Valves",   "layer":LAYER_FIRE, "shape":"gate_valve",  "color":"#c0392b", "tag":"SCV", "pedestal":False},
+    "fsp_elec_hazard": {"name":"Electrical Hazard",          "layer":LAYER_FIRE, "shape":"bolt",        "color":"#f1c40f", "tag":"E"},
+    "fsp_oxygen":      {"name":"Oxygen Valve",                "layer":LAYER_FIRE, "shape":"line_valve",  "color":"#27ae60", "tag":"O2"},
+    "fsp_water_curtain":{"name":"Water Curtain",             "layer":LAYER_FIRE, "shape":"spray_head",  "color":"#2980b9", "tag":"WC"},
+    "fsp_radiation":   {"name":"Radiation Hazard",           "layer":LAYER_FIRE, "shape":"trefoil",     "color":"#1a1a1a", "tag":"RAD"},
+    "fsp_pull_special":{"name":"Pull Station for Special Suppression","layer":LAYER_FIRE,"shape":"flag","color":"#2980b9", "tag":"PSS"},
+    "fsp_refuge":      {"name":"Area of Refuge",             "layer":LAYER_FIRE, "shape":"triangle_text","color":"#c0392b","tag":"R"},
+    "fsp_gas_cylinder":{"name":"Pressurized Gas Cylinder",   "layer":LAYER_FIRE, "shape":"gas_cyl_diamond","color":"#27ae60", "tag":"PGC"},
+    "fsp_generator":   {"name":"Generator",                  "layer":LAYER_FIRE, "shape":"gen_box",     "color":"#f1c40f", "tag":"Gen"},
+    "fsp_air_horn":    {"name":"Air Horn",                   "layer":LAYER_FIRE, "shape":"horn",        "color":"#c0392b", "tag":"HORN"},
+    "fsp_fire_wall":   {"name":"Fire Wall with Fire Door",   "layer":LAYER_FIRE, "shape":"wall_break",  "color":"#1a1a1a", "tag":"FWD"},
+    "fsp_hose_cabinet":{"name":"Fire Hose in Cabinet",       "layer":LAYER_FIRE, "shape":"hose_reel",   "color":"#c0392b", "tag":"FHC", "cabinet":True},
+    "fsp_fdc":         {"name":"Fire Dept. Connection",      "layer":LAYER_FIRE, "shape":"wye",         "color":"#c0392b", "tag":"FDC"},
+    "fsp_hydrant_priv":{"name":"Fire Hydrant - Private",     "layer":LAYER_FIRE, "shape":"hydrant",     "color":"#c0392b", "tag":"PRIV","cap_color":None},
+    "fsp_hydrant_pub": {"name":"Fire Hydrant - Public",      "layer":LAYER_FIRE, "shape":"hydrant",     "color":"#c0392b", "tag":"PUB", "cap_color":"#27ae60"},
+    "fsp_fd_entry":    {"name":"Fire Dept. Entry",           "layer":LAYER_FIRE, "shape":"arrow",       "color":"#00b4e6", "tag":"ENTRY"},
+    "fsp_water_shutoff":{"name":"Domestic Water Shut-off",   "layer":LAYER_FIRE, "shape":"line_valve",  "color":"#2980b9", "tag":"W"},
+    "fsp_north":       {"name":"North Symbol",               "layer":LAYER_FIRE, "shape":"compass",     "color":"#1a1a1a", "tag":"N"},
+    "fsp_elev_full":   {"name":"Firefighter Elevator - Full","layer":LAYER_FIRE, "shape":"helmet",      "color":"#c0392b", "tag":"F"},
+    "fsp_rhss":        {"name":"Range Hood Suppression System","layer":LAYER_FIRE,"shape":"textbox",    "color":"#2980b9", "tag":"RHSS"},
+    "fsp_elev_conv":   {"name":"Firefighter Elevator - Converted","layer":LAYER_FIRE,"shape":"helmet",  "color":"#c0392b", "tag":"C"},
+    "fsp_hose_rack":   {"name":"Fire Hose on Rack",          "layer":LAYER_FIRE, "shape":"hose_reel",   "color":"#c0392b", "tag":"FHR", "cabinet":False},
+    "fsp_first_aid":   {"name":"First Aid Station/Room",     "layer":LAYER_FIRE, "shape":"cross_box",   "color":"#c0392b", "tag":"FA"},
+    "fsp_you_are_here":{"name":"You Are Here",               "layer":LAYER_FIRE, "shape":"you_are_here","color":"#c0392b", "tag":"YOU ARE\nHERE"},
 }
 
 DOOR_WINDOW_DEFS = {
@@ -532,6 +758,7 @@ SYMBOL_CATEGORIES = [
     ("Low-Voltage / Data", [k for k,v in SYMBOL_DEFS.items() if v["layer"]==LAYER_LV]),
     ("Furniture", [k for k,v in SYMBOL_DEFS.items() if v["layer"]==LAYER_FURN]),
     ("Structural", [k for k,v in SYMBOL_DEFS.items() if v["layer"]==LAYER_STRUCT]),
+    ("Fire Safety Plan", [k for k,v in SYMBOL_DEFS.items() if v["layer"]==LAYER_FIRE]),
     ("Doors / Windows", list(DOOR_WINDOW_DEFS.keys())),
 ]
 
@@ -631,10 +858,42 @@ def circuit_grid_layout(devices, box_w, cell_w=28, cell_h=16, left_pad=8, right_
 #  Graphics items
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _sync_wall_dimension(scene, old_key, wall):
+    """Find the DimensionItem paired with `wall` (matched by its coordinates
+    before this move/stretch, since dimensions store their own copy of the
+    endpoints rather than a live reference) and move it to match."""
+    if scene is None:
+        return
+    for d in scene._dim_items:
+        if (d.x1, d.y1, d.x2, d.y2) == old_key:
+            d.prepareGeometryChange()
+            d.x1, d.y1, d.x2, d.y2 = wall.x1, wall.y1, wall.x2, wall.y2
+            d.update()
+            return
+
+
+def _reposition_openings_after_stretch(wall, fixed_x, fixed_y):
+    """Keep each door/window on `wall` the same DISTANCE from whichever
+    corner of the wall didn't move, after the other corner got dragged —
+    otherwise a stretched/shrunk wall would leave its doors floating in the
+    wrong spot (or off the end entirely)."""
+    wx, wy = wall.x2-wall.x1, wall.y2-wall.y1
+    L = math.hypot(wx, wy) or 1.0
+    ang = math.degrees(math.atan2(wy, wx))
+    sign = 1.0 if (fixed_x, fixed_y) == (wall.x1, wall.y1) else -1.0
+    ux, uy = (wx/L)*sign, (wy/L)*sign
+    for o in list(wall.opening_items):
+        ox_ft, oy_ft = o.pos().x()/PX_PER_FT, o.pos().y()/PX_PER_FT
+        dist = max(0.0, min(math.hypot(ox_ft-fixed_x, oy_ft-fixed_y), L))
+        o.setPos((fixed_x+ux*dist)*PX_PER_FT, (fixed_y+uy*dist)*PX_PER_FT)
+        o.setRotation(ang)
+
+
 class WallItem(QGraphicsItem):
     """A single straight wall segment, stored in feet, drawn at scene-origin
     (its geometry is baked into its own coordinates rather than using setPos,
-    since walls aren't individually draggable — edit via double-click)."""
+    so it can share the "local coords == scene coords" convention every
+    other non-setPos item here uses for its own custom-drag mouse handling)."""
     ITEM_TYPE = "wall"
 
     def __init__(self, x1, y1, x2, y2, thickness_in=4.5, layer=LAYER_WALLS):
@@ -648,6 +907,10 @@ class WallItem(QGraphicsItem):
         self.interior_side = 1
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setZValue(1)
+        self._dragging = False
+        self._drag_start_ft = None
+        self._drag_orig = None   # (x1,y1,x2,y2) at the start of this drag
+        self._drag_links = []    # connected walls captured once at drag start
 
     @property
     def length_ft(self):
@@ -742,6 +1005,96 @@ class WallItem(QGraphicsItem):
         if chosen == del_a and self.scene():
             self.scene().remove_item(self)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._drag_start_ft = (event.scenePos().x()/PX_PER_FT, event.scenePos().y()/PX_PER_FT)
+            self._drag_orig = (self.x1, self.y1, self.x2, self.y2)
+            # Find connected walls ONCE, at drag start, and hold direct
+            # references — NOT re-derived by coordinate-matching on every
+            # mouse-move frame. Re-matching every frame was the bug: after
+            # frame 1 moves a connected wall's shared corner, it no longer
+            # sits at THIS wall's *original* corner, so frame 2's re-match
+            # would fail and silently drop the connection (walls "stretch a
+            # little then disconnect").
+            self._drag_links = []   # (wall, "1"/"2" = which end of wall, 1/2 = follows self's corner1/corner2)
+            sc = self.scene()
+            if sc is not None:
+                tol = 0.05
+                for w in sc._wall_items:
+                    if w is self:
+                        continue
+                    if math.hypot(w.x1-self.x1, w.y1-self.y1) <= tol:
+                        self._drag_links.append((w, "1", 1))
+                    elif math.hypot(w.x2-self.x1, w.y2-self.y1) <= tol:
+                        self._drag_links.append((w, "2", 1))
+                    if math.hypot(w.x1-self.x2, w.y1-self.y2) <= tol:
+                        self._drag_links.append((w, "1", 2))
+                    elif math.hypot(w.x2-self.x2, w.y2-self.y2) <= tol:
+                        self._drag_links.append((w, "2", 2))
+            self.setSelected(True)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging:
+            super().mouseMoveEvent(event)
+            return
+        sc = self.scene()
+        cur_x_ft, cur_y_ft = event.scenePos().x()/PX_PER_FT, event.scenePos().y()/PX_PER_FT
+        ox1, oy1, ox2, oy2 = self._drag_orig
+        wdx, wdy = ox2-ox1, oy2-oy1
+        L = math.hypot(wdx, wdy) or 1.0
+        ux, uy = wdx/L, wdy/L
+        nx, ny = -uy, ux   # unit perpendicular to the wall's own (unchanged) direction
+        # Only the perpendicular component of the drag moves the wall — it
+        # slides sideways parallel to itself, same as pushing a partition
+        # wall over in a CAD tool, rather than free 2D dragging.
+        push = (cur_x_ft-self._drag_start_ft[0])*nx + (cur_y_ft-self._drag_start_ft[1])*ny
+        if sc is not None and getattr(sc, "snap_to_grid", False):
+            push = snap_grid(push)
+        new_x1, new_y1 = ox1+nx*push, oy1+ny*push
+        new_x2, new_y2 = ox2+nx*push, oy2+ny*push
+
+        if sc is not None:
+            for w, endpoint, corner in self._drag_links:
+                old_key = (w.x1, w.y1, w.x2, w.y2)
+                target = (new_x1, new_y1) if corner == 1 else (new_x2, new_y2)
+                w.prepareGeometryChange()
+                if endpoint == "1":
+                    w.x1, w.y1 = target
+                    fixed_pt = (w.x2, w.y2)
+                else:
+                    w.x2, w.y2 = target
+                    fixed_pt = (w.x1, w.y1)
+                w.update()
+                _sync_wall_dimension(sc, old_key, w)
+                _reposition_openings_after_stretch(w, fixed_pt[0], fixed_pt[1])
+
+            # This wall's own doors/windows ride along rigidly — the wall
+            # itself only translates (its length/angle don't change).
+            ddx, ddy = new_x1-ox1, new_y1-oy1
+            for o in list(self.opening_items):
+                o.setPos(o.pos().x()+ddx*PX_PER_FT, o.pos().y()+ddy*PX_PER_FT)
+
+        old_self_key = (self.x1, self.y1, self.x2, self.y2)
+        self.prepareGeometryChange()
+        self.x1, self.y1, self.x2, self.y2 = new_x1, new_y1, new_x2, new_y2
+        _sync_wall_dimension(sc, old_self_key, self)
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging:
+            self._dragging = False
+            self._drag_orig = None
+            self._drag_links = []
+            if self.scene(): self.scene().layout_changed.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
 
 class DimensionItem(QGraphicsItem):
     """Auto-generated dimension line offset from a wall, showing its length."""
@@ -825,7 +1178,45 @@ class RoomLabelItem(QGraphicsItem):
         self.layer = layer
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
+        # Needed for itemChange(ItemPositionChange) to fire at all (off by
+        # default) — that's what lets dragging a rectangle-room label also
+        # drag its 4 walls along with it, instead of just the label text.
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
         self.setZValue(2)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange and hasattr(self, "_rect_walls"):
+            sc = self.scene()
+            new_pos = value
+            if sc is not None and getattr(sc, "snap_to_grid", False):
+                new_pos = QPointF(snap_grid(new_pos.x()/PX_PER_FT)*PX_PER_FT,
+                                   snap_grid(new_pos.y()/PX_PER_FT)*PX_PER_FT)
+            old_pos = self.pos()
+            dx_ft = (new_pos.x()-old_pos.x())/PX_PER_FT
+            dy_ft = (new_pos.y()-old_pos.y())/PX_PER_FT
+            if dx_ft or dy_ft:
+                # Drag the room's own 4 walls (and their paired auto-
+                # dimensions, and any doors/windows attached to them) by the
+                # same delta — otherwise only the text label would move,
+                # leaving it detached from the walls it's naming.
+                for w in self._rect_walls:
+                    old_key = (w.x1, w.y1, w.x2, w.y2)
+                    w.prepareGeometryChange()
+                    w.x1 += dx_ft; w.y1 += dy_ft; w.x2 += dx_ft; w.y2 += dy_ft
+                    for o in list(w.opening_items):
+                        o.setPos(o.pos().x()+dx_ft*PX_PER_FT, o.pos().y()+dy_ft*PX_PER_FT)
+                    if sc is not None:
+                        for d in sc._dim_items:
+                            if (d.x1, d.y1, d.x2, d.y2) == old_key:
+                                d.prepareGeometryChange()
+                                d.x1 += dx_ft; d.y1 += dy_ft; d.x2 += dx_ft; d.y2 += dy_ft
+                                d.update()
+                                break
+                    w.update()
+                ox, oy = self._rect_origin
+                self._rect_origin = (ox+dx_ft, oy+dy_ft)
+            return new_pos
+        return super().itemChange(change, value)
 
     def boundingRect(self):
         return QRectF(-80, -22, 160, 58)
@@ -834,6 +1225,12 @@ class RoomLabelItem(QGraphicsItem):
         painter.setRenderHint(QPainter.Antialiasing)
         accent = QColor("#ff7002") if self.isSelected() else QColor(LAYER_COLORS[LAYER_ROOMS])
         text_col = QColor("#232323")   # dark, readable regardless of layer accent color
+        sc = self.scene()
+        if sc is not None and point_in_any_zone(getattr(sc, "_zone_items", []),
+                                                 self.pos().x()/PX_PER_FT, self.pos().y()/PX_PER_FT):
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+            painter.drawRoundedRect(QRectF(-82, -21, 164, 50), 4, 4)
         painter.setPen(accent if self.isSelected() else text_col)
         painter.setFont(QFont("Arial", 9, QFont.Bold))
         painter.drawText(QRectF(-80,-20,160,16), Qt.AlignCenter, self.name)
@@ -863,8 +1260,10 @@ class RoomLabelItem(QGraphicsItem):
         menu = QMenu()
         edit_a = menu.addAction("Edit Room…")
         resize_a = None
+        copy_a = None
         if hasattr(self, "_rect_walls"):
             resize_a = menu.addAction("Resize Rectangle Room…")
+            copy_a = menu.addAction("Copy Room")
         del_a = menu.addAction("Delete Room Label")
         chosen = menu.exec_(event.screenPos())
         if chosen == edit_a:
@@ -893,8 +1292,173 @@ class RoomLabelItem(QGraphicsItem):
                 sc.add_rect_room(x0, y0, v["width_ft"], v["length_ft"], v["name"],
                                   v["ceiling_in"], v["ceiling_type"], v["floor_type"])
             return
+        if copy_a is not None and chosen == copy_a:
+            sc = self.scene()
+            if sc:
+                self.setSelected(True)
+                sc.copy_selected()
+            return
         if chosen == del_a and self.scene():
             self.scene().remove_item(self)
+
+
+class FireZoneItem(QGraphicsItem):
+    """A closed, colored, labeled fire-zone / separation-boundary polygon
+    (e.g. for a Fire Alarm Zone Drawing) — geometry baked into instance
+    coords like WallItem, since it's a multi-point shape rather than a
+    single draggable point."""
+    ITEM_TYPE = "zone"
+
+    def __init__(self, points, name="Zone 1", color="#c0392b", layer=LAYER_FIRE, pattern="solid",
+                 label_offset=(0.0, 0.0)):
+        super().__init__()
+        self.points = list(points)   # [(x_ft,y_ft), ...] — closed implicitly
+        self.name = name
+        self.color = color
+        self.pattern = pattern
+        self.layer = layer
+        # Label position relative to the zone's centroid, in feet. (0,0) —
+        # the default — means "centered in the zone". Drag the label (its
+        # own hit area, separate from the zone polygon) to pull it clear
+        # when the zone is too small/oddly shaped to write the name inside;
+        # a leader line back to the zone follows automatically.
+        self.label_offset_ft = tuple(label_offset)
+        self._dragging_label = False
+        self.setFlag(QGraphicsItem.ItemIsSelectable)
+        self.setZValue(0.5)   # under walls/symbols so it reads as a background tint
+
+    def centroid_ft(self):
+        return polygon_centroid(self.points)
+
+    def area_sqft(self):
+        return shoelace_area(self.points)
+
+    def label_pos_ft(self):
+        cx, cy = self.centroid_ft()
+        return (cx + self.label_offset_ft[0], cy + self.label_offset_ft[1])
+
+    def _label_rect_px(self):
+        lx, ly = self.label_pos_ft()
+        return QRectF(lx*PX_PER_FT-82, ly*PX_PER_FT-17, 164, 26)
+
+    def boundingRect(self):
+        if not self.points:
+            return QRectF(0, 0, 0, 0)
+        xs = [p[0]*PX_PER_FT for p in self.points]
+        ys = [p[1]*PX_PER_FT for p in self.points]
+        pad = 20
+        poly_rect = QRectF(min(xs)-pad, min(ys)-pad, max(xs)-min(xs)+pad*2, max(ys)-min(ys)+pad*2)
+        return poly_rect.united(self._label_rect_px().adjusted(-4, -4, 4, 4))
+
+    def shape(self):
+        p = QPainterPath()
+        p.addPolygon(QPolygonF([QPointF(x*PX_PER_FT, y*PX_PER_FT) for x, y in self.points]))
+        p.addRect(self._label_rect_px())
+        return p
+
+    def paint(self, painter, option, widget=None):
+        if len(self.points) < 3:
+            return
+        painter.setRenderHint(QPainter.Antialiasing)
+        sel = self.isSelected()
+        base = QColor("#ff7002") if sel else QColor(self.color)
+        poly = QPolygonF([QPointF(x*PX_PER_FT, y*PX_PER_FT) for x, y in self.points])
+        if self.pattern == "solid":
+            fill = QColor(base); fill.setAlpha(45)
+            painter.setBrush(QBrush(fill))
+        else:
+            # Qt hatch-pattern brushes draw the pattern in full accent color
+            # over a transparent background (no separate alpha wash needed)
+            # — same look as the reference sheet: white background, colored
+            # hatch lines, so a repeated color still reads as a different
+            # zone by texture alone.
+            painter.setBrush(QBrush(base, ZONE_QT_PATTERNS.get(self.pattern, Qt.SolidPattern)))
+        painter.setPen(QPen(base, 2, Qt.DashLine))
+        painter.drawPolygon(poly)
+
+        cx, cy = self.centroid_ft()
+        cpx, cpy = cx*PX_PER_FT, cy*PX_PER_FT
+        label_rect = self._label_rect_px()
+        lcx, lcy = label_rect.center().x(), label_rect.center().y()
+        moved = self.label_offset_ft != (0.0, 0.0)
+        if moved:
+            # Leader line + anchor dot back to the zone, same convention as
+            # the reference Fire Zone Plan's pulled-out zone callouts.
+            painter.setPen(QPen(base, 1.2))
+            painter.drawLine(QPointF(cpx, cpy), QPointF(lcx, lcy))
+            painter.setBrush(QBrush(base))
+            painter.drawEllipse(QPointF(cpx, cpy), 3, 3)
+
+        # Clear halo behind the zone name — always "inside itself" by
+        # construction, so always halo it, same as any hatch pattern would
+        # otherwise run right through the text.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        painter.drawRoundedRect(label_rect, 4, 4)
+        painter.setPen(base)
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        painter.drawText(label_rect, Qt.AlignCenter, self.name)
+
+    def to_dict(self):
+        return {"points": self.points, "name": self.name, "color": self.color,
+                "layer": self.layer, "pattern": self.pattern,
+                "label_offset": list(self.label_offset_ft)}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d.get("points", []), d.get("name", "Zone"),
+                    d.get("color", "#c0392b"), d.get("layer", LAYER_FIRE),
+                    d.get("pattern", "solid"), tuple(d.get("label_offset", (0.0, 0.0))))
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        edit_a = menu.addAction("Edit Zone…")
+        reset_a = menu.addAction("Reset Label Position") if self.label_offset_ft != (0.0, 0.0) else None
+        del_a = menu.addAction("Delete Zone")
+        chosen = menu.exec_(event.screenPos())
+        if chosen == edit_a:
+            dlg = ZonePropertiesDialog(self.name, self.color, self.pattern)
+            if dlg.exec_() == QDialog.Accepted:
+                v = dlg.values()
+                self.name = v["name"]; self.color = v["color"]; self.pattern = v["pattern"]
+                self.prepareGeometryChange(); self.update()
+                if self.scene(): self.scene().layout_changed.emit()
+            return
+        if reset_a is not None and chosen == reset_a:
+            self.prepareGeometryChange()
+            self.label_offset_ft = (0.0, 0.0)
+            self.update()
+            if self.scene(): self.scene().layout_changed.emit()
+            return
+        if chosen == del_a and self.scene():
+            self.scene().remove_item(self)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._label_rect_px().contains(event.pos()):
+            self._dragging_label = True
+            self.setSelected(True)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_label:
+            cx, cy = self.centroid_ft()
+            pos = event.pos()
+            self.prepareGeometryChange()
+            self.label_offset_ft = (pos.x()/PX_PER_FT - cx, pos.y()/PX_PER_FT - cy)
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging_label:
+            self._dragging_label = False
+            if self.scene(): self.scene().layout_changed.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class SymbolItem(QGraphicsItem):
@@ -945,16 +1509,31 @@ class SymbolItem(QGraphicsItem):
         w = w_in/12.0*PX_PER_FT
         d = d_in/12.0*PX_PER_FT
         R = max(self.R, w/2, d/2) + 6
-        extra_bottom = 26 if self.defn.get("shape") in self.SIZE_EDITABLE_SHAPES else 0
-        return QRectF(-R, -R-14, R*2, R*2+14+extra_bottom)
+        shape = self.defn.get("shape")
+        extra_bottom = 26 if shape in self.SIZE_EDITABLE_SHAPES else (
+            18 if shape in TAG_BELOW_ICON_SHAPES else 0)
+        extra_top = 14 if shape in TAG_ABOVE_ICON_SHAPES else 0
+        return QRectF(-R, -R-14-extra_top, R*2, R*2+14+extra_top+extra_bottom)
 
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.Antialiasing)
         shape = self.defn.get("shape","rect")
-        col = QColor("#ff7002") if self.isSelected() else QColor(LAYER_COLORS.get(self.layer,"#333"))
-        painter.setPen(QPen(col, 1.6)); painter.setBrush(QBrush(col.lighter(175)))
+        base_color = self.defn.get("color") or LAYER_COLORS.get(self.layer,"#333")
+        col = QColor("#ff7002") if self.isSelected() else QColor(base_color)
         R = self.R
         tag = self.defn.get("tag","")
+
+        # Clear halo when placed inside a fire zone — a hatch pattern
+        # otherwise runs right through the icon and fights with it for
+        # attention.
+        sc = self.scene()
+        if sc is not None and point_in_any_zone(getattr(sc, "_zone_items", []),
+                                                 self.pos().x()/PX_PER_FT, self.pos().y()/PX_PER_FT):
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+            painter.drawEllipse(QPointF(0, 0), R*1.6, R*1.6)
+
+        painter.setPen(QPen(col, 1.6)); painter.setBrush(QBrush(col.lighter(175)))
 
         if shape == "outlet":
             painter.drawEllipse(QPointF(0,0), R, R)
@@ -1035,6 +1614,199 @@ class SymbolItem(QGraphicsItem):
             painter.drawLine(QPointF(0,tip_y), QPointF(-ah/2,tip_y-sign*ah))
             painter.drawLine(QPointF(0,tip_y), QPointF(ah/2,tip_y-sign*ah))
             furn_half_h = d/2
+        # ── Fire Safety Plan symbols (Calgary Fire Department set) ──────────
+        elif shape == "arrow":
+            pts = [QPointF(-R,0), QPointF(R*0.4,-R*0.8), QPointF(R*0.4,-R*0.3),
+                   QPointF(R,-R*0.3), QPointF(R,R*0.3), QPointF(R*0.4,R*0.3), QPointF(R*0.4,R*0.8)]
+            painter.drawPolygon(QPolygonF(pts))
+        elif shape == "pull_hand":
+            # Mounting box + a hooked hand/lever line — Calgary's Fire Pull
+            # Station icon (a hand pulling a lever), simplified to a box with
+            # a hook curve since the literal hand illustration doesn't read
+            # at icon scale.
+            painter.drawRect(QRectF(-R*0.9,-R,R*0.4,R*2))
+            path = QPainterPath(); path.moveTo(-R*0.5,-R*0.3)
+            for a in range(200, 341, 20):
+                rad = math.radians(a)
+                path.lineTo(-R*0.1+R*0.35*math.cos(rad), -R*0.1+R*0.35*math.sin(rad))
+            path.lineTo(R*0.6, R*0.5)
+            painter.setBrush(Qt.NoBrush)
+            painter.strokePath(path, QPen(col, 1.4))
+        elif shape == "flag":
+            painter.drawRect(QRectF(-R*0.75,-R,R*0.3,R*2))
+            pts = [QPointF(-R*0.45,-R*0.9), QPointF(R*0.65,-R*0.15),
+                   QPointF(R*0.1,R*0.35), QPointF(-R*0.45,R*0.55)]
+            painter.drawPolygon(QPolygonF(pts))
+        elif shape == "cylinder":
+            # Fire extinguisher: red body + a black nozzle/handle assembly on
+            # top (a pull-pin handle bar plus a short hose hint), which is
+            # the part that actually reads as "extinguisher" at icon scale —
+            # a plain colored cap looked like a generic canister.
+            painter.drawRoundedRect(QRectF(-R*0.5,-R*0.85,R,R*1.85), 3, 3)
+            painter.setPen(QPen(QColor("#1a1a1a"), 1.4))
+            painter.setBrush(QBrush(QColor("#1a1a1a")))
+            painter.drawRect(QRectF(-R*0.4,-R*1.05,R*0.8,R*0.18))
+            painter.drawLine(QPointF(-R*0.55,-R*0.87), QPointF(-R*0.85,-R*0.55))
+            painter.setPen(QPen(col, 1.6))
+        elif shape == "standpipe":
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(QRectF(-R*0.85,-R,R*0.7,R*1.9), 2, 2)
+            painter.drawRect(QRectF(-R*0.15,-R*0.35,R*0.55,R*0.5))
+            painter.drawRect(QRectF(R*0.4,-R*0.25,R*0.35,R*0.3))
+            painter.drawLine(QPointF(R*0.75,-R*0.5), QPointF(R*0.75,R*0.1))
+        elif shape == "gate_valve":
+            for xo in (-R*0.75, R*0.75):
+                painter.drawRect(QRectF(xo-R*0.25,-R*0.6,R*0.5,R*1.2))
+            painter.drawRect(QRectF(-R*0.75,-R*0.22,R*1.5,R*0.44))
+            painter.setBrush(QBrush(col.lighter(175)))
+            painter.drawEllipse(QPointF(0,0), R*0.3, R*0.3)
+            if self.defn.get("pedestal"):
+                painter.drawLine(QPointF(0,R*0.6), QPointF(0,R*0.95))
+        elif shape == "elec_vault":
+            painter.setBrush(QBrush(QColor("#f1c40f")))
+            painter.setPen(QPen(QColor("#1a1a1a"), 1.4))
+            painter.drawRoundedRect(QRectF(-R,-R,R*2,R*2), 3, 3)
+            bolt = QPolygonF([QPointF(R*0.15,-R*0.9),QPointF(-R*0.3,R*0.05),QPointF(R*0.0,R*0.05),
+                               QPointF(-R*0.15,R*0.9),QPointF(R*0.3,-R*0.05),QPointF(R*0.0,-R*0.05)])
+            painter.setBrush(QBrush(QColor("#1a1a1a")))
+            painter.drawPolygon(bolt)
+            painter.setBrush(QBrush(QColor("#f1c40f")))
+            painter.drawEllipse(QPointF(0,0), R*0.35, R*0.35)
+        elif shape == "line_valve":
+            painter.drawLine(QPointF(-R*1.3,0), QPointF(-R*0.9,0))
+            painter.drawLine(QPointF(R*0.9,0), QPointF(R*1.3,0))
+            painter.drawEllipse(QPointF(0,0), R*0.9, R*0.9)
+        elif shape == "spray_head":
+            painter.drawRect(QRectF(-R*0.25,-R,R*0.5,R*0.7))
+            painter.setBrush(Qt.NoBrush)
+            for ang in (-30,-10,10,30):
+                rad = math.radians(ang)
+                painter.drawLine(QPointF(0,-R*0.3), QPointF(R*0.9*math.sin(rad), R*0.8))
+        elif shape in ("diamond_text","triangle_text","circle_text","textbox","rect_outline"):
+            if shape == "diamond_text":
+                painter.drawPolygon(QPolygonF([QPointF(0,-R),QPointF(R,0),QPointF(0,R),QPointF(-R,0)]))
+            elif shape == "triangle_text":
+                painter.drawPolygon(QPolygonF([QPointF(0,-R),QPointF(R,R*0.8),QPointF(-R,R*0.8)]))
+            elif shape == "circle_text":
+                painter.drawEllipse(QPointF(0,0), R, R)
+            elif shape == "textbox":
+                painter.drawRoundedRect(QRectF(-R*1.3,-R*0.8,R*2.6,R*1.6), 3, 3)
+            else:   # rect_outline — plain outlined box (e.g. Handicap Symbol placeholder)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(QRectF(-R*1.1,-R*0.7,R*2.2,R*1.4))
+        elif shape == "gas_cyl_diamond":
+            painter.setBrush(QBrush(col))
+            painter.drawPolygon(QPolygonF([QPointF(0,-R),QPointF(R,0),QPointF(0,R),QPointF(-R,0)]))
+            painter.setBrush(QBrush(QColor("white")))
+            painter.drawRoundedRect(QRectF(-R*0.16,-R*0.55,R*0.32,R*1.05), 2, 2)
+        elif shape == "gen_box":
+            painter.setBrush(QBrush(QColor("#f1c40f")))
+            painter.setPen(QPen(QColor("#1a1a1a"), 1.4))
+            painter.drawRect(QRectF(-R*1.3,-R*0.8,R*2.6,R*1.6))
+        elif shape == "bolt":
+            painter.drawPolygon(QPolygonF([QPointF(R*0.15,-R),QPointF(-R*0.4,R*0.1),QPointF(0,R*0.1),
+                                            QPointF(-R*0.15,R),QPointF(R*0.4,-R*0.1),QPointF(0,-R*0.1)]))
+            painter.drawEllipse(QPointF(0,0), R*0.32, R*0.32)
+        elif shape == "trefoil":
+            painter.setPen(QPen(QColor("#1a1a1a"), 1.0))
+            painter.setBrush(QBrush(QColor("#1a1a1a")))
+            painter.drawRect(QRectF(-R,-R,R*2,R*2))
+            painter.setBrush(QBrush(QColor("white")))
+            painter.drawEllipse(QPointF(0,0), R*0.95, R*0.95)
+            for ang in (90, 210, 330):
+                painter.save(); painter.rotate(ang)
+                painter.setBrush(QBrush(QColor("#1a1a1a")))
+                painter.drawPie(QRectF(-R*0.75,-R*0.75,R*1.5,R*1.5), 60*16, 60*16)
+                painter.restore()
+            painter.setBrush(QBrush(QColor("#1a1a1a")))
+            painter.drawEllipse(QPointF(0,0), R*0.18, R*0.18)
+        elif shape == "horn":
+            painter.drawRect(QRectF(-R*0.9,-R*0.35,R*0.3,R*0.7))
+            painter.setBrush(Qt.NoBrush)
+            for rad in (R*0.35, R*0.7, R*1.05):
+                path = QPainterPath()
+                first = True
+                for a in range(-50, 51, 10):
+                    ar = math.radians(a)
+                    x, y = -R*0.5+rad*math.cos(ar), rad*math.sin(ar)
+                    (path.moveTo if first else path.lineTo)(x, y); first = False
+                painter.strokePath(path, QPen(col, 1.1))
+        elif shape == "wall_break":
+            painter.drawLine(QPointF(-R,0), QPointF(-R*0.3,0))
+            painter.drawLine(QPointF(R*0.3,0), QPointF(R,0))
+            painter.drawArc(QRectF(-R*0.3,-R*0.3,R*0.6,R*0.6), 0, 180*16)
+        elif shape == "hose_reel":
+            if self.defn.get("cabinet"):
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(QRectF(-R,-R*0.75,R*2,R*1.5), 2, 2)
+            path = QPainterPath(); path.moveTo(-R*0.8,R*0.4)
+            for i in range(1,6):
+                yx = R*0.4 if i % 2 == 0 else -R*0.35
+                path.lineTo(-R*0.8+i*R*0.28, yx)
+            painter.strokePath(path, QPen(col, 1.6))
+            painter.setBrush(QBrush(col))
+            painter.drawPolygon(QPolygonF([QPointF(R*0.55,-R*0.5), QPointF(R*0.85,-R*0.15), QPointF(R*0.55,0)]))
+        elif shape == "wye":
+            painter.drawLine(QPointF(0,R), QPointF(0,0))
+            painter.drawLine(QPointF(0,0), QPointF(-R*0.7,-R))
+            painter.drawLine(QPointF(0,0), QPointF(R*0.7,-R))
+        elif shape == "hydrant":
+            cap_color = self.defn.get("cap_color")
+            painter.setBrush(QBrush(col))
+            painter.drawRoundedRect(QRectF(-R*0.4,-R*0.2,R*0.8,R*1.2), 2, 2)
+            painter.drawLine(QPointF(-R*0.6,0), QPointF(-R*0.9,0))
+            painter.drawLine(QPointF(R*0.6,0), QPointF(R*0.9,0))
+            if cap_color:
+                painter.setBrush(QBrush(QColor(cap_color)))
+            painter.drawEllipse(QPointF(0,-R*0.5), R*0.35, R*0.3)
+        elif shape == "compass":
+            painter.setPen(QPen(col.lighter(160), 1.0))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(0,R*0.1), R*0.75, R*0.75)
+            painter.drawLine(QPointF(-R*0.75,R*0.1), QPointF(R*0.75,R*0.1))
+            painter.setPen(QPen(col, 1.4))
+            painter.setBrush(QBrush(col))
+            painter.drawPolygon(QPolygonF([QPointF(0,-R*0.85),QPointF(R*0.22,R*0.35),
+                                            QPointF(0,R*0.15),QPointF(-R*0.22,R*0.35)]))
+            painter.drawLine(QPointF(0,R*0.35), QPointF(0,R*0.95))
+        elif shape == "cross_box":
+            painter.setBrush(QBrush(col))
+            painter.drawRect(QRectF(-R*0.15,-R*0.6,R*0.3,R*1.2))
+            painter.drawRect(QRectF(-R*0.6,-R*0.15,R*1.2,R*0.3))
+        elif shape == "phone":
+            pts = [QPointF(-R*0.7,-R*0.9), QPointF(-R*0.2,-R*0.5), QPointF(-R*0.35,-R*0.25),
+                   QPointF(R*0.05,R*0.15), QPointF(R*0.35,-R*0.05), QPointF(R*0.75,R*0.35),
+                   QPointF(R*0.45,R*0.75), QPointF(R*0.0,R*0.4), QPointF(-R*0.55,-R*0.15),
+                   QPointF(-R*0.9,-R*0.55)]
+            painter.setBrush(QBrush(col))
+            painter.drawPolygon(QPolygonF(pts))
+        elif shape == "gas_meter":
+            painter.drawRect(QRectF(-R*0.8,-R*0.55,R*1.6,R*1.1))
+            painter.drawLine(QPointF(-R*0.6,R*0.55), QPointF(-R*0.6,R))
+            painter.drawLine(QPointF(R*0.6,R*0.55), QPointF(R*0.6,R))
+            painter.drawLine(QPointF(-R*0.3,-R*0.55), QPointF(R*0.15,-R*1.15))
+        elif shape == "keybox":
+            painter.setPen(QPen(col.lighter(180), 0.8))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(0,0), R, R)
+        elif shape == "helmet":
+            pts = [QPointF(-R,R*0.3), QPointF(-R*0.9,-R*0.1), QPointF(-R*0.5,-R*0.6), QPointF(0,-R*0.75),
+                   QPointF(R*0.5,-R*0.5), QPointF(R*0.85,0), QPointF(R,R*0.3),
+                   QPointF(R*0.6,R*0.45), QPointF(-R*0.6,R*0.45)]
+            painter.setBrush(QBrush(col))
+            painter.drawPolygon(QPolygonF(pts))
+            painter.setPen(QPen(QColor("#555555"), 1.0))
+            painter.setBrush(QBrush(QColor("#d5d5d5")))
+            painter.drawEllipse(QPointF(0,-R*0.05), R*0.4, R*0.4)
+        elif shape == "you_are_here":
+            # Text drawn by the generic tag mechanism below (tag is set to
+            # "YOU ARE\nHERE" in SYMBOL_DEFS) rather than baked in here, so
+            # screen and PDF export render it identically instead of two
+            # separately-maintained text placements.
+            painter.setBrush(QBrush(col))
+            painter.drawPolygon(QPolygonF([QPointF(0,-R*1.3),QPointF(R*0.9,R*0.2),QPointF(R*0.4,R*0.2),
+                                            QPointF(R*0.4,R*1.1),QPointF(-R*0.4,R*1.1),
+                                            QPointF(-R*0.4,R*0.2),QPointF(-R*0.9,R*0.2)]))
         else:
             painter.drawRect(QRectF(-R,-R,R*2,R*2))
 
@@ -1046,7 +1818,12 @@ class SymbolItem(QGraphicsItem):
         if tag:
             painter.setFont(QFont("Arial", 6, QFont.Bold))
             painter.setPen(text_col)
-            painter.drawText(QRectF(-R,-R,R*2,R*2), Qt.AlignCenter, tag)
+            if shape in TAG_BELOW_ICON_SHAPES:
+                painter.drawText(QRectF(-60, R+3, 120, 20), Qt.AlignHCenter | Qt.AlignTop, tag)
+            elif shape in TAG_ABOVE_ICON_SHAPES:
+                painter.drawText(QRectF(-60, -R-17, 120, 14), Qt.AlignHCenter | Qt.AlignBottom, tag)
+            else:
+                painter.drawText(QRectF(-R,-R,R*2,R*2), Qt.AlignCenter, tag)
 
         # Furniture (and stairs) footprint dimensions (W x D), printed below
         # the icon — so you know at a glance whether a desk/table will
@@ -1146,6 +1923,11 @@ class DoorWindowItem(QGraphicsItem):
         self.width_in = width_in or self.defn.get("w_in", 36)
         self.flip = flip
         self.host_wall = None
+        # Other walls drawn exactly on top of host_wall (e.g. the shared wall
+        # between two independently-drawn adjoining rooms) that also need
+        # their gap cut so the opening doesn't get visually covered by the
+        # duplicate wall segment. See FloorPlanScene._coincident_walls.
+        self.extra_host_walls = []
         self.setPos(x, y)
         self.setRotation(rotation)
         self.setFlag(QGraphicsItem.ItemIsMovable)
@@ -1257,6 +2039,40 @@ class _WallPreviewItem(QGraphicsItem):
                 painter.drawText(QRectF(mid.x()-50, mid.y()-14, 100, 14), Qt.AlignCenter, self.label)
 
 
+class _ZonePreviewItem(QGraphicsItem):
+    """Non-persistent rubber-band outline shown while the Fire Zone tool is
+    active — mirrors _WallPreviewItem but for a closed-polygon boundary
+    (dashed committed edges + a dashed closing edge back to the first
+    point, so the user can see the shape that will result before clicking)."""
+    def __init__(self):
+        super().__init__()
+        self.points = []       # committed chain points (feet)
+        self.preview_pt = None # current pending endpoint (feet), or None
+        self.setZValue(50)
+
+    def boundingRect(self):
+        return QRectF(-100000, -100000, 200000, 200000)
+
+    def paint(self, painter, option, widget=None):
+        if not self.points:
+            return
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor("#c0392b"), 2, Qt.DashLine)
+        painter.setPen(pen)
+        pts_px = [QPointF(x*PX_PER_FT, y*PX_PER_FT) for x, y in self.points]
+        for i in range(len(pts_px)-1):
+            painter.drawLine(pts_px[i], pts_px[i+1])
+        for pt in pts_px:
+            painter.setBrush(QBrush(QColor("#c0392b")))
+            painter.drawEllipse(pt, 3, 3)
+        if self.preview_pt is not None:
+            last = pts_px[-1]
+            prev_px = QPointF(self.preview_pt[0]*PX_PER_FT, self.preview_pt[1]*PX_PER_FT)
+            painter.drawLine(last, prev_px)
+            if len(pts_px) >= 2:
+                painter.drawLine(prev_px, pts_px[0])
+
+
 class FloorPlanScene(QGraphicsScene):
     layout_changed = pyqtSignal()
     status_changed = pyqtSignal(str)
@@ -1270,24 +2086,40 @@ class FloorPlanScene(QGraphicsScene):
         self._room_items = []
         self._symbol_items = []
         self._opening_items = []
+        self._zone_items = []
         self.layers_visible = {name: True for name in LAYER_ORDER}
         self.show_grid = True
         self.snap_to_grid = True
         self.default_wall_thickness_in = 4.5
-        self._mode = "select"         # select | wall | symbol
+        self._mode = "select"         # select | wall | symbol | zone
         self._pending_symbol = None   # kind string when placing a symbol
         self._chain = []              # committed points of current wall chain (feet)
         self._chain_walls = []        # WallItems created for the current chain
         self._length_buffer = ""
         self._preview = _WallPreviewItem()
         self.addItem(self._preview)
+        self._zone_chain = []         # committed points of current fire-zone chain (feet)
+        self._zone_preview = _ZonePreviewItem()
+        self.addItem(self._zone_preview)
+        # Background trace image (e.g. a scanned/exported PDF floor plan) —
+        # a tracing aid only: never exported, never saved with the project
+        # (a full raster embedded in the save file would bloat it a lot).
+        # bg_pos_ft is the image's top-left corner in feet; bg_px_per_ft is
+        # how many of the image's own pixels span one real-world foot.
+        self.bg_pixmap = None
+        self.bg_pos_ft = (0.0, 0.0)
+        self.bg_px_per_ft = 10.0
+        self.bg_dpi = 150
+        self.bg_opacity = 0.55
+        self.bg_visible = True
+        self._bg_calib_pts = []
 
     # ── Layers ───────────────────────────────────────────────────────────────
 
     def set_layer_visible(self, layer, visible):
         self.layers_visible[layer] = visible
         for lst in (self._wall_items, self._dim_items, self._room_items,
-                    self._symbol_items, self._opening_items):
+                    self._symbol_items, self._opening_items, self._zone_items):
             for it in lst:
                 if it.layer == layer:
                     it.setVisible(visible)
@@ -1302,10 +2134,13 @@ class FloorPlanScene(QGraphicsScene):
         self._mode = "select"
         self._pending_symbol = None
         self._cancel_wall_chain()
+        self._cancel_zone_chain()
+        self._bg_calib_pts = []
 
     def set_mode_wall(self, thickness_in=None):
         if thickness_in is not None:
             self.default_wall_thickness_in = thickness_in
+        self._cancel_zone_chain()
         self._mode = "wall"
         self._chain = []
         self._chain_walls = []
@@ -1321,8 +2156,29 @@ class FloorPlanScene(QGraphicsScene):
         self._mode = "symbol"
         self._pending_symbol = kind
         self._cancel_wall_chain()
+        self._cancel_zone_chain()
         name = ALL_SYMBOL_DEFS.get(kind, {}).get("name", kind)
         self.status_changed.emit(f"  Placing: {name} — click on the canvas (near a wall for doors/windows).")
+
+    def set_mode_zone(self):
+        self._cancel_wall_chain()
+        self._mode = "zone"
+        self._zone_chain = []
+        self._zone_preview.points = []
+        self._zone_preview.preview_pt = None
+        self.status_changed.emit(
+            "  Fire Zone tool — click to place each boundary corner, click near the first point "
+            "(or double-click / Enter with an empty buffer) to close the zone, Esc = cancel.")
+        self.update()
+
+    def set_mode_bg_calibrate(self):
+        self._cancel_wall_chain()
+        self._cancel_zone_chain()
+        self._mode = "bg_calibrate"
+        self._bg_calib_pts = []
+        self.status_changed.emit(
+            "  Calibrate Background Scale — click one end of a distance you know in real life "
+            "(e.g. a doorway), then the other end, and type that distance. Esc = cancel.")
 
     def _cancel_wall_chain(self):
         self._chain = []
@@ -1333,10 +2189,24 @@ class FloorPlanScene(QGraphicsScene):
         self._preview.label = ""
         self.update()
 
+    def _cancel_zone_chain(self):
+        self._zone_chain = []
+        self._zone_preview.points = []
+        self._zone_preview.preview_pt = None
+        self.update()
+
     # ── Grid background ──────────────────────────────────────────────────────
 
     def drawBackground(self, painter, rect):
         painter.fillRect(rect, QBrush(QColor("white")))
+        if self.bg_pixmap is not None and self.bg_visible:
+            painter.save()
+            painter.setOpacity(self.bg_opacity)
+            painter.translate(self.bg_pos_ft[0]*PX_PER_FT, self.bg_pos_ft[1]*PX_PER_FT)
+            s = PX_PER_FT/self.bg_px_per_ft
+            painter.scale(s, s)
+            painter.drawPixmap(0, 0, self.bg_pixmap)
+            painter.restore()
         if not self.show_grid:
             return
         step = GRID_FT * PX_PER_FT
@@ -1362,13 +2232,17 @@ class FloorPlanScene(QGraphicsScene):
     # ── Wall building helpers ───────────────────────────────────────────────
 
     def _snap_point(self, x_ft, y_ft, from_pt=None):
-        """Snap to grid, and if a from_pt is given, snap the direction to 45°."""
+        """Snap to grid, and if a from_pt is given, snap the direction to 45°
+        — both gated on Snap being ON. With Snap OFF this returns the raw
+        point untouched, for genuinely freehand (any angle, any position)
+        wall drawing."""
+        if not self.snap_to_grid:
+            return x_ft, y_ft
         if from_pt is not None:
             dx, dy = x_ft-from_pt[0], y_ft-from_pt[1]
             dx, dy = snap_angle(dx, dy, 45.0)
             x_ft, y_ft = from_pt[0]+dx, from_pt[1]+dy
-        if self.snap_to_grid:
-            x_ft, y_ft = snap_grid(x_ft), snap_grid(y_ft)
+        x_ft, y_ft = snap_grid(x_ft), snap_grid(y_ft)
         return x_ft, y_ft
 
     def _add_wall(self, x1, y1, x2, y2, thickness_in=None, layer=LAYER_WALLS):
@@ -1412,16 +2286,70 @@ class FloorPlanScene(QGraphicsScene):
         self.set_mode_select()
         self.layout_changed.emit()
 
+    def _finish_zone_chain(self):
+        pts = list(self._zone_chain)
+        if len(pts) >= 3:
+            n = len(self._zone_items)
+            # Color and pattern cycle independently (8 colors × 7 patterns =
+            # 56 unique combinations before an exact repeat) so zones stay
+            # distinguishable far longer than color alone would allow —
+            # matters most for a zone number reused across floors.
+            dlg = ZonePropertiesDialog(
+                name=f"Zone {n+1}",
+                color=ZONE_COLOR_CHOICES[n % len(ZONE_COLOR_CHOICES)],
+                pattern=ZONE_PATTERN_CHOICES[n % len(ZONE_PATTERN_CHOICES)])
+            if dlg.exec_() == QDialog.Accepted:
+                v = dlg.values()
+                zone = FireZoneItem(pts, v["name"], v["color"], pattern=v["pattern"])
+                self.addItem(zone); self._apply_layer_visibility(zone)
+                self._zone_items.append(zone)
+        self._cancel_zone_chain()
+        self.set_mode_select()
+        self.layout_changed.emit()
+
+    def _finish_bg_calibration(self):
+        """Rescale the background trace image so the two just-clicked points
+        end up the real-world distance apart that the user types in —
+        keeping the FIRST clicked point fixed in place so already-traced
+        walls near it stay aligned."""
+        p1, p2 = self._bg_calib_pts
+        apparent_ft = math.hypot(p2.x()-p1.x(), p2.y()-p1.y())/PX_PER_FT
+        self._bg_calib_pts = []
+        self.set_mode_select()
+        if apparent_ft < 1e-6:
+            return
+        text, ok = QInputDialog.getText(None, "Calibrate Background Scale",
+            "Real-world distance between the two points you clicked:", text="10'")
+        if not ok:
+            return
+        real_ft = parse_length(text)
+        if not real_ft or real_ft <= 0:
+            QMessageBox.information(None, "Calibrate Background Scale",
+                                     "Couldn't read that as a length (try e.g. 10', 3'6\", 42\").")
+            return
+        old_px_per_ft = self.bg_px_per_ft
+        new_px_per_ft = old_px_per_ft * apparent_ft / real_ft
+        ax_ft, ay_ft = p1.x()/PX_PER_FT, p1.y()/PX_PER_FT
+        img_x = (ax_ft - self.bg_pos_ft[0]) * old_px_per_ft
+        img_y = (ay_ft - self.bg_pos_ft[1]) * old_px_per_ft
+        self.bg_px_per_ft = new_px_per_ft
+        self.bg_pos_ft = (ax_ft - img_x/new_px_per_ft, ay_ft - img_y/new_px_per_ft)
+        self.update()
+        self.status_changed.emit(f"  Background calibrated — {apparent_ft:.1f}' now reads as {real_ft:.1f}'.")
+
     def add_rect_room(self, x0_ft, y0_ft, width_ft, length_ft, name="Room", ceiling_in=108.0,
-                       ceiling_type="T-Bar / Lay-in Tile", floor_type="Carpet Tile"):
+                       ceiling_type="T-Bar / Lay-in Tile", floor_type="Carpet Tile", thickness_in=None):
         """Build a simple rectangular room in one shot — 4 walls (each with
         its own auto dimension, same as manual wall drawing) plus a room
-        label, instead of clicking out each corner by hand."""
+        label, instead of clicking out each corner by hand. thickness_in
+        defaults to the scene's current default (None) — pasting a copied
+        room passes the original's actual thickness explicitly instead."""
         if self.snap_to_grid:
             x0_ft, y0_ft = snap_grid(x0_ft), snap_grid(y0_ft)
         corners = [(x0_ft,y0_ft), (x0_ft+width_ft,y0_ft),
                    (x0_ft+width_ft,y0_ft+length_ft), (x0_ft,y0_ft+length_ft)]
-        walls = [self._add_wall(*corners[i], *corners[(i+1) % 4]) for i in range(4)]
+        walls = [self._add_wall(*corners[i], *corners[(i+1) % 4], thickness_in=thickness_in)
+                 for i in range(4)]
         cx, cy = x0_ft+width_ft/2, y0_ft+length_ft/2
         for wall in walls:
             dx, dy = wall.x2-wall.x1, wall.y2-wall.y1
@@ -1443,6 +2371,45 @@ class FloorPlanScene(QGraphicsScene):
         self._room_items.append(room)
         self.layout_changed.emit()
         return room
+
+    # ── Copy / paste ─────────────────────────────────────────────────────────
+
+    def copy_selected(self):
+        """Copy a selected rectangle room (one placed via 'Add Rectangle
+        Room…', or pasted from a previous copy) so Paste can stamp out a
+        duplicate — walls, dimensions and label together, not just the
+        label text. Freeform (wall-chain-drawn) rooms aren't a single bundled
+        object the same way, so copy only supports rectangle rooms for now."""
+        for it in self.selectedItems():
+            if isinstance(it, RoomLabelItem) and hasattr(it, "_rect_walls"):
+                self._clipboard_room = {
+                    "name": it.name, "width_ft": it._rect_size[0], "length_ft": it._rect_size[1],
+                    "ceiling_in": it.ceiling_in, "ceiling_type": it.ceiling_type,
+                    "floor_type": it.floor_type,
+                    "thickness_in": (it._rect_walls[0].thickness_in if it._rect_walls
+                                      else self.default_wall_thickness_in),
+                    "next_origin": (it._rect_origin[0]+4.0, it._rect_origin[1]+4.0),
+                }
+                self.status_changed.emit(f"  Copied \"{it.name}\" — Ctrl+V to paste a duplicate "
+                                          "(drag it into place afterward).")
+                return
+        self.status_changed.emit("  Select a rectangle room to copy (Ctrl+C) — "
+                                  "one placed via 'Add Rectangle Room…'.")
+
+    def paste_clipboard(self):
+        c = getattr(self, "_clipboard_room", None)
+        if not c:
+            self.status_changed.emit("  Nothing to paste — copy a rectangle room first (Ctrl+C).")
+            return
+        x0, y0 = c["next_origin"]
+        room = self.add_rect_room(x0, y0, c["width_ft"], c["length_ft"], f'{c["name"]} (Copy)',
+                                   c["ceiling_in"], c["ceiling_type"], c["floor_type"],
+                                   thickness_in=c["thickness_in"])
+        for it in self.selectedItems():
+            it.setSelected(False)
+        room.setSelected(True)
+        c["next_origin"] = (room._rect_origin[0]+4.0, room._rect_origin[1]+4.0)
+        self.status_changed.emit(f"  Pasted \"{room.name}\" — drag it to reposition.")
 
     # ── Mouse / keyboard ─────────────────────────────────────────────────────
 
@@ -1482,6 +2449,32 @@ class FloorPlanScene(QGraphicsScene):
         if self._mode == "symbol" and event.button() == Qt.LeftButton:
             self._place_symbol(event.scenePos())
             return
+        if self._mode == "zone" and event.button() == Qt.RightButton:
+            self._cancel_zone_chain()
+            return
+        if self._mode == "zone" and event.button() == Qt.LeftButton:
+            raw = event.scenePos()
+            x_ft, y_ft = raw.x()/PX_PER_FT, raw.y()/PX_PER_FT
+            if self.snap_to_grid:
+                x_ft, y_ft = snap_grid(x_ft), snap_grid(y_ft)
+            if not self._zone_chain:
+                self._zone_chain = [(x_ft, y_ft)]
+                self._zone_preview.points = list(self._zone_chain)
+                self.update()
+                return
+            first = self._zone_chain[0]
+            if len(self._zone_chain) >= 3 and math.hypot(x_ft-first[0], y_ft-first[1]) <= SNAP_TOL_FT:
+                self._finish_zone_chain()
+                return
+            self._zone_chain.append((x_ft, y_ft))
+            self._zone_preview.points = list(self._zone_chain)
+            self.update()
+            return
+        if self._mode == "bg_calibrate" and event.button() == Qt.LeftButton:
+            self._bg_calib_pts.append(event.scenePos())
+            if len(self._bg_calib_pts) == 2:
+                self._finish_bg_calibration()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -1504,11 +2497,22 @@ class FloorPlanScene(QGraphicsScene):
             self._preview.preview_pt = (x_ft, y_ft)
             self.update()
             return
+        if self._mode == "zone" and self._zone_chain:
+            raw = event.scenePos()
+            x_ft, y_ft = raw.x()/PX_PER_FT, raw.y()/PX_PER_FT
+            if self.snap_to_grid:
+                x_ft, y_ft = snap_grid(x_ft), snap_grid(y_ft)
+            self._zone_preview.preview_pt = (x_ft, y_ft)
+            self.update()
+            return
         super().mouseMoveEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if self._mode == "wall" and self._chain:
             self._finish_chain(closed=False)
+            return
+        if self._mode == "zone" and len(self._zone_chain) >= 3:
+            self._finish_zone_chain()
             return
         super().mouseDoubleClickEvent(event)
 
@@ -1548,8 +2552,19 @@ class FloorPlanScene(QGraphicsScene):
             if t and (t.isdigit() or t in ".'\""):
                 self._length_buffer += t
                 self.update(); return
+        if self._mode == "zone":
+            if event.key() == Qt.Key_Escape:
+                self._cancel_zone_chain(); self.set_mode_select(); return
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if len(self._zone_chain) >= 3:
+                    self._finish_zone_chain()
+                return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.selectedItems():
             self.delete_selected(); return
+        if event.key() == Qt.Key_C and (event.modifiers() & Qt.ControlModifier):
+            self.copy_selected(); return
+        if event.key() == Qt.Key_V and (event.modifiers() & Qt.ControlModifier):
+            self.paste_clipboard(); return
         if event.key() == Qt.Key_Escape:
             self.set_mode_select(); return
         super().keyPressEvent(event)
@@ -1574,6 +2589,29 @@ class FloorPlanScene(QGraphicsScene):
                 best_d = d; best = (w, t, d)
         return best
 
+    def _coincident_walls(self, x_ft, y_ft, exclude, tol=0.1):
+        """Other walls whose segment passes through (x_ft,y_ft) within tol —
+        catches the shared wall between two independently-drawn adjoining
+        rooms (each room's chain draws its own wall segment along the same
+        line), so a door/window placed there can cut a gap in ALL of them
+        instead of only the one _nearest_wall happened to pick — otherwise
+        the untouched duplicate wall renders solid right over the opening."""
+        found = []
+        for w in self._wall_items:
+            if w is exclude:
+                continue
+            dx, dy = w.x2-w.x1, w.y2-w.y1
+            L2 = dx*dx+dy*dy
+            if L2 < 1e-9:
+                continue
+            t = ((x_ft-w.x1)*dx + (y_ft-w.y1)*dy)/L2
+            if t < -0.05 or t > 1.05:
+                continue
+            cx, cy = w.x1+t*dx, w.y1+t*dy
+            if math.hypot(x_ft-cx, y_ft-cy) <= tol:
+                found.append(w)
+        return found
+
     def _place_symbol(self, scene_pt):
         kind = self._pending_symbol
         if not kind:
@@ -1589,6 +2627,10 @@ class FloorPlanScene(QGraphicsScene):
                 item.host_wall = w
                 w.opening_items.append(item)
                 w.prepareGeometryChange(); w.update()
+                for ow in self._coincident_walls(x, y, exclude=w):
+                    item.extra_host_walls.append(ow)
+                    ow.opening_items.append(item)
+                    ow.prepareGeometryChange(); ow.update()
             else:
                 item = DoorWindowItem(kind, scene_pt.x(), scene_pt.y(), 0.0)
                 self.status_changed.emit("  ⚠ No wall found nearby — placed unattached; drag onto a wall.")
@@ -1606,8 +2648,15 @@ class FloorPlanScene(QGraphicsScene):
         face (with along-wall grid snap, so a row of them lines up evenly)
         if one is close by, else plain grid snap. Shared by both the initial
         placement click (_place_symbol) and live dragging of an existing
-        symbol (SymbolItem.itemChange), so both behave identically."""
+        symbol (SymbolItem.itemChange), so both behave identically.
+
+        With Snap OFF this is a no-op — full manual placement, including no
+        wall-proximity snap — since that wall snap used to fire regardless
+        of the toggle, which meant "Snap OFF" was never actually off for
+        anything placed near a wall."""
         x_ft, y_ft = scene_pt.x()/PX_PER_FT, scene_pt.y()/PX_PER_FT
+        if not self.snap_to_grid:
+            return QPointF(x_ft*PX_PER_FT, y_ft*PX_PER_FT)
         hit = self._nearest_wall(scene_pt, max_dist_ft=3.0)
         if hit:
             # Snap onto the wall face: project along the wall (and snap that
@@ -1620,15 +2669,12 @@ class FloorPlanScene(QGraphicsScene):
             L = math.hypot(dx, dy) or 1.0
             ux, uy = dx/L, dy/L
             nx, ny = -uy, ux
-            along = t*L
-            if self.snap_to_grid:
-                along = snap_grid(along)
-                along = max(0.0, min(L, along))
+            along = max(0.0, min(L, snap_grid(t*L)))
             wx, wy = w.x1+ux*along, w.y1+uy*along
             side = getattr(w, "interior_side", 1) or 1
             standoff_ft = w.thickness_in/24.0 + 0.4
             x_ft, y_ft = wx+nx*standoff_ft*side, wy+ny*standoff_ft*side
-        elif self.snap_to_grid:
+        else:
             x_ft, y_ft = snap_grid(x_ft), snap_grid(y_ft)
         return QPointF(x_ft*PX_PER_FT, y_ft*PX_PER_FT)
 
@@ -1643,13 +2689,16 @@ class FloorPlanScene(QGraphicsScene):
             xs.append(it.pos().x()/PX_PER_FT); ys.append(it.pos().y()/PX_PER_FT)
         for it in self._room_items:
             xs.append(it.pos().x()/PX_PER_FT); ys.append(it.pos().y()/PX_PER_FT)
+        for z in self._zone_items:
+            for x, y in z.points:
+                xs.append(x); ys.append(y)
         if not xs:
             return (0.0, 0.0, 10.0, 10.0)
         return (min(xs), min(ys), max(xs), max(ys))
 
     def clear_all(self):
         for lst in (self._wall_items, self._dim_items, self._room_items,
-                    self._symbol_items, self._opening_items):
+                    self._symbol_items, self._opening_items, self._zone_items):
             for it in list(lst):
                 self.removeItem(it)
             lst.clear()
@@ -1659,7 +2708,7 @@ class FloorPlanScene(QGraphicsScene):
         """Remove one item and keep all bookkeeping (paired dimension, door/window
         <-> host-wall opening lists) consistent. Safe to call more than once."""
         if it.scene() is None and it not in (self._wall_items+self._dim_items+self._room_items
-                                              +self._symbol_items+self._opening_items):
+                                              +self._symbol_items+self._opening_items+self._zone_items):
             return
         item_type = getattr(it, "ITEM_TYPE", "")
         if item_type == "wall":
@@ -1672,11 +2721,12 @@ class FloorPlanScene(QGraphicsScene):
                     self.removeItem(d)
                     if d in self._dim_items: self._dim_items.remove(d)
         elif item_type == "opening":
-            if it.host_wall is not None and it in it.host_wall.opening_items:
-                it.host_wall.opening_items.remove(it)
-                it.host_wall.update()
+            for hw in [it.host_wall] + list(it.extra_host_walls):
+                if hw is not None and it in hw.opening_items:
+                    hw.opening_items.remove(it)
+                    hw.update()
         for lst in (self._wall_items, self._dim_items, self._room_items,
-                    self._symbol_items, self._opening_items):
+                    self._symbol_items, self._opening_items, self._zone_items):
             if it in lst:
                 lst.remove(it)
         if it.scene() is not None:
@@ -1696,6 +2746,7 @@ class FloorPlanScene(QGraphicsScene):
             "rooms":   [r.to_dict() for r in self._room_items],
             "symbols": [s.to_dict() for s in self._symbol_items],
             "openings":[o.to_dict() for o in self._opening_items],
+            "zones":   [z.to_dict() for z in self._zone_items],
             "layers_visible": self.layers_visible,
         }
 
@@ -1718,11 +2769,17 @@ class FloorPlanScene(QGraphicsScene):
                 w, _t, _d = hit
                 o.host_wall = w
                 w.opening_items.append(o)
+                x_ft, y_ft = o.pos().x()/PX_PER_FT, o.pos().y()/PX_PER_FT
+                for ow in self._coincident_walls(x_ft, y_ft, exclude=w):
+                    o.extra_host_walls.append(ow)
+                    ow.opening_items.append(o)
+        for zd in d.get("zones", []):
+            z = FireZoneItem.from_dict(zd); self.addItem(z); self._zone_items.append(z)
         self.layers_visible.update(d.get("layers_visible", {}))
         for w in self._wall_items:
             w.prepareGeometryChange(); w.update()
         for lst in (self._wall_items, self._dim_items, self._room_items,
-                    self._symbol_items, self._opening_items):
+                    self._symbol_items, self._opening_items, self._zone_items):
             for it in lst:
                 self._apply_layer_visibility(it)
         self.layout_changed.emit()
@@ -1768,7 +2825,8 @@ class FloorPlanCanvas(QGraphicsView):
 
     def fit_all(self):
         sc = self.scene()
-        items = [i for i in sc.items() if i is not getattr(sc, "_preview", None)]
+        items = [i for i in sc.items() if i is not getattr(sc, "_preview", None)
+                 and i is not getattr(sc, "_zone_preview", None)]
         if not items:
             self.fitInView(QRectF(0, 0, 30*PX_PER_FT, 20*PX_PER_FT), Qt.KeepAspectRatio)
             return
@@ -1900,6 +2958,92 @@ class RoomPropertiesDialog(QDialog):
                 "floor_type": self.floor_type_combo.currentText().strip() or "Carpet Tile"}
 
 
+ZONE_COLOR_NAMES = {
+    "#c0392b": "Red", "#2980b9": "Blue", "#27ae60": "Green", "#e67e22": "Orange",
+    "#8e44ad": "Purple", "#16a085": "Teal", "#2c3e50": "Charcoal", "#d35400": "Rust",
+}
+
+
+def _swatch_icon(hex_color, size=16):
+    """Small solid-color square icon for a color combo entry, so choices show
+    as an actual swatch instead of a bare hex code the user has to decode."""
+    pm = QPixmap(size, size)
+    pm.fill(QColor(hex_color))
+    return QIcon(pm)
+
+
+def _pattern_icon(hex_color, pattern, size=28):
+    """Small preview icon showing the actual hatch pattern in the given
+    color, so the pattern combo shows real texture instead of a name —
+    same reasoning as _swatch_icon for colors."""
+    pm = QPixmap(size, size)
+    pm.fill(QColor("white"))
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.Antialiasing)
+    col = QColor(hex_color)
+    painter.setPen(QPen(col.darker(130), 1))
+    if pattern == "solid":
+        fill = QColor(col); fill.setAlpha(60)
+        painter.setBrush(QBrush(fill))
+    else:
+        painter.setBrush(QBrush(col, ZONE_QT_PATTERNS.get(pattern, Qt.SolidPattern)))
+    painter.drawRect(1, 1, size-2, size-2)
+    painter.end()
+    return QIcon(pm)
+
+
+class ZonePropertiesDialog(QDialog):
+    def __init__(self, name="Zone 1", color="#c0392b", pattern="solid", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fire Zone Properties"); self.setMinimumWidth(300)
+        l = QFormLayout(self); l.setSpacing(10); l.setContentsMargins(16,16,16,16)
+        self.name_edit = QLineEdit(name)
+        self.color_combo = QComboBox()
+        self.color_combo.setIconSize(QSize(16, 16))
+        for hex_c in ZONE_COLOR_CHOICES:
+            label = ZONE_COLOR_NAMES.get(hex_c, hex_c)
+            self.color_combo.addItem(_swatch_icon(hex_c), label, hex_c)
+        idx = self.color_combo.findData(color)
+        if idx < 0:
+            self.color_combo.addItem(_swatch_icon(color), ZONE_COLOR_NAMES.get(color, color), color)
+            idx = self.color_combo.count()-1
+        self.color_combo.setCurrentIndex(idx)
+        self.color_combo.currentIndexChanged.connect(self._refresh_pattern_icons)
+
+        self.pattern_combo = QComboBox()
+        self.pattern_combo.setIconSize(QSize(28, 28))
+        for key in ZONE_PATTERN_CHOICES:
+            self.pattern_combo.addItem(_pattern_icon(color, key), ZONE_PATTERN_NAMES[key], key)
+        pidx = self.pattern_combo.findData(pattern)
+        self.pattern_combo.setCurrentIndex(pidx if pidx >= 0 else 0)
+
+        l.addRow("Zone name:", self.name_edit)
+        l.addRow("Boundary color:", self.color_combo)
+        l.addRow("Fill pattern:", self.pattern_combo)
+        note = QLabel("A distinct pattern keeps a zone that reuses a color on another "
+                       "floor visually distinguishable.")
+        note.setWordWrap(True); note.setStyleSheet("color:#888;font-size:10px;")
+        l.addRow(note)
+        br = QHBoxLayout()
+        ok = QPushButton("OK"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        ca = QPushButton("Cancel"); ca.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ca); br.addWidget(ok)
+        l.addRow(br)
+
+    def _refresh_pattern_icons(self):
+        """Repaint the pattern combo's icons in the newly-picked color so the
+        preview always matches what the zone will actually look like."""
+        col = self.color_combo.currentData() or "#c0392b"
+        for i, key in enumerate(ZONE_PATTERN_CHOICES):
+            self.pattern_combo.setItemIcon(i, _pattern_icon(col, key))
+
+    def values(self):
+        return {"name": self.name_edit.text().strip() or "Zone",
+                "color": self.color_combo.currentData() or "#c0392b",
+                "pattern": self.pattern_combo.currentData() or "solid"}
+
+
 class RectRoomDialog(QDialog):
     """Quick square/rectangular room: type a width and length and it builds
     the 4 walls (with dimensions) and a room label automatically — no
@@ -2012,6 +3156,30 @@ def export_floor_plan_pdf(scene, path, paper_key, orientation, feet_per_inch,
     def visible(it):
         return scene.layers_visible.get(it.layer, True)
 
+    # Fire zones — translucent background tint + dashed border, drawn first
+    # so walls/symbols/dimensions print on top of it. Name label text
+    # deferred to the text pass below, same reason as dimension labels.
+    zone_labels = []
+    if visible_layer_any(scene, LAYER_FIRE):
+        for z in scene._zone_items:
+            if not visible(z) or len(z.points) < 3:
+                continue
+            col_hex = z.color
+            col = tuple(int(col_hex[i:i+2],16)/255.0 for i in (1,3,5))
+            pts = [tx(x, y) for x, y in z.points]
+            shape.draw_polyline(pts+[pts[0]])
+            shape.finish(color=col, fill=col, width=1.4, dashes="[4 3] 0", fill_opacity=0.15)
+            cx, cy = z.centroid_ft()
+            lx, ly = z.label_pos_ft()
+            label_pt = tx(lx, ly)
+            if (lx, ly) != (cx, cy):
+                anchor_pt = tx(cx, cy)
+                shape.draw_line(anchor_pt, label_pt)
+                shape.finish(color=col, width=1.0)
+                shape.draw_circle(anchor_pt, 2.2)
+                shape.finish(color=col, fill=col, width=0.5)
+            zone_labels.append((label_pt, z.name, col))
+
     # Walls — filled polygon per solid segment (gaps cut for doors/windows)
     for w in scene._wall_items:
         if not visible(w): continue
@@ -2058,7 +3226,7 @@ def export_floor_plan_pdf(scene, path, paper_key, orientation, feet_per_inch,
     for s in scene._symbol_items:
         if not visible(s): continue
         p = tx(s.pos().x()/PX_PER_FT, s.pos().y()/PX_PER_FT)
-        col_hex = LAYER_COLORS.get(s.layer, "#333333")
+        col_hex = s.defn.get("color") or LAYER_COLORS.get(s.layer, "#333333")
         col = tuple(int(col_hex[i:i+2],16)/255.0 for i in (1,3,5))
         tag = s.defn.get("tag") or "".join(w[0] for w in s.defn["name"].split()[:2]).upper()
         defn_eff = s.defn
@@ -2074,6 +3242,10 @@ def export_floor_plan_pdf(scene, path, paper_key, orientation, feet_per_inch,
         page.insert_text(fitz.Point(mid.x-22, mid.y-4), text,
                           fontsize=9, fontname="helv", color=(0.75,0.22,0.17))
 
+    for p, name, col in zone_labels:
+        page.insert_text(fitz.Point(p.x-50, p.y), name, fontsize=10,
+                          fontname="helv", color=col)
+
     # Room labels
     for r in scene._room_items:
         if not visible(r): continue
@@ -2088,15 +3260,33 @@ def export_floor_plan_pdf(scene, path, paper_key, orientation, feet_per_inch,
                           f"Clg: {r.ceiling_type}   ·   Flr: {r.floor_type}",
                           fontsize=8, color=(0.45,0.45,0.45))
 
-    # Tag prints below the icon, not on top of it — some icons (wap, camera,
-    # furniture) aren't a simple filled blob a short abbreviation can sit
-    # inside of legibly.
+    # Tag position mirrors the official Calgary symbol sheet: on/inside the
+    # icon for shapes that are literal text-carrying glyphs there (HAZ
+    # diamond, FAAP-style boxes, "E"/"W"/"O2" circles, generator box,
+    # elevator badge), above the icon for the north-arrow compass, and below
+    # for every other (purely pictorial) icon — where some icons (wap,
+    # camera, furniture) aren't a simple filled blob a short abbreviation
+    # can sit inside of legibly.
     for s, p, col, tag, half_h, defn_eff in symbol_labels:
+        shp_key = defn_eff.get("shape")
         below_y = p.y + half_h + 9
-        if tag:
+        if tag and shp_key in TAG_ON_ICON_SHAPES:
+            tag_col = _legible_tag_color(col)
+            lines = tag.split("\n")
+            fs = 6.5
+            start_y = p.y - (fs*1.15*(len(lines)-1))/2 + fs*0.35
+            for i, line in enumerate(lines):
+                tw = fitz.get_text_length(line, fontname="hebo", fontsize=fs)
+                page.insert_text(fitz.Point(p.x-tw/2, start_y+i*fs*1.15), line,
+                                  fontsize=fs, fontname="hebo", color=tag_col)
+        elif tag and shp_key in TAG_ABOVE_ICON_SHAPES:
+            tw = fitz.get_text_length(tag, fontname="hebo", fontsize=6)
+            page.insert_text(fitz.Point(p.x-tw/2, p.y-half_h-4), tag, fontsize=6,
+                              fontname="hebo", color=_legible_tag_color(col))
+        elif tag:
             tw = fitz.get_text_length(tag, fontname="hebo", fontsize=6)
             page.insert_text(fitz.Point(p.x-tw/2, below_y), tag, fontsize=6,
-                              fontname="hebo", color=col)
+                              fontname="hebo", color=_legible_tag_color(col))
             below_y += 11
         if defn_eff.get("shape") in ("rect", "circle", "cabinet", "stairs"):
             dim_text = f'{fmt_feet(defn_eff.get("w",24)/12.0)} x {fmt_feet(defn_eff.get("d",24)/12.0)}'
@@ -2128,20 +3318,357 @@ def export_floor_plan_pdf(scene, path, paper_key, orientation, feet_per_inch,
     doc.close()
 
 
+FSP_LEGEND_COL_W_IN = 2.6
+FSP_LEGEND_GAP_IN = 0.2
+
+
+def export_fire_safety_plan_pdf(scene, path, paper_key, orientation, project_meta=None,
+                                 sheet_title="FIRE SAFETY PLAN", symbol_scale=2.0, text_pt=12):
+    """Dedicated single-page export for the Fire Safety Plan / 'You Are Here'
+    evacuation diagram — deliberately NOT a copy of export_floor_plan_pdf's
+    behavior in three ways a plan posted on a wall actually needs:
+      1. Always one page: the on-page legend column's width is subtracted
+         from the printable area BEFORE the auto-fit scale is computed, so
+         there's always room for it instead of a second legend page.
+      2. Walls print as a plain black centerline, not a filled/shaded
+         parallelogram — reads more clearly at a glance than construction
+         wall-thickness detail nobody evacuating a building needs.
+      3. Symbol icons and label text are drawn at caller-supplied sizes
+         (symbol_scale / text_pt) well above the regular export's fixed,
+         print-at-a-desk sizing, since this sheet needs to be legible from
+         a few feet away, not zoomed into on screen.
+    """
+    project_meta = project_meta or {}
+    pw_in, ph_in = PAPER_SIZES_IN[paper_key]
+    if orientation == "landscape" and pw_in < ph_in:
+        pw_in, ph_in = ph_in, pw_in
+    elif orientation == "portrait" and pw_in > ph_in:
+        pw_in, ph_in = ph_in, pw_in
+
+    bbox = scene.all_items_bbox_ft()
+    min_x, min_y, max_x, max_y = bbox
+    width_ft = max(0.1, max_x-min_x); height_ft = max(0.1, max_y-min_y)
+
+    def visible(it):
+        return scene.layers_visible.get(it.layer, True)
+
+    used_kinds = sorted(
+        {s.kind for s in scene._symbol_items
+         if visible(s) and ALL_SYMBOL_DEFS.get(s.kind, {}).get("layer") == LAYER_FIRE},
+        key=lambda k: ALL_SYMBOL_DEFS.get(k, {}).get("name", k))
+    legend_zones = [z for z in scene._zone_items if visible(z) and len(z.points) >= 3]
+    has_legend = bool(used_kinds) or bool(legend_zones)
+    legend_w_in = FSP_LEGEND_COL_W_IN if has_legend else 0.0
+    legend_gap_in = FSP_LEGEND_GAP_IN if has_legend else 0.0
+
+    printable_w_in = pw_in - 2*MARGIN_IN - legend_w_in - legend_gap_in
+    printable_h_in = ph_in - MARGIN_IN - TITLE_BLOCK_H_IN
+    feet_per_inch = best_fit_scale(width_ft, height_ft, printable_w_in, printable_h_in, margin_in=0.0)
+    px_per_ft = 72.0/feet_per_inch
+
+    content_w_pt = width_ft*px_per_ft
+    content_h_pt = height_ft*px_per_ft
+    origin_x = MARGIN_IN*72 + max(0.0, (printable_w_in*72 - content_w_pt)/2)
+    origin_y = MARGIN_IN*72 + max(0.0, (printable_h_in*72 - content_h_pt)/2)
+
+    def tx(x_ft, y_ft):
+        return fitz.Point(origin_x + (x_ft-min_x)*px_per_ft, origin_y + (y_ft-min_y)*px_per_ft)
+
+    def zone_check(x_ft, y_ft):
+        """Whether (x_ft,y_ft) falls inside any VISIBLE drawn zone — used to
+        give symbols/text a clear white halo there so a hatch pattern
+        doesn't run behind and fight with them for readability."""
+        return point_in_any_zone([z for z in scene._zone_items if visible(z)], x_ft, y_ft)
+
+    doc = fitz.open()
+    page = doc.new_page(width=pw_in*72, height=ph_in*72)
+    shape = page.new_shape()
+
+    # Fire zones — dashed border + either a translucent tint (solid pattern)
+    # or a hand-drawn hatch texture (fitz has no pattern-brush equivalent to
+    # Qt's), drawn first so walls/symbols print on top. The hatch is what
+    # keeps a zone number that reuses a color on another floor visually
+    # distinct — same idea as the reference Fire Zone drawing.
+    zone_labels = []
+    for z in scene._zone_items:
+        if not visible(z) or len(z.points) < 3:
+            continue
+        col_hex = z.color
+        col = tuple(int(col_hex[i:i+2],16)/255.0 for i in (1,3,5))
+        pts = [tx(x, y) for x, y in z.points]
+        pattern = getattr(z, "pattern", "solid")
+        if pattern == "solid":
+            shape.draw_polyline(pts+[pts[0]])
+            shape.finish(color=col, fill=col, width=1.6, dashes="[4 3] 0", fill_opacity=0.15)
+        else:
+            shape.draw_polyline(pts+[pts[0]])
+            shape.finish(color=col, width=1.6, dashes="[4 3] 0")
+            pts_xy = [(p.x, p.y) for p in pts]
+            for hang, hspacing in ZONE_HATCH_SPECS.get(pattern, []):
+                for (x1, y1), (x2, y2) in hatch_lines_in_polygon(pts_xy, hang, hspacing):
+                    shape.draw_line(fitz.Point(x1, y1), fitz.Point(x2, y2))
+                    shape.finish(color=col, width=0.7)
+        cx, cy = z.centroid_ft()
+        lx, ly = z.label_pos_ft()
+        label_pt = tx(lx, ly)
+        if (lx, ly) != (cx, cy):
+            # Leader line + anchor dot back to the zone — the label was
+            # dragged clear because the zone itself is too small/oddly
+            # shaped to write the name inside, same convention as the
+            # reference Fire Zone Plan's pulled-out callouts.
+            anchor_pt = tx(cx, cy)
+            shape.draw_line(anchor_pt, label_pt)
+            shape.finish(color=col, width=1.2)
+            shape.draw_circle(anchor_pt, 2.5)
+            shape.finish(color=col, fill=col, width=0.5)
+        zone_labels.append((label_pt, z.name, col))
+
+    # Walls — plain black centerline (no thickness fill) per the "we don't
+    # need the wall detail" feedback; a posted evacuation diagram reads
+    # better as a clean line drawing than a shaded construction plan.
+    for w in scene._wall_items:
+        if not visible(w): continue
+        for sx1, sy1, sx2, sy2 in w.solid_segments_ft():
+            shape.draw_line(tx(sx1, sy1), tx(sx2, sy2))
+            shape.finish(color=(0,0,0), width=2.2)
+
+    # Doors / windows
+    for o in scene._opening_items:
+        if not visible(o): continue
+        _draw_opening_pdf(shape, page, o, tx)
+
+    # Symbols — drawn at symbol_scale (default well above the regular
+    # export) so an exit arrow etc. reads from across a room, not just
+    # zoomed-in on screen.
+    symbol_labels = []
+    for s in scene._symbol_items:
+        if not visible(s): continue
+        sx_ft, sy_ft = s.pos().x()/PX_PER_FT, s.pos().y()/PX_PER_FT
+        p = tx(sx_ft, sy_ft)
+        col_hex = s.defn.get("color") or LAYER_COLORS.get(s.layer, "#333333")
+        col = tuple(int(col_hex[i:i+2],16)/255.0 for i in (1,3,5))
+        tag = s.defn.get("tag") or "".join(w2[0] for w2 in s.defn["name"].split()[:2]).upper()
+        defn_eff = s.defn
+        if s.size_override:
+            defn_eff = dict(s.defn); defn_eff["w"], defn_eff["d"] = s.size_override
+        in_zone = zone_check(sx_ft, sy_ft)
+        if in_zone:
+            # Clear halo behind the icon so a zone's hatch pattern doesn't
+            # run right through it — sized generously since icon extents
+            # vary by shape (pin, cylinder, diamond, ...).
+            halo_r = SYMBOL_ICON_R_PT * symbol_scale * 1.6
+            shape.draw_circle(p, halo_r)
+            shape.finish(color=None, fill=(1,1,1), width=0, fill_opacity=0.9)
+        half_h = _draw_symbol_icon_pdf(shape, defn_eff, p.x, p.y, col, px_per_ft, s.rotation(),
+                                       scale=symbol_scale)
+        symbol_labels.append((p, col, tag, half_h, defn_eff.get("shape"), in_zone))
+
+    shape.commit()
+
+    def halo_behind(x0, y_baseline, text, fontsize, fontname="helv", pad=2.0):
+        """White backing rect sized to `text`, drawn immediately before it's
+        inserted, so a zone's hatch pattern doesn't run through readable
+        text. Returns the text width so callers already computing it for
+        centering don't need get_text_length twice."""
+        tw = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        page.draw_rect(fitz.Rect(x0-pad, y_baseline-fontsize*0.82-pad, x0+tw+pad, y_baseline+fontsize*0.28+pad),
+                        color=None, fill=(1,1,1), fill_opacity=0.9)
+        return tw
+
+    # Text pass — everything below is safely on top of the committed shapes.
+    # All text on this sheet is forced uppercase per the Fire Safety Plan
+    # text-style requirement ("must be entirely in uppercase for clear
+    # visibility and compliance"). Zone name labels always get a halo — at
+    # the default centroid position that's always "inside itself"; when
+    # dragged off to the side (see the leader line drawn above) it isn't,
+    # but the halo is just as needed there.
+    for p, name, col in zone_labels:
+        name_u = name.upper()
+        halo_behind(p.x-60, p.y, name_u, text_pt, "helv")
+        page.insert_text(fitz.Point(p.x-60, p.y), name_u, fontsize=text_pt,
+                          fontname="helv", color=col)
+
+    for r in scene._room_items:
+        if not visible(r): continue
+        rx_ft, ry_ft = r.pos().x()/PX_PER_FT, r.pos().y()/PX_PER_FT
+        p = tx(rx_ft, ry_ft)
+        name_u = r.name.upper()
+        if zone_check(rx_ft, ry_ft):
+            halo_behind(p.x-60, p.y-4, name_u, text_pt, "helv")
+        page.insert_text(fitz.Point(p.x-60, p.y-4), name_u, fontsize=text_pt,
+                          fontname="helv", color=(0.1,0.1,0.1))
+
+    for p, col, tag, half_h, shp_key, in_zone in symbol_labels:
+        if not tag:
+            continue
+        tag = tag.upper()
+        tag_col = _legible_tag_color(col)
+        if shp_key in TAG_ON_ICON_SHAPES:
+            # Font size still follows the user's text_pt setting but is
+            # capped to the icon's own size so a multi-line tag (e.g.
+            # "F.D.\nKEY") can't blow out past a small icon like the key box.
+            # No halo here — it already sits on the icon's own white/light
+            # fill, and the icon itself already got a zone halo if needed.
+            lines = tag.split("\n")
+            fs = min(text_pt, max(8, half_h*1.1))
+            start_y = p.y - (fs*1.15*(len(lines)-1))/2 + fs*0.35
+            for i, line in enumerate(lines):
+                tw = fitz.get_text_length(line, fontname="hebo", fontsize=fs)
+                page.insert_text(fitz.Point(p.x-tw/2, start_y+i*fs*1.15), line,
+                                  fontsize=fs, fontname="hebo", color=tag_col)
+        elif shp_key in TAG_ABOVE_ICON_SHAPES:
+            tw = fitz.get_text_length(tag, fontname="hebo", fontsize=text_pt)
+            above_y = p.y-half_h-text_pt
+            if in_zone:
+                halo_behind(p.x-tw/2, above_y, tag, text_pt, "hebo")
+            page.insert_text(fitz.Point(p.x-tw/2, above_y), tag, fontsize=text_pt,
+                              fontname="hebo", color=tag_col)
+        else:
+            below_y = p.y + half_h + text_pt + 2
+            tw = fitz.get_text_length(tag, fontname="hebo", fontsize=text_pt)
+            if in_zone:
+                halo_behind(p.x-tw/2, below_y, tag, text_pt, "hebo")
+            page.insert_text(fitz.Point(p.x-tw/2, below_y), tag, fontsize=text_pt,
+                              fontname="hebo", color=tag_col)
+
+    # Title block
+    tb_y = (ph_in-TITLE_BLOCK_H_IN)*72
+    page.draw_line(fitz.Point(MARGIN_IN*72, tb_y), fitz.Point((pw_in-MARGIN_IN)*72, tb_y),
+                    color=(0,0,0), width=1.0)
+    page.insert_text(fitz.Point(MARGIN_IN*72, tb_y+18), sheet_title.upper(),
+                      fontsize=15, fontname="helv", color=(0,0,0))
+    info_lines = [
+        f"PROJECT: {(project_meta.get('customer') or '').upper()}   {(project_meta.get('job_number') or '').upper()}",
+        f"DATE: {datetime.date.today().strftime('%b %d, %Y').upper()}",
+    ]
+    for i, line in enumerate(info_lines):
+        page.insert_text(fitz.Point(MARGIN_IN*72, tb_y+36+i*14), line, fontsize=9, color=(0.2,0.2,0.2))
+
+    # On-page legend column (right side) — only Fire Safety Plan symbols
+    # actually used, PLUS every fire zone actually drawn (colored swatch +
+    # whatever the zone was named), arranged to fit whatever vertical room
+    # is available rather than spilling onto a second page.
+    if has_legend:
+        col_x = (pw_in-MARGIN_IN-legend_w_in)*72
+        divider_x = col_x - legend_gap_in*72/2
+        div_shape = page.new_shape()
+        div_shape.draw_line(fitz.Point(divider_x, MARGIN_IN*72), fitz.Point(divider_x, tb_y))
+        div_shape.finish(color=(0.6,0.6,0.6), width=0.8)
+
+        header_h = text_pt + 16
+        row_y0 = MARGIN_IN*72 + header_h
+        available_h = tb_y - row_y0 - 6
+        # +1 extra row reserved for the "ZONES" sub-header when both symbol
+        # and zone entries are present.
+        n_rows = len(used_kinds) + len(legend_zones) + (1 if used_kinds and legend_zones else 0)
+        row_h = max(text_pt+14, min(text_pt+26, available_h/max(1, n_rows)))
+
+        legend_rows = []   # (row_y, tag_or_None, label_text, swatch_color)
+        row_y = row_y0
+        for k in used_kinds:
+            defn = ALL_SYMBOL_DEFS[k]
+            col_hex = defn.get("color") or LAYER_COLORS.get(defn["layer"], "#333333")
+            lcol = tuple(int(col_hex[i:i+2],16)/255.0 for i in (1,3,5))
+            icon_cx, icon_cy = col_x+14, row_y-2
+            _draw_symbol_icon_pdf(div_shape, defn, icon_cx, icon_cy, lcol, px_per_ft=4.0, scale=1.3)
+            tag = defn.get("tag") or "".join(w2[0] for w2 in defn["name"].split()[:2]).upper()
+            legend_rows.append((row_y, tag.upper(), defn["name"].upper(), None))
+            row_y += row_h
+
+        zone_header_y = None
+        if legend_zones:
+            if used_kinds:
+                zone_header_y = row_y
+                row_y += row_h
+            for z in legend_zones:
+                zcol_hex = z.color
+                zcol = tuple(int(zcol_hex[i:i+2],16)/255.0 for i in (1,3,5))
+                sw = text_pt*0.9
+                swatch_rect = fitz.Rect(col_x+14-sw/2, row_y-2-sw/2, col_x+14+sw/2, row_y-2+sw/2)
+                z_pattern = getattr(z, "pattern", "solid")
+                if z_pattern == "solid":
+                    div_shape.draw_rect(swatch_rect)
+                    div_shape.finish(color=zcol, fill=zcol, width=0.8)
+                else:
+                    # Same swatch-plus-hatch rendering as the main plan, at
+                    # legend scale, so a color reused across zones still
+                    # reads as different textures here too.
+                    div_shape.draw_rect(swatch_rect)
+                    div_shape.finish(color=zcol, width=0.8)
+                    sw_pts = [(swatch_rect.x0,swatch_rect.y0),(swatch_rect.x1,swatch_rect.y0),
+                              (swatch_rect.x1,swatch_rect.y1),(swatch_rect.x0,swatch_rect.y1)]
+                    for hang, hspacing in ZONE_HATCH_SPECS.get(z_pattern, []):
+                        for (x1,y1),(x2,y2) in hatch_lines_in_polygon(sw_pts, hang, max(2.5, hspacing*0.35)):
+                            div_shape.draw_line(fitz.Point(x1,y1), fitz.Point(x2,y2))
+                            div_shape.finish(color=zcol, width=0.6)
+                legend_rows.append((row_y, None, z.name.upper(), zcol))
+                row_y += row_h
+        div_shape.commit()
+
+        page.insert_text(fitz.Point(col_x, MARGIN_IN*72+text_pt+2), "LEGEND",
+                          fontsize=text_pt+2, fontname="helv", color=(0,0,0))
+        if zone_header_y is not None:
+            page.insert_text(fitz.Point(col_x, zone_header_y), "ZONES",
+                              fontsize=text_pt, fontname="helv", color=(0,0,0))
+        legend_text_pt = max(8, text_pt*0.85)
+        for row_y, tag, name, zcol in legend_rows:
+            if tag is not None:
+                page.insert_text(fitz.Point(col_x+30, row_y), f"{tag} — {name}",
+                                  fontsize=legend_text_pt, color=(0.1,0.1,0.1))
+            else:
+                page.insert_text(fitz.Point(col_x+30, row_y), name,
+                                  fontsize=legend_text_pt, color=zcol)
+
+    doc.save(path)
+    doc.close()
+
+
+def _legible_tag_color(col):
+    """A symbol's own accent color doubles as its PDF tag-text color, which
+    reads fine for every color in the catalog except yellow (Electrical
+    Vault/Hazard, Generator) — yellow text on the white page background is
+    nearly invisible. Darken only that case; everything else passes through."""
+    r, g, b = col
+    if r > 0.85 and g > 0.65 and b < 0.3:
+        return (0.25, 0.19, 0.0)
+    return col
+
+
+# Where a symbol's tag/label text is positioned relative to its icon —
+# matches the official Calgary Fire Department symbol sheet exactly rather
+# than a single generic convention: shapes that are literal text-carrying
+# glyphs there (HAZ diamond, R triangle, FAAP/FACP/... boxes, the "E"/"W"/
+# "O2" inside a circle or badge, "Gen" filling the generator box) get their
+# tag centered ON the icon; the compass gets "N" printed above it; every
+# other (purely pictorial) icon keeps the tag below it.
+TAG_ON_ICON_SHAPES = {"diamond_text", "triangle_text", "textbox", "line_valve",
+                       "bolt", "elec_vault", "gen_box", "helmet", "keybox"}
+TAG_ABOVE_ICON_SHAPES = {"compass"}
+TAG_BELOW_ICON_SHAPES = {"arrow", "pull_hand", "flag", "cylinder", "standpipe", "gate_valve",
+                          "spray_head", "wall_break", "hose_reel", "wye", "hydrant", "cross_box",
+                          "phone", "gas_meter", "gas_cyl_diamond", "horn", "you_are_here"}
+
+
 SYMBOL_ICON_R_PT = 7.0   # fixed on-page radius for non-furniture symbol icons
 
 
-def _draw_symbol_icon_pdf(shp, defn, cx, cy, col, px_per_ft, rotation_deg=0.0):
+def _draw_symbol_icon_pdf(shp, defn, cx, cy, col, px_per_ft, rotation_deg=0.0, scale=1.0):
     """Mirrors SymbolItem.paint()'s per-shape drawing (same shape cases,
     same relative proportions) so the exported plan shows the actual icon —
     outlet ticks, switch dot, light X, camera trapezoid, etc — instead of a
     generic circle. Furniture (rect/circle/cabinet) draws at true scale
     using px_per_ft, exactly like on screen with PX_PER_FT.
 
+    `scale` uniformly enlarges the icon (both R and px_per_ft, which every
+    shape case below is expressed in terms of) — used by the Fire Safety
+    Plan export to make icons legible from a distance without touching the
+    regular floor-plan export's sizing.
+
     Returns the icon's (unrotated) half-height in points, so the caller can
     place a tag/label below it without guessing the icon's extent."""
     shape = defn.get("shape", "rect")
-    R = SYMBOL_ICON_R_PT
+    R = SYMBOL_ICON_R_PT * scale
+    px_per_ft = px_per_ft * scale
     white = (1, 1, 1)
     ang = math.radians(rotation_deg)
     ca, sa = math.cos(ang), math.sin(ang)
@@ -2154,8 +3681,26 @@ def _draw_symbol_icon_pdf(shp, defn, cx, cy, col, px_per_ft, rotation_deg=0.0):
         half_h = R*0.7
     elif shape == "rrect":
         half_h = R*0.65
+    elif shape in ("textbox", "gen_box"):
+        half_h = R*0.8
+    elif shape == "rect_outline":
+        half_h = R*0.7
+    elif shape == "triangle_text":
+        half_h = R*0.8
     elif shape == "wap":
         half_h = R + 4   # dot sits at +4, arcs extend to radius R above it
+    elif shape == "gate_valve":
+        half_h = R*0.95 if defn.get("pedestal") else R*0.6
+    elif shape == "horn":
+        half_h = R*1.05
+    elif shape == "hose_reel":
+        half_h = R*0.75 if defn.get("cabinet") else R*0.5
+    elif shape == "compass":
+        half_h = R*0.95
+    elif shape == "gas_meter":
+        half_h = R*1.15
+    elif shape == "cylinder":
+        half_h = R*1.05
 
     def pt(dx, dy):
         return fitz.Point(cx + dx*ca - dy*sa, cy + dx*sa + dy*ca)
@@ -2235,6 +3780,175 @@ def _draw_symbol_icon_pdf(shp, defn, cx, cy, col, px_per_ft, rotation_deg=0.0):
         sign = -1 if going_up else 1
         shp.draw_line(pt(0,tip_y), pt(-ah/2,tip_y-sign*ah)); shp.finish(color=col, width=1.0)
         shp.draw_line(pt(0,tip_y), pt(ah/2,tip_y-sign*ah)); shp.finish(color=col, width=1.0)
+    # ── Fire Safety Plan symbols (Calgary Fire Department set) ──────────────
+    elif shape == "arrow":
+        pts = [pt(-R,0), pt(R*0.4,-R*0.8), pt(R*0.4,-R*0.3), pt(R,-R*0.3),
+               pt(R,R*0.3), pt(R*0.4,R*0.3), pt(R*0.4,R*0.8)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+    elif shape == "pull_hand":
+        box = [pt(-R*0.9,-R),pt(-R*0.5,-R),pt(-R*0.5,R),pt(-R*0.9,R)]
+        shp.draw_polyline(box+[box[0]]); shp.finish(color=col, fill=col, width=1.0)
+        pts = [pt(-R*0.5,-R*0.3)]
+        for a in range(200, 341, 20):
+            rad = math.radians(a)
+            pts.append(pt(-R*0.1+R*0.35*math.cos(rad), -R*0.1+R*0.35*math.sin(rad)))
+        pts.append(pt(R*0.6, R*0.5))
+        shp.draw_polyline(pts); shp.finish(color=col, width=1.3)
+    elif shape == "flag":
+        bar = [pt(-R*0.75,-R),pt(-R*0.45,-R),pt(-R*0.45,R),pt(-R*0.75,R)]
+        shp.draw_polyline(bar+[bar[0]]); shp.finish(color=col, fill=col, width=1.0)
+        pennant = [pt(-R*0.45,-R*0.9),pt(R*0.65,-R*0.15),pt(R*0.1,R*0.35),pt(-R*0.45,R*0.55)]
+        shp.draw_polyline(pennant+[pennant[0]]); shp.finish(color=col, fill=col, width=1.0)
+    elif shape == "cylinder":
+        # Fire extinguisher: red body + black nozzle/handle assembly on top —
+        # mirrors SymbolItem.paint()'s "cylinder" case.
+        body = [pt(-R*0.5,-R*0.85),pt(R*0.5,-R*0.85),pt(R*0.5,R),pt(-R*0.5,R)]
+        shp.draw_polyline(body+[body[0]]); shp.finish(color=col, fill=col, width=1.0)
+        handle = [pt(-R*0.4,-R*1.05),pt(R*0.4,-R*1.05),pt(R*0.4,-R*0.87),pt(-R*0.4,-R*0.87)]
+        shp.draw_polyline(handle+[handle[0]]); shp.finish(color=(0.1,0.1,0.1), fill=(0.1,0.1,0.1), width=1.0)
+        shp.draw_line(pt(-R*0.55,-R*0.87), pt(-R*0.85,-R*0.55))
+        shp.finish(color=(0.1,0.1,0.1), width=1.4)
+    elif shape == "standpipe":
+        body = [pt(-R*0.85,-R),pt(-R*0.15,-R),pt(-R*0.15,R*0.9),pt(-R*0.85,R*0.9)]
+        shp.draw_polyline(body+[body[0]]); shp.finish(color=col, width=1.0)
+        port = [pt(-R*0.15,-R*0.35),pt(R*0.4,-R*0.35),pt(R*0.4,R*0.15),pt(-R*0.15,R*0.15)]
+        shp.draw_polyline(port+[port[0]]); shp.finish(color=col, width=1.0)
+        shp.draw_line(pt(R*0.75,-R*0.5), pt(R*0.75,R*0.1)); shp.finish(color=col, width=1.6)
+    elif shape == "gate_valve":
+        for xo in (-R*0.75, R*0.75):
+            vb = [pt(xo-R*0.25,-R*0.6),pt(xo+R*0.25,-R*0.6),pt(xo+R*0.25,R*0.6),pt(xo-R*0.25,R*0.6)]
+            shp.draw_polyline(vb+[vb[0]]); shp.finish(color=col, fill=col, width=1.0)
+        hb = [pt(-R*0.75,-R*0.22),pt(R*0.75,-R*0.22),pt(R*0.75,R*0.22),pt(-R*0.75,R*0.22)]
+        shp.draw_polyline(hb+[hb[0]]); shp.finish(color=col, fill=col, width=1.0)
+        shp.draw_circle(pt(0,0), R*0.3); shp.finish(color=col, fill=white, width=1.2)
+        if defn.get("pedestal"):
+            shp.draw_line(pt(0,R*0.6), pt(0,R*0.95)); shp.finish(color=col, width=2.0)
+    elif shape == "elec_vault":
+        sq = [pt(-R,-R),pt(R,-R),pt(R,R),pt(-R,R)]
+        shp.draw_polyline(sq+[sq[0]]); shp.finish(color=(0.1,0.1,0.1), fill=(0.965,0.769,0.059), width=1.2)
+        bolt = [pt(R*0.15,-R*0.9),pt(-R*0.3,R*0.05),pt(R*0.0,R*0.05),pt(-R*0.15,R*0.9),
+                pt(R*0.3,-R*0.05),pt(R*0.0,-R*0.05)]
+        shp.draw_polyline(bolt+[bolt[0]]); shp.finish(color=(0.1,0.1,0.1), fill=(0.1,0.1,0.1), width=0.5)
+        shp.draw_circle(pt(0,0), R*0.35); shp.finish(color=(0.1,0.1,0.1), fill=(0.965,0.769,0.059), width=1.0)
+    elif shape == "line_valve":
+        shp.draw_line(pt(-R*1.3,0), pt(-R*0.9,0)); shp.finish(color=col, width=2.2)
+        shp.draw_line(pt(R*0.9,0), pt(R*1.3,0)); shp.finish(color=col, width=2.2)
+        shp.draw_circle(pt(0,0), R*0.9); shp.finish(color=col, fill=white, width=1.3)
+    elif shape == "spray_head":
+        nb = [pt(-R*0.25,-R),pt(R*0.25,-R),pt(R*0.25,-R*0.3),pt(-R*0.25,-R*0.3)]
+        shp.draw_polyline(nb+[nb[0]]); shp.finish(color=col, fill=col, width=1.0)
+        for a in (-30,-10,10,30):
+            rad = math.radians(a)
+            shp.draw_line(pt(0,-R*0.3), pt(R*0.9*math.sin(rad), R*0.8))
+            shp.finish(color=col, width=1.0, dashes="[2 2] 0")
+    elif shape in ("diamond_text","triangle_text","circle_text","textbox","rect_outline"):
+        if shape == "diamond_text":
+            pts = [pt(0,-R),pt(R,0),pt(0,R),pt(-R,0)]
+            shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=white, width=1.0)
+        elif shape == "triangle_text":
+            pts = [pt(0,-R),pt(R,R*0.8),pt(-R,R*0.8)]
+            shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=white, width=1.0)
+        elif shape == "circle_text":
+            shp.draw_circle(pt(0,0), R); shp.finish(color=col, fill=white, width=1.0)
+        elif shape == "textbox":
+            poly_rect(R*2.6, R*1.6)
+        else:  # rect_outline
+            pts = [pt(-R*1.1,-R*0.7),pt(R*1.1,-R*0.7),pt(R*1.1,R*0.7),pt(-R*1.1,R*0.7)]
+            shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, width=1.0)
+    elif shape == "gas_cyl_diamond":
+        pts = [pt(0,-R),pt(R,0),pt(0,R),pt(-R,0)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+        cyl = [pt(-R*0.16,-R*0.55),pt(R*0.16,-R*0.55),pt(R*0.16,R*0.5),pt(-R*0.16,R*0.5)]
+        shp.draw_polyline(cyl+[cyl[0]]); shp.finish(color=col, fill=white, width=0.8)
+    elif shape == "gen_box":
+        rect = [pt(-R*1.3,-R*0.8),pt(R*1.3,-R*0.8),pt(R*1.3,R*0.8),pt(-R*1.3,R*0.8)]
+        shp.draw_polyline(rect+[rect[0]]); shp.finish(color=(0.1,0.1,0.1), fill=(0.965,0.769,0.059), width=1.2)
+    elif shape == "bolt":
+        pts = [pt(R*0.15,-R),pt(-R*0.4,R*0.1),pt(0,R*0.1),pt(-R*0.15,R),pt(R*0.4,-R*0.1),pt(0,-R*0.1)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+        shp.draw_circle(pt(0,0), R*0.32); shp.finish(color=col, fill=col, width=1.0)
+    elif shape == "trefoil":
+        sq = [pt(-R,-R),pt(R,-R),pt(R,R),pt(-R,R)]
+        shp.draw_polyline(sq+[sq[0]]); shp.finish(color=(0.1,0.1,0.1), fill=(0.1,0.1,0.1), width=1.0)
+        shp.draw_circle(pt(0,0), R*0.95); shp.finish(color=(0.1,0.1,0.1), fill=white, width=0.8)
+        for base_ang in (90, 210, 330):
+            wedge = [pt(0,0)]
+            for a in range(base_ang-30, base_ang+31, 10):
+                rad = math.radians(a)
+                wedge.append(pt(R*0.75*math.cos(rad), R*0.75*math.sin(rad)))
+            wedge.append(pt(0,0))
+            shp.draw_polyline(wedge); shp.finish(color=(0.1,0.1,0.1), fill=(0.1,0.1,0.1), width=0.5)
+        shp.draw_circle(pt(0,0), R*0.18); shp.finish(color=(0.1,0.1,0.1), fill=(0.1,0.1,0.1), width=1.0)
+    elif shape == "horn":
+        bar = [pt(-R*0.9,-R*0.35),pt(-R*0.6,-R*0.35),pt(-R*0.6,R*0.35),pt(-R*0.9,R*0.35)]
+        shp.draw_polyline(bar+[bar[0]]); shp.finish(color=col, fill=col, width=1.0)
+        for rad in (R*0.35, R*0.7, R*1.05):
+            pts = [pt(-R*0.5+rad*math.cos(math.radians(a)), rad*math.sin(math.radians(a)))
+                   for a in range(-50, 51, 10)]
+            shp.draw_polyline(pts); shp.finish(color=col, width=1.1)
+    elif shape == "wall_break":
+        shp.draw_line(pt(-R,0), pt(-R*0.3,0)); shp.finish(color=col, width=1.2)
+        shp.draw_line(pt(R*0.3,0), pt(R,0)); shp.finish(color=col, width=1.2)
+        arc_pts = [pt(R*0.3*math.cos(math.radians(a)), R*0.3*math.sin(math.radians(a))) for a in range(0,181,20)]
+        shp.draw_polyline(arc_pts); shp.finish(color=col, width=1.0)
+    elif shape == "hose_reel":
+        if defn.get("cabinet"):
+            box = [pt(-R,-R*0.75),pt(R,-R*0.75),pt(R,R*0.75),pt(-R,R*0.75)]
+            shp.draw_polyline(box+[box[0]]); shp.finish(color=col, width=1.2)
+        zig = [pt(-R*0.8,R*0.4)]
+        for i in range(1,6):
+            yx = R*0.4 if i % 2 == 0 else -R*0.35
+            zig.append(pt(-R*0.8+i*R*0.28, yx))
+        shp.draw_polyline(zig); shp.finish(color=col, width=1.6)
+        noz = [pt(R*0.55,-R*0.5),pt(R*0.85,-R*0.15),pt(R*0.55,0)]
+        shp.draw_polyline(noz+[noz[0]]); shp.finish(color=col, fill=col, width=1.0)
+    elif shape == "wye":
+        shp.draw_line(pt(0,R), pt(0,0)); shp.finish(color=col, width=1.4)
+        shp.draw_line(pt(0,0), pt(-R*0.7,-R)); shp.finish(color=col, width=1.4)
+        shp.draw_line(pt(0,0), pt(R*0.7,-R)); shp.finish(color=col, width=1.4)
+    elif shape == "hydrant":
+        cap_hex = defn.get("cap_color")
+        cap_col = tuple(int(cap_hex[i:i+2],16)/255.0 for i in (1,3,5)) if cap_hex else col
+        poly_body = [pt(-R*0.4,-R*0.2),pt(R*0.4,-R*0.2),pt(R*0.4,R),pt(-R*0.4,R)]
+        shp.draw_polyline(poly_body+[poly_body[0]])
+        shp.finish(color=col, fill=col, width=1.0)
+        shp.draw_line(pt(-R*0.6,0), pt(-R*0.9,0)); shp.finish(color=col, width=1.2)
+        shp.draw_line(pt(R*0.6,0), pt(R*0.9,0)); shp.finish(color=col, width=1.2)
+        shp.draw_circle(pt(0,-R*0.5), R*0.35); shp.finish(color=col, fill=cap_col, width=1.0)
+    elif shape == "compass":
+        shp.draw_circle(pt(0,R*0.1), R*0.75); shp.finish(color=(0.7,0.7,0.7), width=0.8)
+        shp.draw_line(pt(-R*0.75,R*0.1), pt(R*0.75,R*0.1)); shp.finish(color=(0.7,0.7,0.7), width=0.6)
+        pts = [pt(0,-R*0.85),pt(R*0.22,R*0.35),pt(0,R*0.15),pt(-R*0.22,R*0.35)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+        shp.draw_line(pt(0,R*0.35), pt(0,R*0.95)); shp.finish(color=col, width=1.5)
+    elif shape == "cross_box":
+        h1 = [pt(-R*0.15,-R*0.6),pt(R*0.15,-R*0.6),pt(R*0.15,R*0.6),pt(-R*0.15,R*0.6)]
+        shp.draw_polyline(h1+[h1[0]]); shp.finish(color=col, fill=col, width=0.5)
+        h2 = [pt(-R*0.6,-R*0.15),pt(R*0.6,-R*0.15),pt(R*0.6,R*0.15),pt(-R*0.6,R*0.15)]
+        shp.draw_polyline(h2+[h2[0]]); shp.finish(color=col, fill=col, width=0.5)
+    elif shape == "phone":
+        pts = [pt(-R*0.7,-R*0.9),pt(-R*0.2,-R*0.5),pt(-R*0.35,-R*0.25),pt(R*0.05,R*0.15),
+               pt(R*0.35,-R*0.05),pt(R*0.75,R*0.35),pt(R*0.45,R*0.75),pt(R*0.0,R*0.4),
+               pt(-R*0.55,-R*0.15),pt(-R*0.9,-R*0.55)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+    elif shape == "gas_meter":
+        body = [pt(-R*0.8,-R*0.55),pt(R*0.8,-R*0.55),pt(R*0.8,R*0.55),pt(-R*0.8,R*0.55)]
+        shp.draw_polyline(body+[body[0]]); shp.finish(color=col, fill=col, width=1.0)
+        shp.draw_line(pt(-R*0.6,R*0.55), pt(-R*0.6,R)); shp.finish(color=col, width=2.0)
+        shp.draw_line(pt(R*0.6,R*0.55), pt(R*0.6,R)); shp.finish(color=col, width=2.0)
+        shp.draw_line(pt(-R*0.3,-R*0.55), pt(R*0.15,-R*1.15)); shp.finish(color=col, width=2.2)
+    elif shape == "keybox":
+        shp.draw_circle(pt(0,0), R); shp.finish(color=col, width=0.6)
+    elif shape == "helmet":
+        pts = [pt(-R,R*0.3),pt(-R*0.9,-R*0.1),pt(-R*0.5,-R*0.6),pt(0,-R*0.75),pt(R*0.5,-R*0.5),
+               pt(R*0.85,0),pt(R,R*0.3),pt(R*0.6,R*0.45),pt(-R*0.6,R*0.45)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+        shp.draw_circle(pt(0,-R*0.05), R*0.4); shp.finish(color=(0.35,0.35,0.35), fill=(0.83,0.83,0.83), width=1.0)
+    elif shape == "you_are_here":
+        pts = [pt(0,-R*1.3),pt(R*0.9,R*0.2),pt(R*0.4,R*0.2),pt(R*0.4,R*1.1),
+               pt(-R*0.4,R*1.1),pt(-R*0.4,R*0.2),pt(-R*0.9,R*0.2)]
+        shp.draw_polyline(pts+[pts[0]]); shp.finish(color=col, fill=col, width=1.0)
+        half_h = R*1.3
     else:
         poly_rect(R*2, R*2)
 
@@ -2281,7 +3995,7 @@ def _append_symbol_legend_page(doc, scene, project_meta, sheet_title, visible):
             if state["y"] > ph - margin - 20:
                 new_page()
             defn = ALL_SYMBOL_DEFS[k]
-            col_hex = LAYER_COLORS.get(defn["layer"], "#333333")
+            col_hex = defn.get("color") or LAYER_COLORS.get(defn["layer"], "#333333")
             col = tuple(int(col_hex[i:i+2], 16)/255.0 for i in (1,3,5))
             cx, cy = margin + 14, state["y"] - 4
             swatch = state["page"].new_shape()
@@ -2292,10 +4006,13 @@ def _append_symbol_legend_page(doc, scene, project_meta, sheet_title, visible):
             swatch.commit()
             tag = defn.get("tag") or "".join(w[0] for w in defn["name"].split()[:2]).upper()
             state["page"].insert_text(fitz.Point(margin+28, state["y"]), tag,
-                                       fontsize=7.5, fontname="helv", color=col)
+                                       fontsize=7.5, fontname="helv", color=_legible_tag_color(col))
             state["page"].insert_text(fitz.Point(margin+70, state["y"]), defn["name"],
                                        fontsize=8.5, color=(0.1,0.1,0.1))
-            state["y"] += row_h
+            # Multi-line tags (e.g. "F.D.\nKEY") need extra row height or the
+            # next row's text overlaps the tag's second line.
+            state["y"] += row_h + tag.count("\n")*10
+
         state["y"] += 8
 
 
@@ -2459,6 +4176,74 @@ class PrintExportDialog(QDialog):
         region_bbox = (min_x,min_y,max_x,max_y) if self.region_combo.currentData()=="selection" else None
         return {"paper_key": paper_key, "orientation": orient, "feet_per_inch": fpi,
                 "region_bbox": region_bbox}
+
+
+class FireSafetyPlanExportDialog(QDialog):
+    """Export settings for the dedicated Fire Safety Plan sheet. Deliberately
+    simpler than PrintExportDialog — always one auto-fit page (room for the
+    on-page legend is reserved automatically, so there's no scale/region
+    choice to make) — but adds the two controls that actually matter for a
+    plan posted on a wall: how big the symbol icons and label text print."""
+    def __init__(self, scene, parent=None):
+        super().__init__(parent)
+        self.scene = scene
+        self.setWindowTitle("Export Fire Safety Plan"); self.setMinimumWidth(360)
+        l = QFormLayout(self); l.setSpacing(10); l.setContentsMargins(16,16,16,16)
+
+        self.paper_combo = QComboBox()
+        for k in PAPER_SIZES_IN:
+            self.paper_combo.addItem(k, k)
+        self.paper_combo.setCurrentText("ARCH D (24x36)" if "ARCH D (24x36)" in PAPER_SIZES_IN
+                                         else list(PAPER_SIZES_IN)[0])
+        l.addRow("Paper size:", self.paper_combo)
+
+        self.orient_combo = QComboBox()
+        self.orient_combo.addItem("Auto (best fit)", "auto")
+        self.orient_combo.addItem("Landscape", "landscape")
+        self.orient_combo.addItem("Portrait", "portrait")
+        l.addRow("Orientation:", self.orient_combo)
+
+        self.icon_scale_spin = QDoubleSpinBox()
+        self.icon_scale_spin.setRange(1.0, 4.0); self.icon_scale_spin.setSingleStep(0.1)
+        self.icon_scale_spin.setValue(2.0); self.icon_scale_spin.setSuffix("×")
+        l.addRow("Symbol icon size:", self.icon_scale_spin)
+
+        self.text_pt_spin = QSpinBox()
+        # Floor of 8pt keeps every label at/above the 0.10" (~7.2pt) minimum
+        # text height called for on posted Fire Safety Plans; raised the
+        # ceiling to 48pt so tags/room names can go large enough to read
+        # from across a room, not just up close.
+        self.text_pt_spin.setRange(8, 48); self.text_pt_spin.setValue(14)
+        self.text_pt_spin.setSuffix(" pt")
+        self.text_pt_spin.setToolTip("Code minimum is 0.10\" (~7.2pt) text height — this floors at 8pt.")
+        l.addRow("Label text size:", self.text_pt_spin)
+
+        note = QLabel("Always fits on one page — the on-page legend column's width is "
+                       "reserved automatically before the plan is scaled to fit.")
+        note.setWordWrap(True); note.setStyleSheet("color:#888;font-size:10px;")
+        l.addRow(note)
+
+        br = QHBoxLayout()
+        ok = QPushButton("Export PDF")
+        ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        ca = QPushButton("Cancel"); ca.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ca); br.addWidget(ok)
+        l.addRow(br)
+
+    def values(self):
+        min_x,min_y,max_x,max_y = self.scene.all_items_bbox_ft()
+        width_ft, height_ft = max(0.1,max_x-min_x), max(0.1,max_y-min_y)
+        paper_key = self.paper_combo.currentData()
+        pw_in, ph_in = PAPER_SIZES_IN[paper_key]
+        orient = self.orient_combo.currentData()
+        if orient == "auto":
+            fpi_land = best_fit_scale(width_ft, height_ft, max(pw_in,ph_in), min(pw_in,ph_in))
+            fpi_port = best_fit_scale(width_ft, height_ft, min(pw_in,ph_in), max(pw_in,ph_in))
+            orient = "landscape" if fpi_land <= fpi_port else "portrait"
+        return {"paper_key": paper_key, "orientation": orient,
+                "symbol_scale": self.icon_scale_spin.value(),
+                "text_pt": self.text_pt_spin.value()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3966,38 +5751,81 @@ class DrawingDesigner(QDialog):
         def _sep():
             s = QFrame(); s.setFrameShape(QFrame.VLine); s.setStyleSheet("color:#555;"); return s
 
-        self._wall_btn = _btn("📐 Draw Wall", self._toggle_wall_tool, color="#1a5276", checkable=True)
-        tbl.addWidget(self._wall_btn)
-        self._thickness_btn = _btn("Wall: 4.5\"", self._pick_wall_thickness)
-        tbl.addWidget(self._thickness_btn)
-        tbl.addWidget(_btn("▭ Add Rectangle Room", self._add_rect_room, color="#1a5276"))
-        self._snap_btn = _btn("Snap ON", self._toggle_snap, checkable=True); self._snap_btn.setChecked(True)
-        tbl.addWidget(self._snap_btn)
-        self._grid_btn = _btn("Grid ON", self._toggle_grid, checkable=True); self._grid_btn.setChecked(True)
-        tbl.addWidget(self._grid_btn)
+        # Floor Plan drawing tools — grouped behind one dropdown since every
+        # one of these only applies on the Floor Plan tab (see
+        # _on_tab_changed, which enables/disables the whole group at once
+        # instead of 6 separate buttons individually).
+        # Menus kept as self.* attributes (not locals) — Qt's C++ parent-
+        # child ownership is supposed to keep them alive on its own once
+        # attached via setMenu(), but a persisted Python reference is a
+        # cheap extra guard against the classic "menu/action + its
+        # connected lambda got garbage-collected out from under Qt" crash.
+        self._fp_tools_btn = HoverMenuButton("Floor Plan Tools ▾", color="#1a5276")
+        self._fp_menu = QMenu(self._fp_tools_btn); self._fp_menu.setStyleSheet(TOOLBAR_MENU_STYLE)
+        self._wall_btn = self._fp_menu.addAction("📐 Draw Wall")
+        self._wall_btn.setCheckable(True); self._wall_btn.triggered.connect(self._toggle_wall_tool)
+        self._thickness_btn = self._fp_menu.addAction("Wall: 4.5\"")
+        self._thickness_btn.triggered.connect(self._pick_wall_thickness)
+        self._fp_menu.addAction("▭ Add Rectangle Room").triggered.connect(self._add_rect_room)
+        self._fp_menu.addSeparator()
+        self._snap_btn = self._fp_menu.addAction("Snap ON")
+        self._snap_btn.setCheckable(True); self._snap_btn.setChecked(True)
+        self._snap_btn.triggered.connect(self._toggle_snap)
+        self._grid_btn = self._fp_menu.addAction("Grid ON")
+        self._grid_btn.setCheckable(True); self._grid_btn.setChecked(True)
+        self._grid_btn.triggered.connect(self._toggle_grid)
+        self._fp_menu.addSeparator()
+        self._zone_btn = self._fp_menu.addAction("🟥 Draw Fire Zone")
+        self._zone_btn.setCheckable(True); self._zone_btn.triggered.connect(self._toggle_zone_tool)
+        self._fp_tools_btn.setMenu(self._fp_menu)
+        tbl.addWidget(self._fp_tools_btn)
+
+        # Background trace tools — also Floor-Plan-tab only.
+        self._bg_tools_btn = HoverMenuButton("Background Trace ▾", color="#7d3c98")
+        self._bg_menu = QMenu(self._bg_tools_btn); self._bg_menu.setStyleSheet(TOOLBAR_MENU_STYLE)
+        self._bg_menu.addAction("Import Background…").triggered.connect(self._import_background)
+        self._bg_calibrate_btn = self._bg_menu.addAction("Calibrate Scale")
+        self._bg_calibrate_btn.setCheckable(True); self._bg_calibrate_btn.triggered.connect(self._toggle_bg_calibrate)
+        self._bg_menu.addAction("Set Scale…").triggered.connect(self._set_bg_scale_manual)
+        self._bg_visible_btn = self._bg_menu.addAction("Background ON")
+        self._bg_visible_btn.setCheckable(True); self._bg_visible_btn.setChecked(True)
+        self._bg_visible_btn.triggered.connect(self._toggle_bg_visible)
+        self._bg_menu.addAction("Remove Background").triggered.connect(self._remove_background)
+        self._bg_tools_btn.setMenu(self._bg_menu)
+        tbl.addWidget(self._bg_tools_btn)
         tbl.addWidget(_sep())
+
         self._connect_btn = _btn("🔌 Connect Wires", self._toggle_connect_tool, color="#7d3c98", checkable=True)
         tbl.addWidget(self._connect_btn)
         tbl.addWidget(_sep())
-        self._add_loop_btn = _btn("+ SLC Loop", lambda: self._ol_add_circuit("slc"), color="#1a5276")
-        tbl.addWidget(self._add_loop_btn)
-        self._add_nac_btn = _btn("+ NAC Circuit", lambda: self._ol_add_circuit("nac"), color="#1a5276")
-        tbl.addWidget(self._add_nac_btn)
-        self._add_booster_btn = _btn("+ Booster", self._ol_add_booster, color="#7d3c98")
-        tbl.addWidget(self._add_booster_btn)
-        self._add_standalone_btn = _btn("+ Standalone NAC Circuit", lambda: self._ol_add_standalone_circuit("nac"),
-                                         color="#7d3c98")
+
+        # One-Line Diagram tools — grouped the same way; Connect Wires above
+        # stays its own button since it's the only Wiring-tab-specific tool
+        # (not worth a 1-item dropdown).
+        self._ol_tools_btn = HoverMenuButton("One-Line Tools ▾", color="#1a5276")
+        self._ol_menu = QMenu(self._ol_tools_btn); self._ol_menu.setStyleSheet(TOOLBAR_MENU_STYLE)
+        self._add_loop_btn = self._ol_menu.addAction("+ SLC Loop")
+        self._add_loop_btn.triggered.connect(lambda: self._ol_add_circuit("slc"))
+        self._add_nac_btn = self._ol_menu.addAction("+ NAC Circuit")
+        self._add_nac_btn.triggered.connect(lambda: self._ol_add_circuit("nac"))
+        self._add_booster_btn = self._ol_menu.addAction("+ Booster")
+        self._add_booster_btn.triggered.connect(self._ol_add_booster)
+        self._add_standalone_btn = self._ol_menu.addAction("+ Standalone NAC Circuit")
         self._add_standalone_btn.setToolTip(
             "A NAC circuit with no panel/booster box on this diagram — right-click it to set a\n"
             "free-text source label (e.g. \"Panel — NAC 3\") instead of drawing a connector line.")
-        tbl.addWidget(self._add_standalone_btn)
-        self._loading_btn = _btn("⚡ Check Loading", self._ol_check_loading, color="#c0392b")
-        tbl.addWidget(self._loading_btn)
+        self._add_standalone_btn.triggered.connect(lambda: self._ol_add_standalone_circuit("nac"))
+        self._ol_menu.addSeparator()
+        self._loading_btn = self._ol_menu.addAction("⚡ Check Loading")
+        self._loading_btn.triggered.connect(self._ol_check_loading)
+        self._ol_menu.addAction("Auto-Arrange").triggered.connect(self._ol_auto_arrange)
+        self._ol_menu.addAction("Import FQQ (.xlsm)").triggered.connect(self._import_fqq)
+        self._ol_tools_btn.setMenu(self._ol_menu)
+        tbl.addWidget(self._ol_tools_btn)
         tbl.addWidget(_sep())
-        tbl.addWidget(_btn("Auto-Arrange", self._ol_auto_arrange))
+
         tbl.addWidget(_btn("Fit View", self._fit))
         tbl.addWidget(_btn("Clear Tab", self._clear_current))
-        tbl.addWidget(_btn("Import FQQ (.xlsm)", self._import_fqq, color="#1a5276"))
         tbl.addWidget(_sep())
         tbl.addWidget(_btn("Project Info", self._edit_project_info))
         tbl.addWidget(_btn("New", self._new_project))
@@ -4006,6 +5834,7 @@ class DrawingDesigner(QDialog):
         tbl.addWidget(_btn("Save As", self._save_project_as))
         tbl.addWidget(_sep())
         tbl.addWidget(_btn("Export PDF", self._export_pdf, color="#c0392b"))
+        tbl.addWidget(_btn("🚨 Export Fire Safety Plan", self._export_fire_safety_plan, color="#922b21"))
         tbl.addWidget(_sep())
         tbl.addWidget(_btn("Help", self._show_help, color="#2c3e50"))
         tbl.addStretch()
@@ -4055,6 +5884,12 @@ class DrawingDesigner(QDialog):
         self._status.setStyleSheet("background:#efe6e1;color:#333;padding:4px 8px;font-size:10px;")
         main.addWidget(self._status)
 
+        # QTabWidget's own currentChanged(0) fires while adding the FIRST tab
+        # (before the connect() above even runs), so without this every
+        # tab-specific button/group starts out enabled regardless of which
+        # tab is actually active until the user manually switches tabs once.
+        self._on_tab_changed(self.tabs.currentIndex())
+
     # ── Status / mode plumbing ──────────────────────────────────────────────
 
     def _active_scene(self):
@@ -4065,8 +5900,13 @@ class DrawingDesigner(QDialog):
     def _on_tab_changed(self, idx):
         self.layer_panel.setVisible(idx == 0)
         self.palette.setVisible(idx in (0, 1))
+        self._fp_tools_btn.setEnabled(idx == 0)
+        self._bg_tools_btn.setEnabled(idx == 0)
+        self._ol_tools_btn.setEnabled(idx == 2)
         self._wall_btn.setEnabled(idx == 0); self._wall_btn.setChecked(False)
         self._thickness_btn.setEnabled(idx == 0)
+        self._zone_btn.setEnabled(idx == 0); self._zone_btn.setChecked(False)
+        self._bg_calibrate_btn.setEnabled(idx == 0); self._bg_calibrate_btn.setChecked(False)
         self._connect_btn.setEnabled(idx == 1); self._connect_btn.setChecked(False)
         for b in (self._add_loop_btn, self._add_nac_btn, self._add_booster_btn, self._loading_btn):
             b.setEnabled(idx == 2)
@@ -4095,16 +5935,112 @@ class DrawingDesigner(QDialog):
             self._connect_btn.setChecked(False)
         else:
             self._wall_btn.setChecked(False)
+            self._zone_btn.setChecked(False)
+            self._bg_calibrate_btn.setChecked(False)
         sc.set_mode_symbol(kind)
 
     def _toggle_wall_tool(self, checked):
         self.palette.clear_all()
         if checked:
             self._connect_btn.setChecked(False)
+            self._zone_btn.setChecked(False)
+            self._bg_calibrate_btn.setChecked(False)
             self.fp_scene.set_mode_wall(self.fp_scene.default_wall_thickness_in)
         else:
             self.fp_scene.set_mode_select()
             self._status.setText("  Select  ·  Scroll=zoom  ·  Middle-drag or Ctrl+drag=pan  ·  Del=delete  ·  Right-click=options  ·  Esc=cancel")
+
+    def _toggle_zone_tool(self, checked):
+        self.palette.clear_all()
+        if checked:
+            self._connect_btn.setChecked(False)
+            self._wall_btn.setChecked(False)
+            self._bg_calibrate_btn.setChecked(False)
+            self.fp_scene.set_mode_zone()
+        else:
+            self.fp_scene.set_mode_select()
+            self._status.setText("  Select  ·  Scroll=zoom  ·  Middle-drag or Ctrl+drag=pan  ·  Del=delete  ·  Right-click=options  ·  Esc=cancel")
+
+    def _import_background(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Background to Trace", "",
+            "Drawings (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp);;All Files (*)")
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".pdf"):
+                doc = fitz.open(path)
+                page_num = 0
+                if doc.page_count > 1:
+                    num, ok = QInputDialog.getInt(
+                        self, "Choose Page",
+                        f"This PDF has {doc.page_count} pages — which page do you want to trace?",
+                        1, 1, doc.page_count)
+                    if not ok:
+                        return
+                    page_num = num - 1
+                dpi = 150
+                pix = doc[page_num].get_pixmap(dpi=dpi)
+                fmt = QImage.Format_RGBA8888 if pix.alpha else QImage.Format_RGB888
+                qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
+                qpix = QPixmap.fromImage(qimg)
+                doc.close()
+            else:
+                qpix = QPixmap(path)
+                if qpix.isNull():
+                    raise ValueError("Couldn't read that as an image.")
+                dpi = 150
+            if qpix.isNull():
+                raise ValueError("Nothing rendered from that file.")
+            self.fp_scene.bg_pixmap = qpix
+            self.fp_scene.bg_dpi = dpi
+            self.fp_scene.bg_pos_ft = (0.0, 0.0)
+            self.fp_scene.bg_px_per_ft = 10.0
+            self.fp_scene.bg_visible = True
+            self._bg_visible_btn.setChecked(True)
+            self._bg_visible_btn.setText("Background ON")
+            self.fp_scene.update()
+            self._status.setText(
+                "  Background imported (not saved with the project — it's a tracing aid only). "
+                "Use 'Calibrate Scale' or 'Set Scale…' before tracing walls over it precisely.")
+        except Exception as e:
+            _log_error("_import_background", e)
+            QMessageBox.critical(self, "Import Failed", str(e))
+
+    def _toggle_bg_calibrate(self, checked):
+        self.palette.clear_all()
+        if checked:
+            self._wall_btn.setChecked(False); self._zone_btn.setChecked(False)
+            self._connect_btn.setChecked(False)
+            self.fp_scene.set_mode_bg_calibrate()
+        else:
+            self.fp_scene.set_mode_select()
+            self._status.setText("  Select  ·  Scroll=zoom  ·  Middle-drag or Ctrl+drag=pan  ·  Del=delete  ·  Right-click=options  ·  Esc=cancel")
+
+    def _set_bg_scale_manual(self):
+        if self.fp_scene.bg_pixmap is None:
+            QMessageBox.information(self, "Set Scale", "Import a background image/PDF first.")
+            return
+        labels = [lbl for lbl, _fpi in SCALE_OPTIONS]
+        label, ok = QInputDialog.getItem(
+            self, "Set Background Scale",
+            "Architectural scale the imported drawing was printed at:", labels, 0, False)
+        if not ok:
+            return
+        fpi = dict(SCALE_OPTIONS)[label]
+        self.fp_scene.bg_px_per_ft = self.fp_scene.bg_dpi / fpi
+        self.fp_scene.update()
+        self._status.setText(f"  Background scale set to {label}. Fine-tune with 'Calibrate Scale' if it's still off.")
+
+    def _toggle_bg_visible(self, checked):
+        self.fp_scene.bg_visible = checked
+        self._bg_visible_btn.setText("Background ON" if checked else "Background OFF")
+        self.fp_scene.update()
+
+    def _remove_background(self):
+        self.fp_scene.bg_pixmap = None
+        self.fp_scene.update()
+        self._status.setText("  Background removed.")
 
     def _add_rect_room(self):
         center = self.fp_canvas.mapToScene(self.fp_canvas.viewport().rect().center())
@@ -4121,6 +6057,8 @@ class DrawingDesigner(QDialog):
         self.palette.clear_all()
         if checked:
             self._wall_btn.setChecked(False)
+            self._zone_btn.setChecked(False)
+            self._bg_calibrate_btn.setChecked(False)
             self.wire_scene.set_mode_connect()
         else:
             self.wire_scene.set_mode_select()
@@ -4352,6 +6290,67 @@ class DrawingDesigner(QDialog):
             _log_error("_export_pdf", e)
             QMessageBox.critical(self, "Export Failed", str(e))
 
+    def _export_fire_safety_plan(self):
+        """Dedicated export for the code-required Fire Safety Plan / 'You Are
+        Here' evacuation diagram — reuses the same Floor Plan geometry as a
+        regular export (so walls/rooms stay single-sourced), but forces the
+        Fire Safety Plan layer on, requires a 'You Are Here' marker be placed
+        first, and titles/names the sheet distinctly from a generic export."""
+        if self.tabs.currentIndex() != 0:
+            self.tabs.setCurrentIndex(0)
+        scene = self.fp_scene
+        if not scene._wall_items and not scene._symbol_items:
+            QMessageBox.information(self, "Nothing to Export",
+                                     "Draw the building's walls/rooms and place Fire Safety Plan "
+                                     "symbols first.")
+            return
+        has_you_are_here = any(s.kind == "fsp_you_are_here" for s in scene._symbol_items)
+        if not has_you_are_here:
+            ans = QMessageBox.question(
+                self, "Missing 'You Are Here' Marker",
+                "No 'You Are Here' marker has been placed on this plan. A Fire Safety Plan "
+                "normally requires one at every posted location.\n\n"
+                "Export anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+        if not scene._zone_items:
+            ans = QMessageBox.question(
+                self, "No Fire Zones Drawn",
+                "No fire zone / separation boundaries have been drawn. If this building isn't "
+                "zoned that's fine — otherwise draw them with the Fire Zone tool first.\n\n"
+                "Export anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ans != QMessageBox.Yes:
+                return
+        dlg = FireSafetyPlanExportDialog(scene, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        cust = self._project_meta.get("customer","Fire_Safety_Plan") or "Fire_Safety_Plan"
+        bad = re.compile(r'[<>:"/\\|?*\s]+')
+        default_name = bad.sub("_", cust) + "_FireSafetyPlan.pdf"
+        path = os.path.join(_submittals_dir(), default_name)
+        path, _ = QFileDialog.getSaveFileName(self, "Export Fire Safety Plan PDF", path, "PDF Files (*.pdf)")
+        if not path:
+            return
+        was_fire_visible = scene.layers_visible.get(LAYER_FIRE, True)
+        scene.layers_visible[LAYER_FIRE] = True
+        try:
+            export_fire_safety_plan_pdf(scene, path, vals["paper_key"], vals["orientation"],
+                                         self._project_meta, sheet_title="FIRE SAFETY PLAN",
+                                         symbol_scale=vals["symbol_scale"], text_pt=vals["text_pt"])
+            QMessageBox.information(self, "Exported", f"PDF saved:\n{path}")
+            try:
+                os.startfile(path)
+            except Exception:
+                pass
+        except Exception as e:
+            _log_error("_export_fire_safety_plan", e)
+            QMessageBox.critical(self, "Export Failed", str(e))
+        finally:
+            scene.layers_visible[LAYER_FIRE] = was_fire_visible
+
     def _export_oneline_pdf(self):
         if len(self.oneline_scene.all_nodes()) <= 1 and not self.oneline_scene.standalone:
             QMessageBox.information(self, "Nothing to Export", "Add a loop, NAC circuit, or booster first.")
@@ -4366,28 +6365,9 @@ class DrawingDesigner(QDialog):
                 pass
 
     def _show_help(self):
-        QMessageBox.information(self, "Drawing Designer — Quick Help",
-            "WALLS\n"
-            "  • Click 'Draw Wall', click to start, click each corner.\n"
-            "  • Type a number then Enter to set the exact length of the segment\n"
-            "    you're drawing (e.g. 12, 12.5, 12'6\", 6\"). Angles snap to 45°.\n"
-            "  • Click back near your start point to close the room automatically —\n"
-            "    you'll be prompted for a name and ceiling height.\n"
-            "  • Double-click or Enter (no typed length) to finish an open wall run.\n\n"
-            "SYMBOLS\n"
-            "  • Pick a symbol from the right-hand palette, then click the canvas.\n"
-            "  • Doors/Windows snap onto the nearest wall automatically.\n\n"
-            "LAYERS\n"
-            "  • Toggle visibility per trade on the left panel — this also controls\n"
-            "    what's included when you export to PDF.\n\n"
-            "EXPORT\n"
-            "  • Export PDF lets you pick paper size and either auto-fit the scale\n"
-            "    to the page or force a standard architectural/engineering scale.\n"
-            "  • Select items first and choose 'Current selection only' to print\n"
-            "    just a section of the plan.\n\n"
-            "WIRING DIAGRAM\n"
-            "  • Second tab — not to scale. Drop devices, then use 'Connect Wires'\n"
-            "    and click two devices to wire them (right-click a wire to label it).")
+        from help_system import HelpDialog, DRAWING_DESIGNER_MANUAL
+        dlg = HelpDialog(DRAWING_DESIGNER_MANUAL, "Drawing Designer", self)
+        dlg.exec_()
 
     def closeEvent(self, event):
         if self._check_unsaved():

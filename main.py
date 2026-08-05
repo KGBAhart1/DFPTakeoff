@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (
     QScrollArea, QToolBar, QAction, QStatusBar, QAbstractItemView, QInputDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSlider, QMenu,
     QFrame, QProgressDialog, QShortcut, QSizePolicy, QCheckBox, QGroupBox, QLayout,
+    QToolButton,
 )
 from PyQt5.QtGui  import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySequence, QPolygonF
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QThread, pyqtSignal, QTimer
@@ -1426,11 +1427,91 @@ class FlowBar(QWidget):
     def setContentsMargins(self, *a):
         self._flow.setContentsMargins(*a)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        h = self._flow.heightForWidth(self.width())
-        if h > 0 and self.minimumHeight() != h:
-            self.setMinimumHeight(h); self.setMaximumHeight(h)
+
+MENU_STYLE = ("QMenu { background:#232728; color:#efe6e1; border:1px solid #555; }"
+              "QMenu::item { padding:8px 24px; }"
+              "QMenu::item:selected { background:#ff7002; color:white; }")
+
+
+class HoverMenuButton(QToolButton):
+    """Toolbar dropdown that opens its menu on hover (mouse-enter) as well as
+    click — groups a cluster of related actions (e.g. the 3 designer tools,
+    or the 3 quote types) behind one button instead of each sitting as its
+    own always-visible toolbar action. Click-to-open still works via
+    InstantPopup; hover is layered on top so the group reads as a single
+    discoverable menu rather than 3+ separate buttons cluttering the bar."""
+    _instances = []
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setPopupMode(QToolButton.InstantPopup)
+        self.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        HoverMenuButton._instances.append(self)
+
+    def _close_sibling_menus(self):
+        # Clicking or hovering onto one dropdown while a sibling's menu is
+        # still open let Qt forward that same click into the new popup as
+        # part of its native "click outside closes popup" handling, which
+        # nested our showMenu() inside the still-unwinding first popup's
+        # call stack and crashed. Closing any other open menu of ours
+        # synchronously, before Qt gets a chance to do that forwarding,
+        # keeps only one of our popups active at a time.
+        for other in HoverMenuButton._instances:
+            if other is not self:
+                m = other.menu()
+                if m is not None and m.isVisible():
+                    m.hide()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Do NOT call super().mousePressEvent() here — with InstantPopup
+            # that calls showMenu() synchronously, and when a sibling's menu
+            # is already open, Qt can redeliver this same click into this
+            # button while still unwinding the sibling's own popup call
+            # stack (the "click one dropdown to switch straight to another"
+            # behavior). Opening a second menu synchronously in that window
+            # nests one popup's event loop inside the other's and crashes.
+            # Deferring to the next event-loop tick lets the sibling's
+            # popup finish closing first.
+            event.accept()
+            self._close_sibling_menus()
+            QTimer.singleShot(0, self._open_menu_now)
+            return
+        super().mousePressEvent(event)
+
+    def _open_menu_now(self):
+        menu = self.menu()
+        if menu is not None and not menu.isVisible():
+            self.showMenu()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        # Defer to the next event-loop tick instead of calling showMenu()
+        # synchronously here — enterEvent can fire while another popup is
+        # still tearing down its own mouse-grab, and calling showMenu()
+        # inline in that window is what was crashing the app on dismiss.
+        QTimer.singleShot(0, self._maybe_show_menu)
+
+    def _maybe_show_menu(self):
+        menu = self.menu()
+        if menu is not None and not menu.isVisible() and self.underMouse():
+            self._close_sibling_menus()
+            self.showMenu()
+
+
+class MultiCheckMenu(QMenu):
+    """A QMenu that stays open after clicking a checkable item — for a group
+    of independent on/off toggles (e.g. the per-type coverage-circle
+    visibility layers) where closing after every single click would make
+    turning on/off several of them tedious. Non-checkable items still close
+    the menu as normal."""
+    def mouseReleaseEvent(self, event):
+        action = self.activeAction()
+        if action is not None and action.isCheckable():
+            action.trigger()
+            return
+        super().mouseReleaseEvent(event)
 
 
 #
@@ -2259,38 +2340,45 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         a = QAction("Export PDF", self); a.triggered.connect(self._export_pdf_menu); tb.addAction(a)
         tb.addSeparator()
-        a = QAction("Suppression Designer", self)
+        # "Designers" groups the 3 design tools behind one dropdown (opens on
+        # hover or click) instead of each sitting as its own always-visible
+        # toolbar button — same idea applied below to "Quotes".
+        # Kept as self.* attributes (not locals) so nothing about them is
+        # eligible for Python-side garbage collection once _build_toolbar()
+        # returns — Qt's C++ parent-child ownership alone is supposed to be
+        # enough, but a persisted Python reference is a cheap extra guard
+        # against the classic "menu/action + its connected lambda got GC'd
+        # out from under Qt" crash class.
+        self._designers_btn = HoverMenuButton("Designers ▾")
+        self._designers_menu = QMenu(self._designers_btn); self._designers_menu.setStyleSheet(MENU_STYLE)
+        a = self._designers_menu.addAction("Suppression Designer")
         a.triggered.connect(self._open_suppression_designer)
-        tb.addAction(a)
-
-        a = QAction("Paint Booth Designer", self)
+        a = self._designers_menu.addAction("Paint Booth Designer")
         a.setToolTip("Design dry chemical suppression for vehicle spray booths (Badger Industry Guard)")
         a.triggered.connect(self._open_paint_booth_designer)
-        tb.addAction(a)
-
-        a = QAction("Drawing Designer", self)
+        a = self._designers_menu.addAction("Drawing Designer")
         a.setToolTip("Draw scaled floor plans, place electrical/low-voltage/furniture symbols, "
                      "and export quote-ready PDFs. Includes freeform wiring diagram and fire "
                      "alarm one-line diagram tabs.")
         a.triggered.connect(self._open_drawing_designer)
-        tb.addAction(a)
+        self._designers_btn.setMenu(self._designers_menu)
+        tb.addWidget(self._designers_btn)
 
         # ── Estimating ────────────────────────────────────────────────────
         tb.addSeparator()
-        a = QAction("PMA Quote", self)
+        self._quotes_btn = HoverMenuButton("Quotes ▾")
+        self._quotes_menu = QMenu(self._quotes_btn); self._quotes_menu.setStyleSheet(MENU_STYLE)
+        a = self._quotes_menu.addAction("PMA Quote")
         a.setToolTip("Build a PMA inspection quote for all fire protection disciplines")
         a.triggered.connect(self._open_pma_quote)
-        tb.addAction(a)
-
-        a = QAction("Install Estimate", self)
+        a = self._quotes_menu.addAction("Install Estimate")
         a.setToolTip("Build an installation estimate with material takeoff and labour hours")
         a.triggered.connect(self._open_install_estimate)
-        tb.addAction(a)
-
-        a = QAction("Programming", self)
+        a = self._quotes_menu.addAction("Programming")
         a.setToolTip("Calculate programming and V.I. hours and sell price")
         a.triggered.connect(self._open_programming)
-        tb.addAction(a)
+        self._quotes_btn.setMenu(self._quotes_menu)
+        tb.addWidget(self._quotes_btn)
 
         # ── Design Mode ────────────────────────────────────────────────────
         tb.addSeparator()
@@ -2299,6 +2387,16 @@ class MainWindow(QMainWindow):
         self.design_action.triggered.connect(self._toggle_design_mode)
         tb.addAction(self.design_action)
 
+        # ── Measure tools ─────────────────────────────────────────────────
+        # 5 previously-separate buttons (scale calibration + the ad-hoc
+        # ruler/area scratch tools) behind one dropdown. A plain QMenu here
+        # (not MultiCheckMenu) closes after each pick — right, since picking
+        # one of these is "now go click on the canvas," not "toggle several
+        # flags in a row."
+        tb.addSeparator()
+        self._measure_btn = HoverMenuButton("Measure ▾")
+        self._measure_menu = QMenu(self._measure_btn); self._measure_menu.setStyleSheet(MENU_STYLE)
+
         self.measure_action = QAction("Measure on Drawing", self)
         self.measure_action.setCheckable(True)
         self.measure_action.setToolTip(
@@ -2306,15 +2404,14 @@ class MainWindow(QMainWindow):
             "then enter the real-world length to set the scale."
         )
         self.measure_action.triggered.connect(self._start_measure)
-        tb.addAction(self.measure_action)
+        self._measure_menu.addAction(self.measure_action)
 
         a = QAction("Set Scale…", self)
         a.setToolTip("Enter a scale ratio (e.g. 1:100) to calibrate coverage circles.")
         a.triggered.connect(self._set_scale_ratio)
-        tb.addAction(a)
+        self._measure_menu.addAction(a)
 
-        # ── Ad-hoc ruler / area tool ─────────────────────────────────────────
-        tb.addSeparator()
+        self._measure_menu.addSeparator()
         self.measure_length_action = QAction("Measure Length", self)
         self.measure_length_action.setCheckable(True)
         self.measure_length_action.setToolTip(
@@ -2323,7 +2420,7 @@ class MainWindow(QMainWindow):
             "This is a scratch measurement, not a counted takeoff item."
         )
         self.measure_length_action.triggered.connect(lambda c: self._toggle_measure("length", c))
-        tb.addAction(self.measure_length_action)
+        self._measure_menu.addAction(self.measure_length_action)
 
         self.measure_area_action = QAction("Measure Area", self)
         self.measure_area_action.setCheckable(True)
@@ -2334,24 +2431,32 @@ class MainWindow(QMainWindow):
             "This is a scratch measurement, not a counted takeoff item."
         )
         self.measure_area_action.triggered.connect(lambda c: self._toggle_measure("area", c))
-        tb.addAction(self.measure_area_action)
+        self._measure_menu.addAction(self.measure_area_action)
 
         a = QAction("Clear Measurements (page)", self)
         a.triggered.connect(self.canvas.clear_measurements_current_page)
-        tb.addAction(a)
+        self._measure_menu.addAction(a)
+
+        self._measure_btn.setMenu(self._measure_menu)
+        tb.addWidget(self._measure_btn)
 
         self.canvas.measurement_completed.connect(self._on_measurement_completed)
 
-        # Per-type coverage toggles
+        # Per-type coverage toggles — MultiCheckMenu so turning several
+        # layers on/off doesn't require reopening the dropdown each time.
         tb.addSeparator()
+        self._coverage_btn = HoverMenuButton("Coverage ▾")
+        self._coverage_menu = MultiCheckMenu(self._coverage_btn); self._coverage_menu.setStyleSheet(MENU_STYLE)
         self._cov_toggles = {}
         for ctype, label in COVERAGE_LABELS.items():
             act = QAction(label, self)
             act.setCheckable(True)
             act.setChecked(True)
             act.triggered.connect(lambda checked, t=ctype: self._toggle_coverage_type(t, checked))
-            tb.addAction(act)
+            self._coverage_menu.addAction(act)
             self._cov_toggles[ctype] = act
+        self._coverage_btn.setMenu(self._coverage_menu)
+        tb.addWidget(self._coverage_btn)
 
         # Help
         tb.addSeparator()

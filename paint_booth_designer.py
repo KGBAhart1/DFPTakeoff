@@ -1885,6 +1885,9 @@ class PaintBoothDesigner(QDialog):
         tb.addSeparator()
         fit_a = QAction("Fit View", self); fit_a.triggered.connect(self._canvas.fit if hasattr(self, "_canvas") else lambda: None)
         tb.addAction(fit_a)
+        tb.addSeparator()
+        help_a = QAction("Help", self); help_a.triggered.connect(self._show_help)
+        tb.addAction(help_a)
         root.addWidget(tb)
 
         # ── Main splitter ──
@@ -2181,6 +2184,11 @@ class PaintBoothDesigner(QDialog):
         dlg = PaintBoothProjectInfoDialog(self._project_meta, parent=self)
         if dlg.exec_() == QDialog.Accepted:
             self._project_meta = dlg.values()
+
+    def _show_help(self):
+        from help_system import HelpDialog, PAINT_BOOTH_MANUAL
+        dlg = HelpDialog(PAINT_BOOTH_MANUAL, "Paint Booth Designer", self)
+        dlg.exec_()
 
     # ── PDF Export ──────────────────────────────────────────────────────────
 
