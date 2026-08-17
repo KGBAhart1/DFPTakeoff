@@ -3579,11 +3579,16 @@ class MainWindow(QMainWindow):
         try:
             backup_path = os.path.splitext(self._pdf_path)[0] + "_backup.pdf"
             shutil.copy2(self._pdf_path, backup_path)
+            # fitz refuses to save a restructured (select()'d) document back
+            # over the exact path it was opened from — write to a scratch
+            # file first, then atomically swap it into place.
+            tmp_path = self._pdf_path + ".tmp"
             new_doc = fitz.open(self._pdf_path)   # fresh copy — self._doc stays untouched until this succeeds
             new_doc.select(kept)
-            new_doc.save(self._pdf_path, incremental=False)
+            new_doc.save(tmp_path)
             new_doc.close()
             self._doc.close()
+            os.replace(tmp_path, self._pdf_path)
             db.rewrite_page_data(self._project_id, self._pdf_path, kept)
             for new_idx, label in labels.items():
                 db.set_page_label(self._project_id, self._pdf_path, new_idx, label)

@@ -1,5 +1,5 @@
 {
-  "version": "1.4.0",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.4.0/DFP_TakeoffPro_Setup_1.4.0.exe",
-  "notes": "New in the Takeoff: Manage Pages to rename/delete pages on an uploaded print without needing consecutive selections; a Field Notes markup layer (styled text notes with a circle marker, plus arrow trace lines) that's independent of your device counts and can be included or hidden on export; a 'Build Submittal — No Counts' option to send shop drawings before a quote is done; Snips — pin a crop of any page (like a symbol legend) in its own floating, resizable window you can leave open across sessions; the device library now groups into collapsible category/subcategory dropdowns you define yourself; and per-device Candela tracking (15/30/75/110/135/177/185cd) set independently on each placed strobe, with a Candela Load Summary on export that can be scoped to selected sections."
+  "version": "1.4.1",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.4.1/DFP_TakeoffPro_Setup_1.4.1.exe",
+  "notes": "Fix Manage Pages: renaming or deleting pages on an uploaded print was failing with \"save to original must be incremental\" — PyMuPDF refuses to save a trimmed/reordered PDF back over the exact file it was opened from. Manage Pages now writes the result to a scratch file first and swaps it into place, so rename and delete both work correctly again."
 }
