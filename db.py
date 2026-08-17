@@ -141,6 +141,9 @@ def init_db():
     _safe_alter("ALTER TABLE products ADD COLUMN lu_diff REAL DEFAULT 0.0")
     _safe_alter("ALTER TABLE products ADD COLUMN lu_hard REAL DEFAULT 0.0")
     _safe_alter("ALTER TABLE products ADD COLUMN lu_id INTEGER DEFAULT NULL")
+    _safe_alter("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
+    _safe_alter("ALTER TABLE products ADD COLUMN candela REAL DEFAULT 0")   # default candela suggested for new placements
+    _safe_alter("ALTER TABLE marks ADD COLUMN candela REAL DEFAULT 0")     # actual per-placed-device candela — editable independently on each plot
     _seed_labour_units()
     _safe_alter("ALTER TABLE takeoff_items ADD COLUMN section_id INTEGER DEFAULT NULL")
     _safe_alter("ALTER TABLE takeoff_items ADD COLUMN notes TEXT DEFAULT ''")
@@ -182,6 +185,58 @@ def init_db():
                 FOREIGN KEY (assembly_id) REFERENCES assemblies(id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS page_labels (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  INTEGER NOT NULL,
+                pdf_path    TEXT    NOT NULL,
+                page_index  INTEGER NOT NULL,
+                label       TEXT    DEFAULT '',
+                UNIQUE(project_id, pdf_path, page_index) ON CONFLICT REPLACE,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS field_notes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  INTEGER NOT NULL,
+                pdf_path    TEXT    NOT NULL,
+                page_index  INTEGER NOT NULL DEFAULT 0,
+                page_x      REAL    NOT NULL,
+                page_y      REAL    NOT NULL,
+                text        TEXT    NOT NULL DEFAULT '',
+                color       TEXT    DEFAULT '#000000',
+                bold        INTEGER DEFAULT 0,
+                font_size   REAL    DEFAULT 10.0,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS field_lines (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  INTEGER NOT NULL,
+                pdf_path    TEXT    NOT NULL,
+                page_index  INTEGER NOT NULL DEFAULT 0,
+                points      TEXT    NOT NULL,
+                color       TEXT    DEFAULT '#000000',
+                width       REAL    DEFAULT 2.0,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_snips (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  INTEGER NOT NULL,
+                name        TEXT    NOT NULL,
+                image       BLOB    NOT NULL,
+                visible     INTEGER DEFAULT 0,
+                win_x       INTEGER DEFAULT 80,
+                win_y       INTEGER DEFAULT 80,
+                win_w       INTEGER DEFAULT 320,
+                win_h       INTEGER DEFAULT 240,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
         conn.commit()
 
 
@@ -203,18 +258,49 @@ def get_products():
         ).fetchall()
 
 
+def get_distinct_categories():
+    """Every category value actually in use, so custom groups the user has
+    typed (e.g. 'Hi-Ca Horn Strobes') show up as reusable options instead of
+    needing to be retyped identically each time."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM products WHERE category != '' ORDER BY category"
+        ).fetchall()
+        return [r["category"] for r in rows]
+
+
+def get_distinct_subcategories(category=None):
+    """Every subcategory value actually in use — the optional second level
+    of grouping inside a category (e.g. Category 'Horn Strobes', subcategory
+    'Wall Mount' / 'Ceiling Mount'). Pass a category to scope suggestions to
+    subcategories already used within it; omit for the full list."""
+    with get_conn() as conn:
+        if category:
+            rows = conn.execute(
+                "SELECT DISTINCT subcategory FROM products "
+                "WHERE subcategory != '' AND category=? ORDER BY subcategory",
+                (category,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT subcategory FROM products WHERE subcategory != '' ORDER BY subcategory"
+            ).fetchall()
+        return [r["subcategory"] for r in rows]
+
+
 def add_product(name, code="", unit_cost=0.0, category="General",
                 shop_drawing_path="", image_path="",
                 coverage_type="", coverage_radius_m=0.0,
-                lu_reg=0.0, lu_diff=0.0, lu_hard=0.0, lu_id=None):
+                lu_reg=0.0, lu_diff=0.0, lu_hard=0.0, lu_id=None,
+                subcategory="", candela=0.0):
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO products "
             "(name, code, unit_cost, category, shop_drawing_path, image_path, "
-            " coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, code, unit_cost, category, shop_drawing_path, image_path,
-             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id),
+             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela),
         )
         conn.commit()
 
@@ -222,15 +308,16 @@ def add_product(name, code="", unit_cost=0.0, category="General",
 def update_product(pid, name, code, unit_cost, category,
                    shop_drawing_path="", image_path="",
                    coverage_type="", coverage_radius_m=0.0,
-                   lu_reg=0.0, lu_diff=0.0, lu_hard=0.0, lu_id=None):
+                   lu_reg=0.0, lu_diff=0.0, lu_hard=0.0, lu_id=None,
+                   subcategory="", candela=0.0):
     with get_conn() as conn:
         conn.execute(
             "UPDATE products SET name=?,code=?,unit_cost=?,category=?,"
             "shop_drawing_path=?,image_path=?,"
             "coverage_type=?,coverage_radius_m=?,"
-            "lu_reg=?,lu_diff=?,lu_hard=?,lu_id=? WHERE id=?",
+            "lu_reg=?,lu_diff=?,lu_hard=?,lu_id=?,subcategory=?,candela=? WHERE id=?",
             (name, code, unit_cost, category, shop_drawing_path, image_path,
-             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, pid),
+             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela, pid),
         )
         conn.commit()
 
@@ -347,6 +434,10 @@ def delete_project(project_id):
         conn.execute("DELETE FROM marks WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM takeoff_items WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM sections WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM page_labels WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM field_notes WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM field_lines WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM pdf_snips WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
         conn.commit()
 
@@ -410,9 +501,22 @@ def get_takeoff_items(project_id, section_id=None):
             """, (project_id, section_id)).fetchall()
 
 
-def get_all_takeoff_items(project_id):
-    """All items across all sections (for export)."""
+def get_all_takeoff_items(project_id, section_ids=None):
+    """All items across all sections (for export). Pass section_ids (an
+    iterable of section id) to scope to just those sections instead."""
     with get_conn() as conn:
+        if section_ids:
+            placeholders = ",".join("?" * len(section_ids))
+            return conn.execute(f"""
+                SELECT p.id as product_id, p.name, p.code, p.unit_cost, p.category,
+                       p.shop_drawing_path,
+                       SUM(ti.count) as count
+                FROM takeoff_items ti
+                JOIN products p ON ti.product_id = p.id
+                WHERE ti.project_id=? AND ti.section_id IN ({placeholders})
+                GROUP BY p.id
+                ORDER BY p.category, p.name
+            """, (project_id, *section_ids)).fetchall()
         return conn.execute("""
             SELECT p.id as product_id, p.name, p.code, p.unit_cost, p.category,
                    p.shop_drawing_path,
@@ -474,15 +578,15 @@ def adjust_item_count(project_id, product_id, delta, section_id=None):
 # ── Marks ─────────────────────────────────────────────────────────────────────
 
 def add_mark(project_id, pdf_path, page_index, page_x, page_y,
-             entity_type, entity_id, color, label, section_id=None):
+             entity_type, entity_id, color, label, section_id=None, candela=0.0):
     with get_conn() as conn:
         cur = conn.execute("""
             INSERT INTO marks
                 (project_id, pdf_path, page_index, page_x, page_y,
-                 entity_type, entity_id, color, label, section_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
+                 entity_type, entity_id, color, label, section_id, candela)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """, (project_id, pdf_path, page_index, page_x, page_y,
-              entity_type, entity_id, color, label, section_id))
+              entity_type, entity_id, color, label, section_id, candela))
         conn.commit()
         return cur.lastrowid
 
@@ -490,6 +594,14 @@ def add_mark(project_id, pdf_path, page_index, page_x, page_y,
 def delete_mark(mark_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM marks WHERE id=?", (mark_id,))
+        conn.commit()
+
+
+def update_mark_candela(mark_id, candela):
+    """Each placed device's candela is independent of every other plot of
+    the same product — set/change it per mark, not per catalogue item."""
+    with get_conn() as conn:
+        conn.execute("UPDATE marks SET candela=? WHERE id=?", (candela, mark_id))
         conn.commit()
 
 
@@ -504,6 +616,30 @@ def get_marks(project_id, pdf_path=None):
             "SELECT * FROM marks WHERE project_id=? ORDER BY page_index",
             (project_id,),
         ).fetchall()
+
+
+def get_candela_breakdown(project_id, section_ids=None):
+    """Device count per candela rating across every placed mark in the
+    project (any page), for NAC circuit loading math on export. Pass
+    section_ids to scope to just those sections instead of the whole
+    project — unassigned (no-section) marks are excluded once a section
+    filter is applied, matching how the rest of the export is scoped."""
+    with get_conn() as conn:
+        if section_ids:
+            placeholders = ",".join("?" * len(section_ids))
+            rows = conn.execute(
+                f"SELECT candela, COUNT(*) as cnt FROM marks "
+                f"WHERE project_id=? AND candela > 0 AND section_id IN ({placeholders}) "
+                f"GROUP BY candela ORDER BY candela",
+                (project_id, *section_ids),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT candela, COUNT(*) as cnt FROM marks "
+                "WHERE project_id=? AND candela > 0 GROUP BY candela ORDER BY candela",
+                (project_id,),
+            ).fetchall()
+        return {r["candela"]: r["cnt"] for r in rows}
 
 
 def get_page_scale(project_id, pdf_path, page_index):
@@ -524,6 +660,73 @@ def set_page_scale(project_id, pdf_path, page_index, points_per_meter):
             "(project_id, pdf_path, page_index, pixels_per_meter) VALUES (?,?,?,?)",
             (project_id, pdf_path, page_index, points_per_meter),
         )
+        conn.commit()
+
+
+def get_page_label(project_id, pdf_path, page_index):
+    """Return the custom label for this page, or None if not set."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT label FROM page_labels WHERE project_id=? AND pdf_path=? AND page_index=?",
+            (project_id, pdf_path, page_index),
+        ).fetchone()
+        return row["label"] if row and row["label"] else None
+
+
+def set_page_label(project_id, pdf_path, page_index, label):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO page_labels "
+            "(project_id, pdf_path, page_index, label) VALUES (?,?,?,?)",
+            (project_id, pdf_path, page_index, label),
+        )
+        conn.commit()
+
+
+def get_page_labels(project_id, pdf_path):
+    """Return {page_index: label} for every labeled page of this PDF."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT page_index, label FROM page_labels WHERE project_id=? AND pdf_path=?",
+            (project_id, pdf_path),
+        ).fetchall()
+        return {r["page_index"]: r["label"] for r in rows if r["label"]}
+
+
+def rewrite_page_data(project_id, pdf_path, kept_old_indices):
+    """
+    Called after a PDF's pages have been trimmed/reordered (see
+    MainWindow._manage_pages). kept_old_indices lists the OLD page_index
+    values that survive, in their NEW left-to-right order — e.g. [0, 2, 5]
+    means old pages 0, 2, 5 survive and become new pages 0, 1, 2.
+
+    Deletes every row (marks, scale, runs, labels, field notes/lines) tied
+    to a page that was removed, and remaps page_index for surviving rows
+    so they still line up with their device/annotation on the trimmed PDF.
+    Two passes per table (delete, then update) avoid UNIQUE collisions on
+    page_scales/page_labels when a freed index is about to be reused by a
+    shifted-down row.
+    """
+    old_to_new = {old: new for new, old in enumerate(kept_old_indices)}
+    tables = ["marks", "page_scales", "linear_runs", "page_labels",
+              "field_notes", "field_lines"]
+    with get_conn() as conn:
+        placeholders = ",".join("?" * len(kept_old_indices))
+        for t in tables:
+            conn.execute(
+                f"DELETE FROM {t} WHERE project_id=? AND pdf_path=? "
+                f"AND page_index NOT IN ({placeholders})",
+                (project_id, pdf_path, *kept_old_indices),
+            )
+        for t in tables:
+            rows = conn.execute(
+                f"SELECT id, page_index FROM {t} WHERE project_id=? AND pdf_path=?",
+                (project_id, pdf_path),
+            ).fetchall()
+            for r in rows:
+                new_idx = old_to_new[r["page_index"]]
+                if new_idx != r["page_index"]:
+                    conn.execute(f"UPDATE {t} SET page_index=? WHERE id=?", (new_idx, r["id"]))
         conn.commit()
 
 
@@ -558,6 +761,136 @@ def delete_linear_run(run_id):
         conn.commit()
 
 
+# ── Field Notes (installer markup layer) ────────────────────────────────────────
+
+def add_field_note(project_id, pdf_path, page_index, page_x, page_y,
+                    text, color, bold, font_size):
+    with get_conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO field_notes
+                (project_id, pdf_path, page_index, page_x, page_y,
+                 text, color, bold, font_size)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """, (project_id, pdf_path, page_index, page_x, page_y,
+              text, color, int(bold), font_size))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_field_notes(project_id, pdf_path=None):
+    with get_conn() as conn:
+        if pdf_path:
+            return conn.execute(
+                "SELECT * FROM field_notes WHERE project_id=? AND pdf_path=? ORDER BY page_index",
+                (project_id, pdf_path),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM field_notes WHERE project_id=? ORDER BY page_index",
+            (project_id,),
+        ).fetchall()
+
+
+def update_field_note(note_id, text, color, bold, font_size):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE field_notes SET text=?, color=?, bold=?, font_size=? WHERE id=?",
+            (text, color, int(bold), font_size, note_id),
+        )
+        conn.commit()
+
+
+def delete_field_note(note_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM field_notes WHERE id=?", (note_id,))
+        conn.commit()
+
+
+def add_field_line(project_id, pdf_path, page_index, points_json, color, width):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO field_lines (project_id, pdf_path, page_index, points, color, width)"
+            " VALUES (?,?,?,?,?,?)",
+            (project_id, pdf_path, page_index, points_json, color, width),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_field_lines(project_id, pdf_path=None):
+    with get_conn() as conn:
+        if pdf_path:
+            return conn.execute(
+                "SELECT * FROM field_lines WHERE project_id=? AND pdf_path=? ORDER BY id",
+                (project_id, pdf_path),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM field_lines WHERE project_id=? ORDER BY id",
+            (project_id,),
+        ).fetchall()
+
+
+def delete_field_line(line_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM field_lines WHERE id=?", (line_id,))
+        conn.commit()
+
+
+# ── PDF Snips — pinned reference crops (e.g. a symbol legend on another page) ───
+
+def add_snip(project_id, name, image_bytes, win_x=80, win_y=80, win_w=320, win_h=240, visible=1):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO pdf_snips (project_id, name, image, visible, win_x, win_y, win_w, win_h)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (project_id, name, sqlite3.Binary(image_bytes), visible, win_x, win_y, win_w, win_h),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_snips(project_id):
+    """List of snips (no image blob — use get_snip_image for that) for menu/list building."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, name, visible, win_x, win_y, win_w, win_h FROM pdf_snips "
+            "WHERE project_id=? ORDER BY name",
+            (project_id,),
+        ).fetchall()
+
+
+def get_snip_image(snip_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT image FROM pdf_snips WHERE id=?", (snip_id,)).fetchone()
+        return bytes(row["image"]) if row else None
+
+
+def rename_snip(snip_id, name):
+    with get_conn() as conn:
+        conn.execute("UPDATE pdf_snips SET name=? WHERE id=?", (name, snip_id))
+        conn.commit()
+
+
+def set_snip_visible(snip_id, visible):
+    with get_conn() as conn:
+        conn.execute("UPDATE pdf_snips SET visible=? WHERE id=?", (int(visible), snip_id))
+        conn.commit()
+
+
+def update_snip_geometry(snip_id, x, y, w, h):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE pdf_snips SET win_x=?, win_y=?, win_w=?, win_h=? WHERE id=?",
+            (x, y, w, h, snip_id),
+        )
+        conn.commit()
+
+
+def delete_snip(snip_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM pdf_snips WHERE id=?", (snip_id,))
+        conn.commit()
+
+
 def get_assembly_footage(project_id, assembly_id):
     with get_conn() as conn:
         row = conn.execute(
@@ -588,10 +921,10 @@ def move_section_count(project_id, product_id, qty, from_section_id, to_section_
 
 
 def get_section_breakdown(project_id):
-    """Returns rows of (section_name, product_name, code, count) for reporting."""
+    """Returns rows of (section_id, section_name, product_name, code, count) for reporting."""
     with get_conn() as conn:
         return conn.execute("""
-            SELECT s.name as section_name, p.name as product_name, p.code,
+            SELECT s.id as section_id, s.name as section_name, p.name as product_name, p.code,
                    p.category, ti.count
             FROM takeoff_items ti
             JOIN products p ON ti.product_id = p.id

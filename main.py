@@ -1,7 +1,7 @@
 """
 DFP TakeoffPro - Defense Fire Protection
 """
-import sys, os, csv
+import sys, os, csv, shutil
 import fitz
 from version import APP_NAME, APP_VERSION
 
@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
     QScrollArea, QToolBar, QAction, QStatusBar, QAbstractItemView, QInputDialog,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QSlider, QMenu,
     QFrame, QProgressDialog, QShortcut, QSizePolicy, QCheckBox, QGroupBox, QLayout,
-    QToolButton,
+    QToolButton, QColorDialog, QTreeWidget, QTreeWidgetItem,
 )
 from PyQt5.QtGui  import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySequence, QPolygonF
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QThread, pyqtSignal, QTimer
@@ -28,6 +28,8 @@ CATEGORIES = [
     "Detectors","Notification","Control Panels","Modules",
     "Initiating Devices","Suppression","Exit/Emergency","Misc","General",
 ]
+
+CANDELA_OPTIONS = [15, 30, 75, 110, 135, 177, 185]
 
 # ── Coverage rules: ULC S524 + National Fire Code of Canada (NFC overrides S524) ──
 # Radii = √(max_area / π).  NFC 2010 Table 2.5.4.1 / ULC S524 Cl. 6.5 & 6.7.
@@ -82,6 +84,27 @@ def color_for_id(eid):
     return MARK_COLORS[int(eid) % len(MARK_COLORS)]
 
 
+def _arrow_wings(fx, fy, tx, ty, size=10, spread_deg=25):
+    """Given a line from (fx,fy) to (tx,ty), return the two wing-tip points
+    of an arrowhead at (tx,ty) — pure geometry, coordinate-system agnostic
+    (used both for the on-screen QPainter preview, scaled by zoom, and for
+    the unscaled PDF export via fitz)."""
+    import math
+    dx, dy = tx - fx, ty - fy
+    length = math.hypot(dx, dy)
+    if length < 1e-6:
+        return None
+    ux, uy = -dx / length, -dy / length   # unit vector pointing back along the line
+    ang = math.radians(spread_deg)
+    wings = []
+    for sign in (1, -1):
+        a = ang * sign
+        wx = ux * math.cos(a) - uy * math.sin(a)
+        wy = ux * math.sin(a) + uy * math.cos(a)
+        wings.append((tx + wx * size, ty + wy * size))
+    return wings
+
+
 def _linear_mat_per_ft(assembly_id):
     """Return total material cost per foot for a linear assembly."""
     items = db.get_assembly_items(assembly_id)
@@ -97,10 +120,17 @@ class PdfCanvas(QLabel):
     pan_delta            = pyqtSignal(int, int)
     zoom_requested       = pyqtSignal(int, int, float)
     mark_deleted         = pyqtSignal(int, str, int)   # db_id, entity_type, entity_id
+    mark_candela_changed = pyqtSignal(int, float)      # db_id, candela — set independently per placed device
     scale_measured       = pyqtSignal(QPointF, QPointF) # two page-coord points
     linear_run_completed = pyqtSignal(int, float, str)  # assembly_id, footage, points_json
     run_deleted          = pyqtSignal(int, int)         # run_id, assembly_id
     measurement_completed = pyqtSignal(str, float)      # "length"|"area", value (ft or sq ft)
+    field_note_placed    = pyqtSignal(QPointF)          # click in note mode -> MainWindow opens style dialog
+    field_line_completed = pyqtSignal(str)              # points_json -> MainWindow persists
+    field_note_deleted   = pyqtSignal(int)              # db_id
+    field_line_deleted   = pyqtSignal(int)              # db_id
+    field_note_edit_requested = pyqtSignal(dict)        # note_dict -> MainWindow opens style dialog
+    snip_rect_selected   = pyqtSignal(QRectF)           # page-coord rect -> MainWindow captures + names it
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -146,6 +176,27 @@ class PdfCanvas(QLabel):
         self._measure_preview   = None
         # {(pdf_path, page_index): [{"type":"length"|"area","points":[...],"value":float}, ...]}
         self._page_measurements = {}
+        # Field Notes markup layer — independent of device marks/counts, so
+        # it can be shown/hidden and exported separately (see set_field_notes_visible).
+        self._field_note_mode = False
+        self._field_note_color = "#000000"
+        self._field_note_bold  = False
+        self._field_note_size  = 10.0
+        # {(pdf_path, page_index): [note_dict, ...]}
+        self._page_field_notes = {}
+        self._field_line_mode  = False
+        self._field_line_color = "#000000"
+        self._field_line_width = 2.0
+        self._field_line_points  = []
+        self._field_line_preview = None
+        # {(pdf_path, page_index): [line_dict, ...]}
+        self._page_field_lines = {}
+        self._field_notes_visible = True
+        # Snip tool — one-shot drag-rectangle selection to crop a reference
+        # image (e.g. a symbol legend) into its own floating window.
+        self._snip_mode = False
+        self._snip_start = None    # QPointF, page coords
+        self._snip_preview = None  # QPointF, page coords
 
     #  Public API
 
@@ -175,7 +226,7 @@ class PdfCanvas(QLabel):
 
     def add_mark(self, page_x, page_y, entity_type, entity_id,
                  color, label, db_id=None, section_id=None, repaint=True,
-                 coverage_type="", coverage_radius_m=0.0):
+                 coverage_type="", coverage_radius_m=0.0, candela=0.0):
         self._mark_counter += 1
         mark = dict(
             id=self._mark_counter, db_id=db_id,
@@ -183,6 +234,7 @@ class PdfCanvas(QLabel):
             entity_type=entity_type, entity_id=entity_id,
             color=color, label=label, section_id=section_id,
             coverage_type=coverage_type, coverage_radius_m=coverage_radius_m,
+            candela=candela,
         )
         key = (self._pdf_path, self._page_index)
         self._page_marks.setdefault(key, []).append(mark)
@@ -203,6 +255,7 @@ class PdfCanvas(QLabel):
                 section_id=m.get("section_id"),
                 coverage_type=m.get("coverage_type", ""),
                 coverage_radius_m=m.get("coverage_radius_m", 0.0),
+                candela=m.get("candela", 0.0),
             ))
         self._paint_overlay()
 
@@ -220,7 +273,17 @@ class PdfCanvas(QLabel):
                 section_id=m["section_id"],
                 coverage_type=m.get("coverage_type", ""),
                 coverage_radius_m=m.get("coverage_radius_m", 0.0),
+                candela=m.get("candela", 0.0) or 0.0,
             ))
+        self._paint_overlay()
+
+    def update_mark_candela(self, mark_id, candela):
+        """mark_id here is the DB id (see _find_nearest_mark/_on_right_click),
+        not the local per-session counter id."""
+        for marks in self._page_marks.values():
+            for m in marks:
+                if m["db_id"] == mark_id:
+                    m["candela"] = candela
         self._paint_overlay()
 
     def undo_last_mark(self):
@@ -316,6 +379,89 @@ class PdfCanvas(QLabel):
         self._linear_preview = None
         self._paint_overlay()
 
+    # ── Field Notes API ──────────────────────────────────────────────────────
+
+    def set_field_note_mode(self, enabled, color="#000000", bold=False, font_size=10.0):
+        self._field_note_mode = enabled
+        self._field_note_color = color
+        self._field_note_bold  = bold
+        self._field_note_size  = font_size
+        self._update_cursor()
+
+    def add_field_note(self, page_x, page_y, text, color, bold, font_size, db_id=None, repaint=True):
+        key = (self._pdf_path, self._page_index)
+        self._page_field_notes.setdefault(key, []).append(dict(
+            id=db_id, db_id=db_id, page_x=page_x, page_y=page_y,
+            text=text, color=color, bold=bold, font_size=font_size,
+        ))
+        if repaint:
+            self._paint_overlay()
+
+    def load_saved_field_notes(self, notes_from_db):
+        self._page_field_notes.clear()
+        for n in notes_from_db:
+            key = (n["pdf_path"], n["page_index"])
+            self._page_field_notes.setdefault(key, []).append(dict(
+                id=n["id"], db_id=n["id"], page_x=n["page_x"], page_y=n["page_y"],
+                text=n["text"], color=n["color"], bold=bool(n["bold"]), font_size=n["font_size"],
+            ))
+        self._paint_overlay()
+
+    def update_field_note_by_id(self, note_id, text, color, bold, font_size):
+        for notes in self._page_field_notes.values():
+            for n in notes:
+                if n["db_id"] == note_id:
+                    n["text"], n["color"], n["bold"], n["font_size"] = text, color, bold, font_size
+        self._paint_overlay()
+
+    def delete_field_note_by_id(self, note_id):
+        for key in list(self._page_field_notes.keys()):
+            self._page_field_notes[key] = [n for n in self._page_field_notes[key] if n["db_id"] != note_id]
+        self._paint_overlay()
+
+    def set_field_line_mode(self, enabled, color="#000000", width=2.0):
+        self._field_line_mode  = enabled
+        self._field_line_color = color
+        self._field_line_width = width
+        self._field_line_points  = []
+        self._field_line_preview = None
+        self._update_cursor()
+        self._paint_overlay()
+
+    def add_field_line(self, line_dict, repaint=True):
+        key = (line_dict["pdf_path"], line_dict["page_index"])
+        self._page_field_lines.setdefault(key, []).append(line_dict)
+        if repaint:
+            self._paint_overlay()
+
+    def load_saved_field_lines(self, lines_from_db):
+        self._page_field_lines.clear()
+        for l in lines_from_db:
+            key = (l["pdf_path"], l["page_index"])
+            self._page_field_lines.setdefault(key, []).append(dict(l))
+        self._paint_overlay()
+
+    def delete_field_line_by_id(self, line_id):
+        for key in list(self._page_field_lines.keys()):
+            self._page_field_lines[key] = [l for l in self._page_field_lines[key] if l["id"] != line_id]
+        self._paint_overlay()
+
+    def cancel_field_line_draw(self):
+        self._field_line_points = []
+        self._field_line_preview = None
+        self._paint_overlay()
+
+    def set_field_notes_visible(self, visible):
+        self._field_notes_visible = visible
+        self._paint_overlay()
+
+    def set_snip_mode(self, enabled):
+        self._snip_mode = enabled
+        self._snip_start = None
+        self._snip_preview = None
+        self._update_cursor()
+        self._paint_overlay()
+
     #  Internal
 
     def _render(self):
@@ -395,6 +541,21 @@ class PdfCanvas(QLabel):
             if m["label"]:
                 painter.setPen(QPen(QColor("#ffffff")))
                 painter.drawText(cx-R, cy-R, R*2, R*2, Qt.AlignCenter, m["label"])
+            candela = m.get("candela", 0)
+            if candela:
+                cd_font = QFont("Arial", max(6, R - 5), QFont.Bold)
+                painter.setFont(cd_font)
+                cd_text = f"{candela:g}cd"
+                fm = painter.fontMetrics()
+                tw = fm.horizontalAdvance(cd_text) + 4
+                th = fm.height()
+                tx, ty = cx + R + 2, cy - th // 2
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(0, 0, 0, 160))
+                painter.drawRect(tx, ty, tw, th)
+                painter.setPen(QPen(QColor("#ffff00")))
+                painter.drawText(tx, ty, tw, th, Qt.AlignCenter, cd_text)
+                painter.setFont(font)
 
         # ── Completed linear runs ─────────────────────────────────────────────
         import json as _json, math as _math
@@ -570,6 +731,91 @@ class PdfCanvas(QLabel):
                     painter.setPen(QPen(QColor("#ffff00")))
                     painter.drawText(lx, ly - lh, lw, lh, Qt.AlignCenter, lbl)
 
+        # ── Field Notes markup layer (independent of counts) ───────────────────
+        if self._field_notes_visible:
+            lines = self._page_field_lines.get((self._pdf_path, self._page_index), [])
+            for ln in lines:
+                try:
+                    pts = _json.loads(ln["points"])
+                except Exception:
+                    continue
+                if len(pts) < 2:
+                    continue
+                color = QColor(ln.get("color", "#000000"))
+                pen = QPen(color, ln.get("width", 2.0))
+                pen.setCapStyle(Qt.RoundCap)
+                pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                for i in range(1, len(pts)):
+                    painter.drawLine(int(pts[i-1]["x"]*self._zoom), int(pts[i-1]["y"]*self._zoom),
+                                     int(pts[i]["x"]*self._zoom), int(pts[i]["y"]*self._zoom))
+                # Arrowhead at the final point — trace lines point FROM the
+                # note TO whatever they're calling out.
+                wings = _arrow_wings(pts[-2]["x"]*self._zoom, pts[-2]["y"]*self._zoom,
+                                     pts[-1]["x"]*self._zoom, pts[-1]["y"]*self._zoom,
+                                     size=10 + ln.get("width", 2.0))
+                if wings:
+                    tx, ty = pts[-1]["x"]*self._zoom, pts[-1]["y"]*self._zoom
+                    for wx, wy in wings:
+                        painter.drawLine(int(tx), int(ty), int(wx), int(wy))
+
+            if self._field_line_mode and self._field_line_points:
+                draw_pts = self._field_line_points[:]
+                if self._field_line_preview:
+                    draw_pts.append(self._field_line_preview)
+                pen = QPen(QColor(self._field_line_color), self._field_line_width, Qt.DashLine)
+                pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                for i in range(1, len(draw_pts)):
+                    painter.drawLine(int(draw_pts[i-1].x()*self._zoom), int(draw_pts[i-1].y()*self._zoom),
+                                     int(draw_pts[i].x()*self._zoom), int(draw_pts[i].y()*self._zoom))
+                if len(draw_pts) >= 2:
+                    wings = _arrow_wings(draw_pts[-2].x()*self._zoom, draw_pts[-2].y()*self._zoom,
+                                         draw_pts[-1].x()*self._zoom, draw_pts[-1].y()*self._zoom,
+                                         size=10 + self._field_line_width)
+                    if wings:
+                        tx, ty = draw_pts[-1].x()*self._zoom, draw_pts[-1].y()*self._zoom
+                        for wx, wy in wings:
+                            painter.drawLine(int(tx), int(ty), int(wx), int(wy))
+                painter.setPen(QPen(QColor(self._field_line_color), 2))
+                painter.setBrush(QColor(self._field_line_color))
+                for pt in self._field_line_points:
+                    cx = int(pt.x() * self._zoom)
+                    cy = int(pt.y() * self._zoom)
+                    painter.drawEllipse(cx - 4, cy - 4, 8, 8)
+
+            notes = self._page_field_notes.get((self._pdf_path, self._page_index), [])
+            for n in notes:
+                note_color = QColor(n.get("color", "#000000"))
+                cx = int(n["page_x"]*self._zoom)
+                cy = int(n["page_y"]*self._zoom)
+                fsize = max(6, int(n.get("font_size", 10.0) * max(self._zoom, 0.5)))
+                f = QFont("Arial", fsize)
+                f.setBold(bool(n.get("bold")))
+                painter.setFont(f)
+                fm = painter.fontMetrics()
+                pad = 4
+                tw = fm.horizontalAdvance(n["text"]) + pad * 2
+                th = fm.height() + pad * 2
+                ex, ey = cx - tw // 2, cy - th // 2
+                painter.setPen(QPen(note_color, 2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(ex, ey, tw, th)
+                painter.setPen(QPen(note_color))
+                painter.drawText(ex, ey, tw, th, Qt.AlignCenter, n["text"])
+
+        # ── In-progress snip selection rectangle ────────────────────────────────
+        if self._snip_mode and self._snip_start is not None and self._snip_preview is not None:
+            x1, y1 = self._snip_start.x()*self._zoom, self._snip_start.y()*self._zoom
+            x2, y2 = self._snip_preview.x()*self._zoom, self._snip_preview.y()*self._zoom
+            rx, ry = min(x1, x2), min(y1, y2)
+            rw, rh = abs(x2-x1), abs(y2-y1)
+            painter.setPen(QPen(QColor("#ff7002"), 2, Qt.DashLine))
+            painter.setBrush(QColor(255, 112, 2, 35))
+            painter.drawRect(int(rx), int(ry), int(rw), int(rh))
+
         painter.end()
         self.setPixmap(pm)
         self.resize(pm.size())
@@ -580,7 +826,8 @@ class PdfCanvas(QLabel):
     def _update_cursor(self):
         if self._pan_start is not None:
             self.setCursor(Qt.ClosedHandCursor)
-        elif self._scale_mode or self._counting_mode or self._linear_mode or self._measure_mode:
+        elif (self._scale_mode or self._counting_mode or self._linear_mode or self._measure_mode
+              or self._field_note_mode or self._field_line_mode or self._snip_mode):
             self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
@@ -612,6 +859,16 @@ class PdfCanvas(QLabel):
         self._linear_preview = None
         self._paint_overlay()
         self.linear_run_completed.emit(aid, footage, points_json)
+
+    def _finish_field_line(self):
+        import json as _json
+        pts = self._field_line_points
+        points_data = [{"x": p.x(), "y": p.y()} for p in pts]
+        points_json = _json.dumps(points_data)
+        self._field_line_points = []
+        self._field_line_preview = None
+        self._paint_overlay()
+        self.field_line_completed.emit(points_json)
 
     def _finish_measurement(self):
         """Compute the scratch length/area measurement and keep it drawn on
@@ -694,7 +951,44 @@ class PdfCanvas(QLabel):
                 best_dist, best = d, m
         return best
 
-    #  Mouse events 
+    def _find_nearest_field_note(self, canvas_pos, threshold=20):
+        notes = self._page_field_notes.get((self._pdf_path, self._page_index), [])
+        best, best_dist = None, threshold
+        for n in notes:
+            dx = canvas_pos.x() - n["page_x"] * self._zoom
+            dy = canvas_pos.y() - n["page_y"] * self._zoom
+            d = (dx*dx + dy*dy) ** 0.5
+            if d < best_dist:
+                best_dist, best = d, n
+        return best
+
+    def _find_nearest_field_line(self, canvas_pos, threshold=12):
+        import math as _math, json as _json
+        lines = self._page_field_lines.get((self._pdf_path, self._page_index), [])
+        best, best_dist = None, threshold
+        cx, cy = canvas_pos.x(), canvas_pos.y()
+        for ln in lines:
+            try:
+                pts = _json.loads(ln["points"])
+            except Exception:
+                continue
+            for i in range(1, len(pts)):
+                x1 = pts[i-1]["x"] * self._zoom
+                y1 = pts[i-1]["y"] * self._zoom
+                x2 = pts[i]["x"]   * self._zoom
+                y2 = pts[i]["y"]   * self._zoom
+                dx, dy = x2 - x1, y2 - y1
+                seg_len = _math.sqrt(dx*dx + dy*dy)
+                if seg_len < 1:
+                    continue
+                t = max(0, min(1, ((cx-x1)*dx + (cy-y1)*dy) / (seg_len*seg_len)))
+                px, py = x1 + t*dx, y1 + t*dy
+                d = _math.sqrt((cx-px)**2 + (cy-py)**2)
+                if d < best_dist:
+                    best_dist, best = d, ln
+        return best
+
+    #  Mouse events
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -735,6 +1029,21 @@ class PdfCanvas(QLabel):
                 self._measure_points.append(page_pt)
                 self._measure_preview = None
                 self._paint_overlay()
+            elif self._field_line_mode:
+                # Free placement — no H/V grid snap, unlike the takeoff
+                # linear-run tool. Trace lines are meant to be pointed
+                # freely at whatever the note is calling out.
+                page_pt = self._canvas_to_page(event.pos())
+                self._field_line_points.append(page_pt)
+                self._field_line_preview = None
+                self._paint_overlay()
+            elif self._field_note_mode:
+                page_pt = self._canvas_to_page(event.pos())
+                self.field_note_placed.emit(page_pt)
+            elif self._snip_mode:
+                self._snip_start = self._canvas_to_page(event.pos())
+                self._snip_preview = self._snip_start
+                self._paint_overlay()
             elif self._counting_mode:
                 page_pt = self._canvas_to_page(event.pos())
                 near = self._find_nearest_mark(event.pos(), threshold=18)
@@ -765,6 +1074,9 @@ class PdfCanvas(QLabel):
         elif self._measure_mode == "length" and event.button() == Qt.LeftButton:
             if len(self._measure_points) >= 2:
                 self._finish_measurement()
+        elif self._field_line_mode and event.button() == Qt.LeftButton:
+            if len(self._field_line_points) >= 2:
+                self._finish_field_line()
 
     def mouseMoveEvent(self, event):
         if self._pan_start and (event.buttons() & Qt.LeftButton):
@@ -779,6 +1091,12 @@ class PdfCanvas(QLabel):
             page_pt = self._canvas_to_page(event.pos())
             self._measure_preview = self._snap_linear(self._measure_points[-1], page_pt, event.modifiers())
             self._paint_overlay()
+        elif self._field_line_mode and self._field_line_points:
+            self._field_line_preview = self._canvas_to_page(event.pos())
+            self._paint_overlay()
+        elif self._snip_mode and self._snip_start is not None:
+            self._snip_preview = self._canvas_to_page(event.pos())
+            self._paint_overlay()
 
     def keyPressEvent(self, event):
         if self._linear_mode and event.key() == Qt.Key_Escape:
@@ -789,6 +1107,14 @@ class PdfCanvas(QLabel):
             self._measure_points = []
             self._measure_preview = None
             self._paint_overlay()
+        elif self._field_line_mode and event.key() == Qt.Key_Escape:
+            self._field_line_points = []
+            self._field_line_preview = None
+            self._paint_overlay()
+        elif self._snip_mode and event.key() == Qt.Key_Escape:
+            self._snip_start = None
+            self._snip_preview = None
+            self._paint_overlay()
         elif (self._measure_mode == "area" and event.key() in (Qt.Key_Return, Qt.Key_Enter)
               and len(self._measure_points) >= 3):
             self._finish_measurement()
@@ -797,6 +1123,20 @@ class PdfCanvas(QLabel):
         if event.button() == Qt.LeftButton and self._pan_start:
             self._pan_start = None
             self._update_cursor()
+        elif event.button() == Qt.LeftButton and self._snip_mode and self._snip_start is not None:
+            start = self._snip_start
+            end = self._canvas_to_page(event.pos())
+            self._snip_start = None
+            self._snip_preview = None
+            rect = QRectF(min(start.x(), end.x()), min(start.y(), end.y()),
+                          abs(end.x() - start.x()), abs(end.y() - start.y()))
+            # Snip is a one-shot tool — auto-exit after a selection so the
+            # user isn't left mid-drag-mode for their next click on the canvas.
+            self._snip_mode = False
+            self._update_cursor()
+            self._paint_overlay()
+            if rect.width() > 4 and rect.height() > 4:
+                self.snip_rect_selected.emit(rect)
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
@@ -818,15 +1158,42 @@ class PdfCanvas(QLabel):
             self._measure_preview = None
             self._paint_overlay()
             return
+        if self._field_line_mode and self._field_line_points:
+            # Cancel current in-progress trace line
+            self._field_line_points = []
+            self._field_line_preview = None
+            self._paint_overlay()
+            return
         menu = QMenu(self)
         mark = self._find_nearest_mark(pos)
         run  = self._find_nearest_run(pos)
+        note = self._find_nearest_field_note(pos)
+        line = self._find_nearest_field_line(pos)
+        cd = mark.get("candela", 0) if mark else 0
+        candela_label = f"Set Candela…  ({cd:g} cd)" if cd else "Set Candela…"
+        candela_act  = menu.addAction(candela_label) if mark else None
         del_mark_act = menu.addAction(f"Delete mark  ({mark['label']})") if mark else None
         del_run_act  = menu.addAction(f"Delete run  ({run.get('footage', 0):.1f} ft)") if run else None
-        if not mark and not run:
+        edit_note_act = menu.addAction(f"Edit note…  ({note['text'][:20]})") if note else None
+        del_note_act  = menu.addAction("Delete note") if note else None
+        del_line_act  = menu.addAction("Delete trace line") if line else None
+        if not mark and not run and not note and not line:
             return
         chosen = menu.exec_(self.mapToGlobal(pos))
-        if chosen and chosen == del_mark_act and mark:
+        if chosen and chosen == candela_act and mark:
+            from PyQt5.QtWidgets import QInputDialog
+            options = ["N/A"] + [f"{cd} cd" for cd in CANDELA_OPTIONS]
+            current = mark.get("candela", 0) or 0
+            cur_idx = (CANDELA_OPTIONS.index(int(current)) + 1) if int(current) in CANDELA_OPTIONS else 0
+            choice, ok = QInputDialog.getItem(
+                self.window(), "Set Candela", "Candela rating for this device:",
+                options, cur_idx, editable=False)
+            if ok:
+                new_cd = 0 if choice == "N/A" else int(choice.split()[0])
+                mark["candela"] = new_cd
+                self._paint_overlay()
+                self.mark_candela_changed.emit(mark["db_id"] or 0, new_cd)
+        elif chosen and chosen == del_mark_act and mark:
             key = (self._pdf_path, self._page_index)
             self._page_marks[key] = [m for m in self._page_marks.get(key, [])
                                      if m["id"] != mark["id"]]
@@ -838,6 +1205,20 @@ class PdfCanvas(QLabel):
                                     if r["id"] != run["id"]]
             self._paint_overlay()
             self.run_deleted.emit(run["id"], run["assembly_id"])
+        elif chosen and chosen == edit_note_act and note:
+            self.field_note_edit_requested.emit(note)
+        elif chosen and chosen == del_note_act and note:
+            key = (self._pdf_path, self._page_index)
+            self._page_field_notes[key] = [n for n in self._page_field_notes.get(key, [])
+                                           if n["id"] != note["id"]]
+            self._paint_overlay()
+            self.field_note_deleted.emit(note["db_id"] or 0)
+        elif chosen and chosen == del_line_act and line:
+            key = (self._pdf_path, self._page_index)
+            self._page_field_lines[key] = [l for l in self._page_field_lines.get(key, [])
+                                           if l["id"] != line["id"]]
+            self._paint_overlay()
+            self.field_line_deleted.emit(line["id"])
 
 
 # 
@@ -955,7 +1336,22 @@ class ProductDialog(QDialog):
         self.code_edit = QLineEdit()
         self.cost_spin = QDoubleSpinBox()
         self.cost_spin.setRange(0,999999); self.cost_spin.setDecimals(2); self.cost_spin.setPrefix("$")
-        self.cat_combo = QComboBox(); self.cat_combo.addItems(CATEGORIES); self.cat_combo.setEditable(True)
+        self.cat_combo = QComboBox()
+        self.cat_combo.addItems(sorted(set(CATEGORIES) | set(db.get_distinct_categories())))
+        self.cat_combo.setEditable(True)
+        self.subcat_combo = QComboBox()
+        self.subcat_combo.addItems(db.get_distinct_subcategories())
+        self.subcat_combo.setEditable(True)
+        self.subcat_combo.lineEdit().setPlaceholderText("Optional — a further sort within Category")
+        self.candela_combo = QComboBox()
+        self.candela_combo.addItem("N/A", 0)
+        for cd in CANDELA_OPTIONS:
+            self.candela_combo.addItem(f"{cd} cd", cd)
+        self.candela_combo.setCurrentIndex(self.candela_combo.findData(15))  # overridden by _load() when editing
+        self.candela_combo.setToolTip(
+            "For strobes/horn strobes — just a default that pre-fills when you place\n"
+            "a new one on the print. Each placed device's candela is independent and\n"
+            "can be changed on its own afterward (right-click the mark -> Set Candela…).")
         dr = QHBoxLayout()
         self.drawing_edit = QLineEdit(); self.drawing_edit.setPlaceholderText("No drawing attached"); self.drawing_edit.setReadOnly(True)
         browse = QPushButton("Browse"); browse.setFixedWidth(72); browse.clicked.connect(self._browse)
@@ -996,6 +1392,8 @@ class ProductDialog(QDialog):
         layout.addRow("Code / Part #",  self.code_edit)
         layout.addRow("Unit Cost",       self.cost_spin)
         layout.addRow("Category",        self.cat_combo)
+        layout.addRow("Subcategory",     self.subcat_combo)
+        layout.addRow("Default Candela", self.candela_combo)
 
         lu_sep = QFrame(); lu_sep.setFrameShape(QFrame.HLine); layout.addRow(lu_sep)
         lu_hdr = QLabel("Labour Unit  (Install Estimate)"); lu_hdr.setStyleSheet("font-weight:bold;color:#ff7002;"); layout.addRow(lu_hdr)
@@ -1092,6 +1490,16 @@ class ProductDialog(QDialog):
         self._set_img_preview(img or "")
         idx = self.cat_combo.findText(p["category"] or "General")
         self.cat_combo.setCurrentIndex(idx) if idx>=0 else self.cat_combo.setCurrentText(p["category"] or "General")
+        subcat = p["subcategory"] if "subcategory" in p.keys() else ""
+        self.subcat_combo.setCurrentText(subcat or "")
+        candela = p["candela"] if "candela" in p.keys() and p["candela"] else 0
+        idx = self.candela_combo.findData(candela)
+        if idx < 0 and candela:
+            # Legacy value from before candela was restricted to the fixed
+            # list — keep it selectable rather than silently discarding it.
+            self.candela_combo.addItem(f"{candela:g} cd (custom)", candela)
+            idx = self.candela_combo.count() - 1
+        self.candela_combo.setCurrentIndex(max(idx, 0))
         # Coverage fields
         ctype = p.get("coverage_type") or ""
         cidx  = self.cov_type_combo.findText(ctype) if ctype else 0
@@ -1130,6 +1538,8 @@ class ProductDialog(QDialog):
             name=name, code=self.code_edit.text().strip(),
             unit_cost=self.cost_spin.value(),
             category=self.cat_combo.currentText().strip() or "General",
+            subcategory=self.subcat_combo.currentText().strip(),
+            candela=self.candela_combo.currentData(),
             shop_drawing_path=self.drawing_edit.text().strip(),
             image_path=self.img_edit.text().strip(),
             coverage_type="" if raw_ctype == "(auto-detect)" else raw_ctype,
@@ -1157,7 +1567,9 @@ class AssemblyDialog(QDialog):
         layout = QVBoxLayout(self); layout.setContentsMargins(14,14,14,14); layout.setSpacing(8)
         form = QFormLayout()
         self.name_edit = QLineEdit()
-        self.cat_combo = QComboBox(); self.cat_combo.addItems(CATEGORIES); self.cat_combo.setEditable(True)
+        self.cat_combo = QComboBox()
+        self.cat_combo.addItems(sorted(set(CATEGORIES) | set(db.get_distinct_categories())))
+        self.cat_combo.setEditable(True)
         self.desc_edit = QLineEdit(); self.desc_edit.setPlaceholderText("Optional description")
         form.addRow("Assembly Name *", self.name_edit)
         form.addRow("Category", self.cat_combo)
@@ -1541,9 +1953,24 @@ class LibraryPanel(QWidget):
         w = QWidget(); layout = QVBoxLayout(w); layout.setContentsMargins(2,4,2,2); layout.setSpacing(4)
         self.prod_search = QLineEdit(); self.prod_search.setPlaceholderText("Search"); self.prod_search.textChanged.connect(self._filter)
         layout.addWidget(self.prod_search)
-        self.prod_list = QListWidget()
-        self.prod_list.itemClicked.connect(lambda i: self.product_selected.emit(i.data(Qt.UserRole)))
-        self.prod_list.setStyleSheet("QListWidget::item{padding:5px;border-bottom:1px solid #e0e0e0;}QListWidget::item:selected{background:#232728;color:white;}")
+        # Grouped by category — each category is a collapsible node (click the
+        # arrow, or the group row, to expand/collapse) so a long device list
+        # (e.g. Horn Strobes / Hi-Ca Horn Strobes / Addressable Horn Strobes)
+        # doesn't have to sit fully flat. Which group a product lands in is
+        # just its Category field (ProductDialog's category combo — editable,
+        # so any custom group name works).
+        self._group_expanded = {}   # {category: bool} — remembered across refreshes
+        self.prod_list = QTreeWidget()
+        self.prod_list.setHeaderHidden(True)
+        self.prod_list.setIndentation(12)
+        self.prod_list.itemClicked.connect(self._on_prod_item_clicked)
+        self.prod_list.itemExpanded.connect(
+            lambda item: self._group_expanded.__setitem__(item.data(0, Qt.UserRole + 1), True))
+        self.prod_list.itemCollapsed.connect(
+            lambda item: self._group_expanded.__setitem__(item.data(0, Qt.UserRole + 1), False))
+        self.prod_list.setStyleSheet(
+            "QTreeWidget::item{padding:5px;border-bottom:1px solid #e0e0e0;}"
+            "QTreeWidget::item:selected{background:#232728;color:white;}")
         layout.addWidget(self.prod_list)
         btns = FlowBar(hspacing=4, vspacing=4)
         for lbl2,fn,style in [("+ Add",self._add_prod,"background:#ff7002;color:white;padding:4px;"),
@@ -1591,37 +2018,90 @@ class LibraryPanel(QWidget):
             item = QListWidgetItem(f"{'⌇ ' if a.get('is_linear') else ''}{a['name']}\n  {sub}")
             item.setData(Qt.UserRole, a); self.asm_list.addItem(item)
 
+    def _on_prod_item_clicked(self, item, column):
+        data = item.data(0, Qt.UserRole)
+        if data is not None:
+            self.product_selected.emit(data)
+
+    def _make_prod_leaf(self, p):
+        has_drawing = bool(p["shop_drawing_path"])
+        badge = " " if has_drawing else ""
+        leaf = QTreeWidgetItem([f"{badge}{p['name']}\n  {p['code'] or ''}"])
+        img_path = p["image_path"] if "image_path" in p.keys() else ""
+        if img_path and os.path.exists(img_path):
+            from PyQt5.QtGui import QIcon
+            leaf.setIcon(0, QIcon(QPixmap(img_path).scaled(40,40,Qt.KeepAspectRatio,Qt.SmoothTransformation)))
+        leaf.setData(0, Qt.UserRole, dict(p))
+        return leaf
+
+    def _make_group_node(self, key, label, count):
+        node = QTreeWidgetItem([f"{label}  ({count})"])
+        f = node.font(0); f.setBold(True); node.setFont(0, f)
+        node.setData(0, Qt.UserRole + 1, key)
+        return node
+
     def _filter(self, text):
         # Remember which product is currently selected so we can restore it
         prev = self.selected_product()
         prev_id = prev["id"] if prev else None
 
         self.prod_list.clear(); text = text.lower()
-        # Sort by use_count descending so most-used products appear at top
-        sorted_prods = sorted(self._all_products,
-                              key=lambda p: -(p["use_count"] if "use_count" in p.keys() else 0))
+
+        groups = {}
+        for p in self._all_products:
+            groups.setdefault(p["category"] or "Uncategorized", []).append(p)
+
         self.prod_list.setIconSize(QSize(40, 40))
-        for p in sorted_prods:
-            if text and text not in p["name"].lower() and text not in (p["code"] or "").lower():
-                continue
-            item = QListWidgetItem()
-            has_drawing = bool(p["shop_drawing_path"])
-            badge = " " if has_drawing else ""
-            item.setText(f"{badge}{p['name']}\n  {p['code'] or ''}  |  {p['category']}")
-            img_path = p["image_path"] if "image_path" in p.keys() else ""
-            if img_path and os.path.exists(img_path):
-                from PyQt5.QtGui import QIcon
-                item.setIcon(QIcon(QPixmap(img_path).scaled(40,40,Qt.KeepAspectRatio,Qt.SmoothTransformation)))
-            item.setData(Qt.UserRole, dict(p))
-            self.prod_list.addItem(item)
-            # Restore selection without firing the clicked signal
-            if prev_id is not None and p["id"] == prev_id:
-                self.prod_list.blockSignals(True)
-                self.prod_list.setCurrentItem(item)
-                self.prod_list.blockSignals(False)
+        for category in sorted(groups.keys()):
+            prods = groups[category]
+            if text:
+                prods = [p for p in prods
+                        if text in p["name"].lower() or text in (p["code"] or "").lower()]
+                if not prods:
+                    continue
+
+            cat_key = category
+            grp_item = self._make_group_node(cat_key, category, len(prods))
+            self.prod_list.addTopLevelItem(grp_item)
+            grp_item.setExpanded(True if text else self._group_expanded.get(cat_key, True))
+
+            # A second, optional dropdown level within the category — its own
+            # Subcategory field on the product — for further sorting a group
+            # that's grown too large (e.g. Horn Strobes -> Wall / Ceiling).
+            # Products left without a subcategory sit directly under the
+            # category, alongside any subcategory subgroups.
+            subgroups = {}
+            loose = []
+            for p in prods:
+                sub = p["subcategory"] if "subcategory" in p.keys() else ""
+                if sub:
+                    subgroups.setdefault(sub, []).append(p)
+                else:
+                    loose.append(p)
+
+            def add_sorted(parent_widget, plist):
+                # Sort by use_count descending so the most-used variant of a
+                # device rises to the top of its (sub)group.
+                for p in sorted(plist, key=lambda p: -(p["use_count"] if "use_count" in p.keys() else 0)):
+                    leaf = self._make_prod_leaf(p)
+                    parent_widget.addChild(leaf)
+                    if prev_id is not None and p["id"] == prev_id:
+                        self.prod_list.blockSignals(True)
+                        self.prod_list.setCurrentItem(leaf)
+                        self.prod_list.blockSignals(False)
+
+            for sub in sorted(subgroups.keys()):
+                sub_key = f"{category}\x1f{sub}"
+                sub_item = self._make_group_node(sub_key, sub, len(subgroups[sub]))
+                grp_item.addChild(sub_item)
+                sub_item.setExpanded(True if text else self._group_expanded.get(sub_key, True))
+                add_sorted(sub_item, subgroups[sub])
+
+            add_sorted(grp_item, loose)
 
     def selected_product(self):
-        i = self.prod_list.currentItem(); return i.data(Qt.UserRole) if i else None
+        i = self.prod_list.currentItem()
+        return i.data(0, Qt.UserRole) if i else None
     def selected_assembly(self):
         i = self.asm_list.currentItem(); return i.data(Qt.UserRole) if i else None
 
@@ -1637,7 +2117,7 @@ class LibraryPanel(QWidget):
                            d.get("shop_drawing_path", ""), d.get("image_path", ""),
                            d.get("coverage_type", ""), d.get("coverage_radius_m", 0.0),
                            d.get("lu_reg", 0.0), d.get("lu_diff", 0.0), d.get("lu_hard", 0.0),
-                           d.get("lu_id"))
+                           d.get("lu_id"), d.get("subcategory", ""), d.get("candela", 0.0))
             self.refresh()
 
     def _edit_prod(self):
@@ -1650,7 +2130,7 @@ class LibraryPanel(QWidget):
                               d.get("shop_drawing_path", ""), d.get("image_path", ""),
                               d.get("coverage_type", ""), d.get("coverage_radius_m", 0.0),
                               d.get("lu_reg", 0.0), d.get("lu_diff", 0.0), d.get("lu_hard", 0.0),
-                              d.get("lu_id"))
+                              d.get("lu_id"), d.get("subcategory", ""), d.get("candela", 0.0))
             self.refresh()
 
     def _del_prod(self):
@@ -1665,10 +2145,10 @@ class LibraryPanel(QWidget):
         try:
             with open(path,"w",newline="",encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["name","code","unit_cost","category","shop_drawing_path"])
-                writer.writerow(["Smoke Detector - Photo","SD-100",85.00,"Detectors",""])
-                writer.writerow(["Horn Strobe - Red","HS-240R",120.00,"Notification",""])
-                writer.writerow(["Pull Station","PS-001",65.00,"Initiating Devices",""])
+                writer.writerow(["name","code","unit_cost","category","subcategory","shop_drawing_path"])
+                writer.writerow(["Smoke Detector - Photo","SD-100",85.00,"Detectors","",""])
+                writer.writerow(["Horn Strobe - Red","HS-240R",120.00,"Notification","Wall Mount",""])
+                writer.writerow(["Pull Station","PS-001",65.00,"Initiating Devices","",""])
             QMessageBox.information(self,"Template Saved",
                 f"CSV template saved to:\n{path}\n\nOpen in Excel, fill in your products, save as CSV, then use Import CSV.")
             os.startfile(path)
@@ -1690,6 +2170,7 @@ class LibraryPanel(QWidget):
                         row.get("code","").strip() or row.get("Code","").strip(),
                         float(row.get("unit_cost",0) or row.get("Unit Cost",0) or 0),
                         row.get("category","General").strip() or "General",
+                        subcategory=row.get("subcategory","").strip() or row.get("Subcategory","").strip(),
                     )
                     added += 1
             self.refresh()
@@ -1730,9 +2211,87 @@ class LibraryPanel(QWidget):
             db.delete_assembly(a["id"]); self.refresh()
 
 
-# 
+class SubmittalProductPickerDialog(QDialog):
+    """Pick products to include in a shop-drawing submittal directly from the
+    catalogue — for when a submittal needs to go out before the takeoff has
+    any counts done (e.g. a submittal owed ahead of the quote)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Build Submittal — No Counts")
+        self.resize(480, 560)
+        self._build_ui()
+        self._load()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Check the products to include. Only products with a "
+                                 "shop drawing attached can be selected."))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search…")
+        self._search.textChanged.connect(self._apply_filter)
+        layout.addWidget(self._search)
+
+        self._list = QListWidget()
+        layout.addWidget(self._list)
+
+        br = QHBoxLayout()
+        ok = QPushButton("Build Submittal")
+        ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(cancel); br.addWidget(ok)
+        layout.addLayout(br)
+
+    def _load(self):
+        self._list.clear()
+        products = db.get_products()
+        last_category = None
+        for p in products:
+            if p["category"] != last_category:
+                last_category = p["category"]
+                hdr = QListWidgetItem(last_category)
+                hdr.setFlags(Qt.NoItemFlags)
+                f = hdr.font(); f.setBold(True); hdr.setFont(f)
+                hdr.setBackground(QColor("#eeeeee"))
+                self._list.addItem(hdr)
+            has_drawing = bool(p["shop_drawing_path"]) and os.path.exists(p["shop_drawing_path"] or "")
+            label = f"{p['name']}  ({p['code']})" if p["code"] else p["name"]
+            if not has_drawing:
+                label += "   [no shop drawing]"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, dict(p))
+            if has_drawing:
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+            else:
+                item.setFlags(Qt.NoItemFlags)
+                item.setForeground(QColor("#999999"))
+            self._list.addItem(item)
+
+    def _apply_filter(self, text):
+        text = text.lower().strip()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            data = item.data(Qt.UserRole)
+            if data is None:
+                item.setHidden(bool(text))   # category header — hide while filtering
+            else:
+                name = data["name"].lower(); code = (data["code"] or "").lower()
+                item.setHidden(bool(text) and text not in name and text not in code)
+
+    def selected_products(self):
+        result = []
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item.data(Qt.UserRole) is not None and item.checkState() == Qt.Checked:
+                result.append(item.data(Qt.UserRole))
+        return result
+
+
+#
 # Takeoff Panel
-# 
+#
 
 class TakeoffPanel(QWidget):
     def __init__(self, parent=None):
@@ -1790,6 +2349,14 @@ class TakeoffPanel(QWidget):
         submittal_btn.setStyleSheet("background:#ff7002;color:white;padding:8px;font-size:12px;font-weight:bold;border-radius:4px;")
         submittal_btn.clicked.connect(self._build_submittal); layout.addWidget(submittal_btn)
 
+        presub_btn = QPushButton("Build Submittal — No Counts")
+        presub_btn.setToolTip(
+            "Build a shop-drawing submittal package directly from the product\n"
+            "catalogue, without needing any counts done on the takeoff yet —\n"
+            "for when a submittal is owed before the quote.")
+        presub_btn.setStyleSheet("background:#232728;color:white;padding:8px;font-size:12px;font-weight:bold;border-radius:4px;")
+        presub_btn.clicked.connect(self._build_submittal_no_counts); layout.addWidget(presub_btn)
+
     def _build_summary_tab(self):
         w = QWidget(); layout = QVBoxLayout(w); layout.setContentsMargins(0,4,0,0)
         self.table = QTableWidget(0,4)
@@ -1809,16 +2376,35 @@ class TakeoffPanel(QWidget):
 
     def _build_section_tab(self):
         w = QWidget(); layout = QVBoxLayout(w); layout.setContentsMargins(0,4,0,0)
+        hint = QLabel("Select section(s) below to limit Export/Submittal to just those — "
+                      "leave nothing selected to include the whole project.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;font-size:10px;padding:2px 4px;")
+        layout.addWidget(hint)
         self.sec_table = QTableWidget(0,4)
         self.sec_table.setHorizontalHeaderLabels(["Section","Product","Qty","Total"])
         self.sec_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.sec_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         for c in (2,3): self.sec_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.sec_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.sec_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sec_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.sec_table.verticalHeader().setVisible(False)
         self.sec_table.setAlternatingRowColors(True)
         layout.addWidget(self.sec_table)
         return w
+
+    def selected_section_ids(self):
+        """Distinct section_ids from selected rows in the By Section tab —
+        empty set means no filter (export the whole project)."""
+        ids = set()
+        for idx in self.sec_table.selectionModel().selectedRows() if self.sec_table.selectionModel() else []:
+            item = self.sec_table.item(idx.row(), 0)
+            if item is not None:
+                sid = item.data(Qt.UserRole)
+                if sid is not None:
+                    ids.add(sid)
+        return ids
 
     #  Project & section 
 
@@ -1985,7 +2571,9 @@ class TakeoffPanel(QWidget):
         self.sec_table.setRowCount(len(breakdown))
         for row, item in enumerate(breakdown):
             total = item["count"] * 0  # no unit_cost in breakdown query; show qty only
-            self.sec_table.setItem(row,0,QTableWidgetItem(item["section_name"]))
+            sec_item = QTableWidgetItem(item["section_name"])
+            sec_item.setData(Qt.UserRole, item["section_id"])
+            self.sec_table.setItem(row,0,sec_item)
             self.sec_table.setItem(row,1,QTableWidgetItem(item["product_name"]))
             qi = QTableWidgetItem(str(item["count"])); qi.setTextAlignment(Qt.AlignCenter)
             self.sec_table.setItem(row,2,qi)
@@ -1995,14 +2583,17 @@ class TakeoffPanel(QWidget):
 
     def _export(self):
         if not self._project_id: QMessageBox.warning(self,"No Project","Open a project first."); return
-        items = list(db.get_all_takeoff_items(self._project_id))
+        section_ids = self.selected_section_ids()
+        items = list(db.get_all_takeoff_items(self._project_id, section_ids or None))
         if not items: QMessageBox.information(self,"Empty","No items to export."); return
         proj = next((p for p in db.get_projects() if p["id"]==self._project_id), None)
         pname = proj["name"] if proj else "Takeoff"
-        path,_ = QFileDialog.getSaveFileName(self,"Save Excel",f"{pname}_takeoff.xlsx","Excel (*.xlsx)")
+        suffix = "_takeoff" if not section_ids else "_takeoff_selected_sections"
+        path,_ = QFileDialog.getSaveFileName(self,"Save Excel",f"{pname}{suffix}.xlsx","Excel (*.xlsx)")
         if not path: return
         try:
-            excel_export.export_takeoff(pname, items, path)
+            candela_breakdown = db.get_candela_breakdown(self._project_id, section_ids or None)
+            excel_export.export_takeoff(pname, items, path, candela_breakdown)
             QMessageBox.information(self,"Exported",f"Saved to:\n{path}")
             os.startfile(path)
         except Exception as e:
@@ -2038,7 +2629,26 @@ class TakeoffPanel(QWidget):
 
         proj = next((p for p in db.get_projects() if p["id"]==self._project_id), None)
         pname = proj["name"] if proj else "Submittal"
+        self._assemble_submittal_pdf(drawings, pname)
 
+    def _build_submittal_no_counts(self):
+        """Build a shop-drawing submittal straight from the product catalogue,
+        with no takeoff counts required — for a submittal owed before the quote."""
+        dlg = SubmittalProductPickerDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        picked = dlg.selected_products()
+        if not picked:
+            QMessageBox.information(self, "Nothing Selected", "No products were selected.")
+            return
+        drawings = [(p, None) for p in picked]
+        proj = next((p for p in db.get_projects() if p["id"] == self._project_id), None)
+        pname = proj["name"] if proj else "Submittal"
+        self._assemble_submittal_pdf(drawings, pname)
+
+    def _assemble_submittal_pdf(self, drawings, pname):
+        """drawings: list of (product_dict, qty_or_None). Shared by both the
+        counts-based submittal and the no-counts product-picker submittal."""
         # Default to a Submittals subfolder
         default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Submittals")
         os.makedirs(default_dir, exist_ok=True)
@@ -2062,7 +2672,8 @@ class TakeoffPanel(QWidget):
             y = 195
             cover.insert_text((30,y),"Contents:", fontsize=12,fontname="helv",color=(0.17,0.24,0.31)); y+=20
             for i,(p,qty) in enumerate(drawings,1):
-                cover.insert_text((30,y),f"  {i}.  {p['name']}  ({p['code'] or ''})   qty: {qty}",
+                qty_str = f"   qty: {qty}" if qty is not None else ""
+                cover.insert_text((30,y),f"  {i}.  {p['name']}  ({p['code'] or ''}){qty_str}",
                                    fontsize=10,fontname="helv"); y+=16
                 if y>745: break
             prog.setValue(1)
@@ -2078,7 +2689,8 @@ class TakeoffPanel(QWidget):
                 else:
                     pg = out_doc.new_page(width=612,height=792)
                     pg.insert_image(fitz.Rect(36,50,576,756), filename=p["shop_drawing_path"])
-                    pg.insert_text((36,36),f"{p['name']}    {p['code'] or ''}  (qty: {qty})",
+                    qty_str = f"  (qty: {qty})" if qty is not None else ""
+                    pg.insert_text((36,36),f"{p['name']}    {p['code'] or ''}{qty_str}",
                                     fontsize=10,fontname="helv",color=(0.4,0.4,0.4))
 
             prog.setValue(len(drawings)+1)
@@ -2253,9 +2865,41 @@ class ProjectManagerDialog(QDialog):
             db.delete_project(item.data(Qt.UserRole)); self.refresh()
 
 
-# 
+class ExportPdfDialog(QDialog):
+    """Lets the user pick which layers go into an exported PDF — in
+    particular, Field Notes ON with Marks OFF is how you produce a clean
+    print for installers without the internal device-count clutter."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export PDF")
+        self.setMinimumWidth(320)
+        l = QVBoxLayout(self)
+        l.addWidget(QLabel("Include:"))
+        self._marks_chk = QCheckBox("Marks (device counts)")
+        self._marks_chk.setChecked(True)
+        l.addWidget(self._marks_chk)
+        self._design_chk = QCheckBox("Design (coverage circles)")
+        l.addWidget(self._design_chk)
+        self._notes_chk = QCheckBox("Field Notes (markup for installers)")
+        l.addWidget(self._notes_chk)
+
+        br = QHBoxLayout()
+        ok = QPushButton("Export")
+        ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(cancel); br.addWidget(ok)
+        l.addLayout(br)
+
+    def selections(self):
+        """Returns (draw_marks, draw_design, draw_field_notes)."""
+        return self._marks_chk.isChecked(), self._design_chk.isChecked(), self._notes_chk.isChecked()
+
+
+#
 # Main Window
-# 
+#
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -2270,6 +2914,14 @@ class MainWindow(QMainWindow):
         self._pdf_path = ""
         self._project_id = None
         self._counting_mode = False
+        # Default style for the Field Notes markup layer (independent of counts).
+        # Trace lines always match the note color — one shared setting.
+        self._last_field_note_color = "#000000"
+        self._last_field_note_bold  = False
+        self._last_field_note_size  = 10.0
+        self._last_field_line_width = 2.0
+        self._snip_windows = {}   # {snip_id: SnipWindow} — only currently-open ones
+        self._snip_toggle_actions = {}   # {snip_id: QAction} — dynamic Snips ▾ menu entries
         db.init_db()
         self._build_ui()
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
@@ -2308,8 +2960,15 @@ class MainWindow(QMainWindow):
         self.canvas.pan_delta.connect(self._on_pan_delta)
         self.canvas.zoom_requested.connect(self._on_zoom_requested)
         self.canvas.mark_deleted.connect(self._on_mark_deleted)
+        self.canvas.mark_candela_changed.connect(self._on_mark_candela_changed)
         self.canvas.linear_run_completed.connect(self._on_linear_run_completed)
         self.canvas.run_deleted.connect(self._on_run_deleted)
+        self.canvas.field_note_placed.connect(self._on_field_note_placed)
+        self.canvas.field_line_completed.connect(self._on_field_line_completed)
+        self.canvas.field_note_deleted.connect(self._on_field_note_deleted)
+        self.canvas.field_line_deleted.connect(self._on_field_line_deleted)
+        self.canvas.field_note_edit_requested.connect(self._on_field_note_edit_requested)
+        self.canvas.snip_rect_selected.connect(self._on_snip_rect_selected)
         self.scroll_area.setWidget(self.canvas); cl.addWidget(self.scroll_area)
         splitter.addWidget(centre)
 
@@ -2331,7 +2990,8 @@ class MainWindow(QMainWindow):
 
     def _build_toolbar(self):
         tb = QToolBar("Main"); tb.setMovable(False); self.addToolBar(tb)
-        for label, slot in [("Projects", self._open_project_manager), ("Load PDF", self._load_pdf)]:
+        for label, slot in [("Projects", self._open_project_manager), ("Load PDF", self._load_pdf),
+                            ("Manage Pages…", self._manage_pages)]:
             a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
         tb.addSeparator()
         self.count_action = QAction("Start Counting", self); self.count_action.setCheckable(True)
@@ -2442,6 +3102,78 @@ class MainWindow(QMainWindow):
 
         self.canvas.measurement_completed.connect(self._on_measurement_completed)
 
+        # Field Notes markup layer — separate dropdown from Coverage since it
+        # needs tool-activation actions and color pickers, not just on/off
+        # toggles. This is the "clean print for installers" layer: it can be
+        # hidden on-screen and left out of exports independently of the
+        # device-count marks, so the export doesn't dump internal takeoff
+        # info on installers who only need the handwritten-style notes.
+        tb.addSeparator()
+        self._field_notes_btn = HoverMenuButton("Field Notes ▾")
+        self._field_notes_menu = QMenu(self._field_notes_btn); self._field_notes_menu.setStyleSheet(MENU_STYLE)
+
+        self.field_note_action = QAction("Add Note", self)
+        self.field_note_action.setCheckable(True)
+        self.field_note_action.setToolTip("Click the drawing to place a styled text note (e.g. an address by a device).")
+        self.field_note_action.triggered.connect(self._toggle_field_note_mode)
+        self._field_notes_menu.addAction(self.field_note_action)
+
+        self.field_line_action = QAction("Trace Line", self)
+        self.field_line_action.setCheckable(True)
+        self.field_line_action.setToolTip("Click points to draw a trace/leader line, double-click to finish.")
+        self.field_line_action.triggered.connect(self._toggle_field_line_mode)
+        self._field_notes_menu.addAction(self.field_line_action)
+
+        self._field_notes_menu.addSeparator()
+        a = QAction("Note/Line Color…", self)
+        a.setToolTip("Default color for new notes and trace lines — trace lines always match the note color.")
+        a.triggered.connect(self._pick_field_note_color)
+        self._field_notes_menu.addAction(a)
+
+        self.field_note_bold_action = QAction("Bold Notes", self)
+        self.field_note_bold_action.setCheckable(True)
+        self.field_note_bold_action.setChecked(self._last_field_note_bold)
+        self.field_note_bold_action.triggered.connect(self._toggle_field_note_bold_default)
+        self._field_notes_menu.addAction(self.field_note_bold_action)
+
+        self._field_notes_menu.addSeparator()
+        a = QAction("Clear Field Notes (page)", self); a.triggered.connect(self._clear_field_notes_page)
+        self._field_notes_menu.addAction(a)
+        a = QAction("Clear Trace Lines (page)", self); a.triggered.connect(self._clear_field_lines_page)
+        self._field_notes_menu.addAction(a)
+
+        self._field_notes_menu.addSeparator()
+        self.show_field_notes_action = QAction("Show Field Notes", self)
+        self.show_field_notes_action.setCheckable(True)
+        self.show_field_notes_action.setChecked(True)
+        self.show_field_notes_action.triggered.connect(self.canvas.set_field_notes_visible)
+        self._field_notes_menu.addAction(self.show_field_notes_action)
+
+        self._field_notes_btn.setMenu(self._field_notes_menu)
+        tb.addWidget(self._field_notes_btn)
+
+        # Snips — pinned crops (e.g. the symbol legend sitting on another
+        # page) as their own floating, freely resizable/movable windows, so
+        # you don't have to flip pages back and forth to check them.
+        # MultiCheckMenu so switching several snips on/off in a row doesn't
+        # require reopening the dropdown each time — only the per-snip
+        # toggles are checkable, so "New Snip"/"Manage Snips…" still close
+        # the menu normally on click.
+        tb.addSeparator()
+        self._snips_btn = HoverMenuButton("Snips ▾")
+        self._snips_menu = MultiCheckMenu(self._snips_btn); self._snips_menu.setStyleSheet(MENU_STYLE)
+        self._new_snip_action = QAction("New Snip", self)
+        self._new_snip_action.setToolTip("Drag a box around anything (e.g. a legend) to pin it in its own window.")
+        self._new_snip_action.triggered.connect(self._start_snip_mode)
+        self._snips_menu.addAction(self._new_snip_action)
+        self._snips_sep_top = self._snips_menu.addSeparator()
+        self._snips_sep_bottom = self._snips_menu.addSeparator()
+        manage_snips_action = QAction("Manage Snips…", self)
+        manage_snips_action.triggered.connect(self._manage_snips)
+        self._snips_menu.addAction(manage_snips_action)
+        self._snips_btn.setMenu(self._snips_menu)
+        tb.addWidget(self._snips_btn)
+
         # Per-type coverage toggles — MultiCheckMenu so turning several
         # layers on/off doesn't require reopening the dropdown each time.
         tb.addSeparator()
@@ -2530,6 +3262,12 @@ class MainWindow(QMainWindow):
             if self.count_action.isChecked():
                 self.count_action.setChecked(False)
                 self._toggle_counting(False)
+            if self.field_note_action.isChecked() or self.field_line_action.isChecked():
+                self.field_note_action.setChecked(False)
+                self.field_line_action.setChecked(False)
+                self.canvas.set_field_note_mode(False)
+                self.canvas.set_field_line_mode(False)
+            self.canvas.set_snip_mode(False)
             self.canvas.set_measure_mode(mode)
             if mode == "length":
                 self.statusBar().showMessage(
@@ -2546,6 +3284,241 @@ class MainWindow(QMainWindow):
     def _on_measurement_completed(self, mode, value):
         unit = "ft" if mode == "length" else "SF"
         self.statusBar().showMessage(f"Measured {mode}: {value:.1f} {unit}", 8000)
+
+    # ── Field Notes markup layer ────────────────────────────────────────────
+
+    def _toggle_field_note_mode(self, checked):
+        if checked:
+            self.field_line_action.setChecked(False)
+            self.canvas.set_field_line_mode(False)
+            if self.count_action.isChecked():
+                self.count_action.setChecked(False)
+                self._toggle_counting(False)
+            self.canvas.set_measure_mode(None)
+            self.measure_length_action.setChecked(False)
+            self.measure_area_action.setChecked(False)
+            self.canvas.set_snip_mode(False)
+            self.canvas.set_field_note_mode(True, self._last_field_note_color,
+                                            self._last_field_note_bold, self._last_field_note_size)
+            self.statusBar().showMessage("Add Note: click the drawing to place a text note.")
+        else:
+            self.canvas.set_field_note_mode(False)
+            self.statusBar().showMessage("Add Note off.")
+
+    def _toggle_field_line_mode(self, checked):
+        if checked:
+            self.field_note_action.setChecked(False)
+            self.canvas.set_field_note_mode(False)
+            if self.count_action.isChecked():
+                self.count_action.setChecked(False)
+                self._toggle_counting(False)
+            self.canvas.set_measure_mode(None)
+            self.measure_length_action.setChecked(False)
+            self.measure_area_action.setChecked(False)
+            self.canvas.set_snip_mode(False)
+            # Trace lines always match the note color — one shared setting.
+            self.canvas.set_field_line_mode(True, self._last_field_note_color, self._last_field_line_width)
+            self.statusBar().showMessage(
+                "Trace Line: click each point, double-click to finish  |  Esc/right-click = cancel")
+        else:
+            self.canvas.set_field_line_mode(False)
+            self.statusBar().showMessage("Trace Line off.")
+
+    def _pick_field_note_color(self):
+        c = QColorDialog.getColor(QColor(self._last_field_note_color), self, "Note / Line Color")
+        if c.isValid():
+            self._last_field_note_color = c.name()
+            if self.field_note_action.isChecked():
+                self.canvas.set_field_note_mode(True, self._last_field_note_color,
+                                                self._last_field_note_bold, self._last_field_note_size)
+            if self.field_line_action.isChecked():
+                self.canvas.set_field_line_mode(True, self._last_field_note_color, self._last_field_line_width)
+
+    def _toggle_field_note_bold_default(self, checked):
+        self._last_field_note_bold = checked
+        if self.field_note_action.isChecked():
+            self.canvas.set_field_note_mode(True, self._last_field_note_color,
+                                            self._last_field_note_bold, self._last_field_note_size)
+
+    def _clear_field_notes_page(self):
+        key = (self.canvas._pdf_path, self.canvas._page_index)
+        for n in self.canvas._page_field_notes.get(key, []):
+            if n["db_id"]:
+                db.delete_field_note(n["db_id"])
+        self.canvas._page_field_notes.pop(key, None)
+        self.canvas._paint_overlay()
+
+    def _clear_field_lines_page(self):
+        key = (self.canvas._pdf_path, self.canvas._page_index)
+        for l in self.canvas._page_field_lines.get(key, []):
+            if l["id"]:
+                db.delete_field_line(l["id"])
+        self.canvas._page_field_lines.pop(key, None)
+        self.canvas._paint_overlay()
+
+    def _on_field_note_placed(self, page_pt):
+        from field_note_dialog import FieldNoteDialog
+        dlg = FieldNoteDialog(color=self._last_field_note_color, bold=self._last_field_note_bold,
+                              font_size=self._last_field_note_size, parent=self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.text():
+            return
+        note_id = db.add_field_note(self._project_id, self._pdf_path, self._page_index,
+                                    page_pt.x(), page_pt.y(), dlg.text(), dlg.color(),
+                                    int(dlg.bold()), dlg.font_size())
+        self.canvas.add_field_note(page_pt.x(), page_pt.y(), dlg.text(), dlg.color(),
+                                   dlg.bold(), dlg.font_size(), db_id=note_id)
+        self._last_field_note_color = dlg.color()
+        self._last_field_note_bold  = dlg.bold()
+        self._last_field_note_size  = dlg.font_size()
+
+    def _on_field_note_edit_requested(self, note):
+        from field_note_dialog import FieldNoteDialog
+        dlg = FieldNoteDialog(text=note["text"], color=note["color"], bold=note["bold"],
+                              font_size=note["font_size"], parent=self)
+        if dlg.exec_() != QDialog.Accepted or not dlg.text():
+            return
+        if note["db_id"]:
+            db.update_field_note(note["db_id"], dlg.text(), dlg.color(), int(dlg.bold()), dlg.font_size())
+        self.canvas.update_field_note_by_id(note["db_id"], dlg.text(), dlg.color(), dlg.bold(), dlg.font_size())
+
+    def _on_field_line_completed(self, points_json):
+        line_id = db.add_field_line(self._project_id, self._pdf_path, self._page_index,
+                                    points_json, self._last_field_note_color, self._last_field_line_width)
+        self.canvas.add_field_line({"id": line_id, "pdf_path": self._pdf_path,
+                                    "page_index": self._page_index, "points": points_json,
+                                    "color": self._last_field_note_color, "width": self._last_field_line_width})
+
+    def _on_field_note_deleted(self, db_id):
+        if db_id:
+            db.delete_field_note(db_id)
+
+    def _on_field_line_deleted(self, db_id):
+        if db_id:
+            db.delete_field_line(db_id)
+
+    # ── Snips — pinned reference windows ────────────────────────────────────
+
+    def _start_snip_mode(self):
+        if not self._doc:
+            QMessageBox.warning(self, "No PDF", "Load a PDF first.")
+            return
+        if self.count_action.isChecked():
+            self.count_action.setChecked(False)
+            self._toggle_counting(False)
+        self.canvas.set_measure_mode(None)
+        self.measure_length_action.setChecked(False)
+        self.measure_area_action.setChecked(False)
+        if self.field_note_action.isChecked() or self.field_line_action.isChecked():
+            self.field_note_action.setChecked(False)
+            self.field_line_action.setChecked(False)
+            self.canvas.set_field_note_mode(False)
+            self.canvas.set_field_line_mode(False)
+        self.canvas.set_snip_mode(True)
+        self.statusBar().showMessage(
+            "New Snip: drag a box around the area to capture  |  Esc/right-click = cancel")
+
+    def _on_snip_rect_selected(self, rect):
+        if not self._project_id or not self._doc:
+            return
+        name, ok = QInputDialog.getText(self, "Name This Snip", 'Name (e.g. "FA Legend"):')
+        if not ok or not name.strip():
+            self.statusBar().showMessage("Snip cancelled.")
+            return
+        name = name.strip()
+        page = self._doc[self._page_index]
+        clip = fitz.Rect(rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height())
+        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=clip, alpha=False)
+        png_bytes = pix.tobytes("png")
+        snip_id = db.add_snip(self._project_id, name, png_bytes)
+        self._open_snip_window(snip_id, name, png_bytes, 80, 80, 320, 240)
+        self._rebuild_snips_menu()
+        self.statusBar().showMessage(f"Snip '{name}' created.")
+
+    def _open_snip_window(self, snip_id, name, image_bytes, x, y, w, h):
+        from snip_window import SnipWindow
+        win = SnipWindow(snip_id, name, image_bytes, parent=self)
+        win.setGeometry(x, y, w, h)
+        win.closed.connect(self._on_snip_window_closed)
+        win.geometry_changed.connect(self._on_snip_geometry_changed)
+        self._snip_windows[snip_id] = win
+        win.show()
+        if snip_id in self._snip_toggle_actions:
+            act = self._snip_toggle_actions[snip_id]
+            act.blockSignals(True); act.setChecked(True); act.blockSignals(False)
+
+    def _on_snip_window_closed(self, snip_id):
+        self._snip_windows.pop(snip_id, None)
+        db.set_snip_visible(snip_id, False)
+        if snip_id in self._snip_toggle_actions:
+            act = self._snip_toggle_actions[snip_id]
+            act.blockSignals(True); act.setChecked(False); act.blockSignals(False)
+
+    def _on_snip_geometry_changed(self, snip_id, x, y, w, h):
+        db.update_snip_geometry(snip_id, x, y, w, h)
+
+    def _toggle_snip_visibility(self, snip_id, checked):
+        if checked:
+            if snip_id in self._snip_windows:
+                return
+            img = db.get_snip_image(snip_id)
+            row = next((s for s in db.get_snips(self._project_id) if s["id"] == snip_id), None)
+            if not img or not row:
+                return
+            db.set_snip_visible(snip_id, True)
+            self._open_snip_window(snip_id, row["name"], img,
+                                   row["win_x"], row["win_y"], row["win_w"], row["win_h"])
+        else:
+            win = self._snip_windows.get(snip_id)
+            if win:
+                win.close()   # triggers closeEvent -> _on_snip_window_closed
+            else:
+                db.set_snip_visible(snip_id, False)
+
+    def _rebuild_snips_menu(self):
+        for act in list(self._snip_toggle_actions.values()):
+            self._snips_menu.removeAction(act)
+        self._snip_toggle_actions = {}
+        if not self._project_id:
+            return
+        for s in db.get_snips(self._project_id):
+            act = QAction(s["name"], self)
+            act.setCheckable(True)
+            act.setChecked(s["id"] in self._snip_windows)
+            act.triggered.connect(lambda checked, sid=s["id"]: self._toggle_snip_visibility(sid, checked))
+            self._snips_menu.insertAction(self._snips_sep_bottom, act)
+            self._snip_toggle_actions[s["id"]] = act
+
+    def _manage_snips(self):
+        if not self._project_id:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        from snip_window import ManageSnipsDialog
+        dlg = ManageSnipsDialog(self._project_id, self)
+        dlg.exec_()
+        existing = {s["id"]: s["name"] for s in db.get_snips(self._project_id)}
+        for sid in list(self._snip_windows.keys()):
+            if sid not in existing:
+                self._snip_windows[sid].close()
+            else:
+                self._snip_windows[sid].set_name(existing[sid])
+        self._rebuild_snips_menu()
+
+    def _restore_snip_windows(self):
+        """Called whenever the open project changes — close whatever snip
+        windows belonged to the previous project, then reopen (at their
+        saved position/size) whichever snips were left visible for the
+        newly opened one."""
+        for win in list(self._snip_windows.values()):
+            win.close()
+        self._snip_windows = {}
+        if self._project_id:
+            for s in db.get_snips(self._project_id):
+                if s["visible"]:
+                    img = db.get_snip_image(s["id"])
+                    if img:
+                        self._open_snip_window(s["id"], s["name"], img,
+                                               s["win_x"], s["win_y"], s["win_w"], s["win_h"])
+        self._rebuild_snips_menu()
 
     def _on_scale_measured(self, pt1, pt2):
         """Called after user clicks two points; opens ScaleDialog to enter real distance."""
@@ -2584,12 +3557,41 @@ class MainWindow(QMainWindow):
             for p in db.get_projects():
                 if p["id"]==self._project_id and p["pdf_path"]:
                     self._open_pdf(p["pdf_path"]); break
+            self._restore_snip_windows()
             self._update_title()
 
     def _load_pdf(self):
         if not self._project_id: QMessageBox.warning(self,"No Project","Open or create a project first."); return
         path,_ = QFileDialog.getOpenFileName(self,"Open PDF","","PDF Files (*.pdf)")
         if path: self._open_pdf(path); db.update_project_pdf(self._project_id,path)
+
+    def _manage_pages(self):
+        if not self._doc:
+            QMessageBox.warning(self, "No PDF", "Load a PDF first.")
+            return
+        from manage_pages_dialog import ManagePagesDialog
+        dlg = ManagePagesDialog(self._doc, self._project_id, self._pdf_path, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        kept, labels = dlg.result_data()
+        if kept == list(range(len(self._doc))) and not dlg.labels_changed():
+            return  # nothing changed — skip the file rewrite entirely
+        try:
+            backup_path = os.path.splitext(self._pdf_path)[0] + "_backup.pdf"
+            shutil.copy2(self._pdf_path, backup_path)
+            new_doc = fitz.open(self._pdf_path)   # fresh copy — self._doc stays untouched until this succeeds
+            new_doc.select(kept)
+            new_doc.save(self._pdf_path, incremental=False)
+            new_doc.close()
+            self._doc.close()
+            db.rewrite_page_data(self._project_id, self._pdf_path, kept)
+            for new_idx, label in labels.items():
+                db.set_page_label(self._project_id, self._pdf_path, new_idx, label)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to update pages:\n{e}")
+            return
+        self._open_pdf(self._pdf_path)
+        self.statusBar().showMessage(f"Pages updated — backup saved to {os.path.basename(backup_path)}")
 
     def _open_pdf(self, path):
         if not os.path.exists(path): self.statusBar().showMessage(f"PDF not found: {path}"); return
@@ -2619,14 +3621,26 @@ class MainWindow(QMainWindow):
             # Restore saved scale for page 0
             ppm = db.get_page_scale(self._project_id, path, 0)
             self.canvas.set_page_scale(ppm if ppm else 0.0)
+            # Load saved field notes / trace lines (independent markup layer)
+            self.canvas.load_saved_field_notes(db.get_field_notes(self._project_id, path))
+            self.canvas.load_saved_field_lines(db.get_field_lines(self._project_id, path))
         self._show_page()
         self.statusBar().showMessage(f"Loaded: {os.path.basename(path)}")
+
+    def _update_page_label(self):
+        total = len(self._doc) if self._doc else 0
+        text = f"Page {self._page_index+1} of {total}"
+        if self._project_id and self._pdf_path:
+            lbl = db.get_page_label(self._project_id, self._pdf_path, self._page_index)
+            if lbl:
+                text += f"  —  {lbl}"
+        self.page_label.setText(text)
 
     def _show_page(self):
         if not self._doc: return
         self.canvas.load_page(self._doc, self._page_index, self._pdf_path)
         total = len(self._doc)
-        self.page_label.setText(f"Page {self._page_index+1} of {total}")
+        self._update_page_label()
         self.prev_btn.setEnabled(self._page_index>0)
         self.next_btn.setEnabled(self._page_index<total-1)
         # Restore scale for this page (may differ per page)
@@ -2638,13 +3652,14 @@ class MainWindow(QMainWindow):
     def _prev_page(self):
         if self._doc and self._page_index>0:
             self._page_index-=1; self.canvas.set_page(self._page_index)
-            self.page_label.setText(f"Page {self._page_index+1} of {len(self._doc)}")
+            self._update_page_label()
             self.prev_btn.setEnabled(self._page_index>0); self.next_btn.setEnabled(True)
 
     def _next_page(self):
         if self._doc and self._page_index<len(self._doc)-1:
             self._page_index+=1; self.canvas.set_page(self._page_index)
-            total=len(self._doc); self.page_label.setText(f"Page {self._page_index+1} of {total}")
+            total=len(self._doc)
+            self._update_page_label()
             self.prev_btn.setEnabled(True); self.next_btn.setEnabled(self._page_index<total-1)
 
     def _fit_page(self):
@@ -2661,6 +3676,13 @@ class MainWindow(QMainWindow):
             self.measure_length_action.setChecked(False)
             self.measure_area_action.setChecked(False)
             self.canvas.set_measure_mode(None)
+        if checked and (self.field_note_action.isChecked() or self.field_line_action.isChecked()):
+            self.field_note_action.setChecked(False)
+            self.field_line_action.setChecked(False)
+            self.canvas.set_field_note_mode(False)
+            self.canvas.set_field_line_mode(False)
+        if checked:
+            self.canvas.set_snip_mode(False)
         e = self.takeoff_panel._active_entity
         is_linear = e and e["type"] == "assembly" and e["data"].get("is_linear")
 
@@ -2719,11 +3741,16 @@ class MainWindow(QMainWindow):
         color = color_for_id(eid if etype=="product" else 1000+eid)
         label = entity["name"][0].upper()
         ctype, cr_m = _coverage_for_product(entity) if etype == "product" else ("", 0.0)
+        # Default Candela on the product just pre-fills each new placement —
+        # the value actually lives on the mark and can be changed per-device
+        # afterward (right-click -> Set Candela…), independent of every
+        # other plot of the same product.
+        candela = (entity.get("candela", 0) or 0.0) if etype == "product" else 0.0
 
         db_id = db.add_mark(self._project_id, self._pdf_path, self._page_index,
-                            page_pt.x(), page_pt.y(), etype, eid, color, label, section_id)
+                            page_pt.x(), page_pt.y(), etype, eid, color, label, section_id, candela)
         self.canvas.add_mark(page_pt.x(), page_pt.y(), etype, eid, color, label, db_id, section_id,
-                             coverage_type=ctype, coverage_radius_m=cr_m)
+                             coverage_type=ctype, coverage_radius_m=cr_m, candela=candela)
         self.takeoff_panel.set_active_entity(etype, entity)
         self.takeoff_panel.add_one()
         if etype == "product":
@@ -2743,6 +3770,11 @@ class MainWindow(QMainWindow):
         if db_id: db.delete_mark(db_id)
         self.takeoff_panel.subtract_one(entity_type, entity_id)
         self.statusBar().showMessage("Mark deleted  count adjusted.")
+
+    def _on_mark_candela_changed(self, db_id, candela):
+        if db_id:
+            db.update_mark_candela(db_id, candela)
+            self.statusBar().showMessage(f"Candela set to {candela:g} cd.")
 
     def _on_product_selected(self, p):
         self.takeoff_panel.set_active_entity("product", p)
@@ -2839,35 +3871,18 @@ class MainWindow(QMainWindow):
         if not self._doc:
             QMessageBox.warning(self, "No PDF", "Load a PDF first.")
             return
-        menu = QMenu(self)
-        menu.setStyleSheet("QMenu { background:#232728; color:#efe6e1; border:1px solid #555; }"
-                           "QMenu::item { padding:8px 24px; }"
-                           "QMenu::item:selected { background:#ff7002; color:white; }")
-        act_marks  = menu.addAction("With Marks")
-        act_design = menu.addAction("With Design (coverage circles)")
-        act_both   = menu.addAction("Both")
-        menu.addSeparator()
-        act_none   = menu.addAction("Clean (no annotations)")
-
-        # Show menu centred on the main window
-        geo  = self.geometry()
-        hint = menu.sizeHint()
-        pos  = QPoint(geo.left() + (geo.width()  - hint.width())  // 2,
-                      geo.top()  + (geo.height() - hint.height()) // 2)
-        chosen = menu.exec_(pos)
-
-        if chosen is None:
+        dlg = ExportPdfDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
             return
-        draw_marks  = chosen in (act_marks,  act_both)
-        draw_design = chosen in (act_design, act_both)
-        self._do_export_pdf(draw_marks, draw_design)
+        draw_marks, draw_design, draw_field_notes = dlg.selections()
+        self._do_export_pdf(draw_marks, draw_design, draw_field_notes)
 
-    def _do_export_pdf(self, draw_marks, draw_design):
-        suffix = ""
-        if draw_marks and draw_design: suffix = "_annotated"
-        elif draw_marks:               suffix = "_marked"
-        elif draw_design:              suffix = "_design"
-        else:                          suffix = "_clean"
+    def _do_export_pdf(self, draw_marks, draw_design, draw_field_notes=False):
+        suffix_parts = []
+        if draw_marks:       suffix_parts.append("marked")
+        if draw_design:      suffix_parts.append("design")
+        if draw_field_notes: suffix_parts.append("notes")
+        suffix = "_" + "_".join(suffix_parts) if suffix_parts else "_clean"
 
         path, _ = QFileDialog.getSaveFileName(
             self, "Save PDF",
@@ -2880,10 +3895,20 @@ class MainWindow(QMainWindow):
             out.insert_pdf(self._doc)
             all_marks = self.canvas._page_marks
             ppm = self.canvas._points_per_meter
+            all_lines = self.canvas._page_field_lines
+            all_notes = self.canvas._page_field_notes
 
-            for (pdf_p, pg_idx), marks in all_marks.items():
-                if pdf_p != self._pdf_path:
-                    continue
+            pages_touched = set()
+            for (pdf_p, pg_idx) in all_marks.keys():
+                if pdf_p == self._pdf_path: pages_touched.add(pg_idx)
+            if draw_field_notes:
+                for (pdf_p, pg_idx) in all_lines.keys():
+                    if pdf_p == self._pdf_path: pages_touched.add(pg_idx)
+                for (pdf_p, pg_idx) in all_notes.keys():
+                    if pdf_p == self._pdf_path: pages_touched.add(pg_idx)
+
+            for pg_idx in pages_touched:
+                marks = all_marks.get((self._pdf_path, pg_idx), [])
                 page = out[pg_idx]
 
                 # Coverage circles
@@ -2914,6 +3939,43 @@ class MainWindow(QMainWindow):
                         if m["label"]:
                             page.insert_text(fitz.Point(cx - r + 1, cy + r - 1),
                                              m["label"], fontsize=7, color=(1, 1, 1))
+
+                # Field Notes markup layer — trace lines (with arrowhead), then text notes on top
+                if draw_field_notes:
+                    for ln in all_lines.get((self._pdf_path, pg_idx), []):
+                        import json as _json
+                        try:
+                            pts = _json.loads(ln["points"])
+                        except Exception:
+                            continue
+                        if len(pts) < 2:
+                            continue
+                        c = QColor(ln.get("color", "#000000"))
+                        col = (c.redF(), c.greenF(), c.blueF())
+                        width = ln.get("width", 2.0)
+                        for i in range(1, len(pts)):
+                            page.draw_line(fitz.Point(pts[i-1]["x"], pts[i-1]["y"]),
+                                           fitz.Point(pts[i]["x"], pts[i]["y"]),
+                                           color=col, width=width)
+                        wings = _arrow_wings(pts[-2]["x"], pts[-2]["y"], pts[-1]["x"], pts[-1]["y"],
+                                             size=10 + width)
+                        if wings:
+                            tip = fitz.Point(pts[-1]["x"], pts[-1]["y"])
+                            for wx, wy in wings:
+                                page.draw_line(tip, fitz.Point(wx, wy), color=col, width=width)
+                    for n in all_notes.get((self._pdf_path, pg_idx), []):
+                        c = QColor(n.get("color", "#000000"))
+                        col = (c.redF(), c.greenF(), c.blueF())
+                        fontname = "hebo" if n.get("bold") else "helv"
+                        fsize = n.get("font_size", 10.0)
+                        pad = 3
+                        tw = fitz.get_text_length(n["text"], fontname=fontname, fontsize=fsize) + pad * 2
+                        th = fsize * 1.3 + pad * 2
+                        cx, cy = n["page_x"], n["page_y"]
+                        oval_rect = fitz.Rect(cx - tw/2, cy - th/2, cx + tw/2, cy + th/2)
+                        page.draw_oval(oval_rect, color=col, width=1.5)
+                        page.insert_text(fitz.Point(cx - tw/2 + pad, cy + fsize/3), n["text"],
+                                         fontsize=fsize, color=col, fontname=fontname)
 
             out.save(path)
             out.close()
@@ -2986,6 +4048,11 @@ class MainWindow(QMainWindow):
                 if p["id"]==self._project_id:
                     self.setWindowTitle(f"DFP TakeoffPro    {p['name']}"); return
         self.setWindowTitle("DFP TakeoffPro")
+
+    def closeEvent(self, event):
+        for win in list(self._snip_windows.values()):
+            win.close()
+        super().closeEvent(event)
 
 
 # 

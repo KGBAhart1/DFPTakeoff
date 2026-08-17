@@ -1,5 +1,5 @@
 APP_NAME     = "DFP TakeoffPro"
-APP_VERSION  = "1.3.3"          # <-- bump this for every release
+APP_VERSION  = "1.4.0"          # <-- bump this for every release
 APP_COMPANY  = "Defense Fire Protection"
 
 # Auto-update flow:

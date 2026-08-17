@@ -1,5 +1,5 @@
 {
-  "version": "1.3.3",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.3.3/DFP_TakeoffPro_Setup_1.3.3.exe",
-  "notes": "Toolbar cleanup: the main toolbar and Drawing Designer toolbar now group related tools into hover/click dropdowns (Designers, Quotes, Measure Tools, Coverage Toggles; Floor Plan Tools, Background Trace, One-Line Tools) instead of showing every button at once. Fixed a crash when opening the Coverage dropdown. Added a searchable Help menu (like the main Takeoff and Suppression Designer ones) to the Paint Booth Designer, and upgraded the Drawing Designer's Help button to the same searchable format."
+  "version": "1.4.0",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.4.0/DFP_TakeoffPro_Setup_1.4.0.exe",
+  "notes": "New in the Takeoff: Manage Pages to rename/delete pages on an uploaded print without needing consecutive selections; a Field Notes markup layer (styled text notes with a circle marker, plus arrow trace lines) that's independent of your device counts and can be included or hidden on export; a 'Build Submittal — No Counts' option to send shop drawings before a quote is done; Snips — pin a crop of any page (like a symbol legend) in its own floating, resizable window you can leave open across sessions; the device library now groups into collapsible category/subcategory dropdowns you define yourself; and per-device Candela tracking (15/30/75/110/135/177/185cd) set independently on each placed strobe, with a Candela Load Summary on export that can be scoped to selected sections."
 }

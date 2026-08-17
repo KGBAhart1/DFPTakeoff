@@ -625,6 +625,10 @@
    'C:\\Users\\Kevin\\OneDrive - Defense Fire '
    'Protection\\Takeoff\\excel_export.py',
    'PYMODULE'),
+  ('field_note_dialog',
+   'C:\\Users\\Kevin\\OneDrive - Defense Fire '
+   'Protection\\Takeoff\\field_note_dialog.py',
+   'PYMODULE'),
   ('fitz',
    'C:\\Users\\Kevin\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\fitz\\__init__.py',
    'PYMODULE'),
@@ -1391,6 +1395,10 @@
   ('lzma',
    'C:\\Users\\Kevin\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\lzma.py',
    'PYMODULE'),
+  ('manage_pages_dialog',
+   'C:\\Users\\Kevin\\OneDrive - Defense Fire '
+   'Protection\\Takeoff\\manage_pages_dialog.py',
+   'PYMODULE'),
   ('mimetypes',
    'C:\\Users\\Kevin\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\mimetypes.py',
    'PYMODULE'),
@@ -2096,6 +2104,10 @@
    'PYMODULE'),
   ('signal',
    'C:\\Users\\Kevin\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\signal.py',
+   'PYMODULE'),
+  ('snip_window',
+   'C:\\Users\\Kevin\\OneDrive - Defense Fire '
+   'Protection\\Takeoff\\snip_window.py',
    'PYMODULE'),
   ('socket',
    'C:\\Users\\Kevin\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\socket.py',
