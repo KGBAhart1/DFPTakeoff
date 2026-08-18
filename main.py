@@ -2225,7 +2225,8 @@ class SubmittalProductPickerDialog(QDialog):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Check the products to include. Only products with a "
-                                 "shop drawing attached can be selected."))
+                                 "shop drawing attached can be selected — select a product "
+                                 "below and click \"Attach Shop Drawing…\" to add one on the spot."))
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search…")
         self._search.textChanged.connect(self._apply_filter)
@@ -2233,6 +2234,13 @@ class SubmittalProductPickerDialog(QDialog):
 
         self._list = QListWidget()
         layout.addWidget(self._list)
+
+        attach_row = QHBoxLayout()
+        attach_btn = QPushButton("Attach Shop Drawing…")
+        attach_btn.clicked.connect(self._attach_drawing)
+        attach_row.addWidget(attach_btn)
+        attach_row.addStretch()
+        layout.addLayout(attach_row)
 
         br = QHBoxLayout()
         ok = QPushButton("Build Submittal")
@@ -2243,13 +2251,18 @@ class SubmittalProductPickerDialog(QDialog):
         br.addStretch(); br.addWidget(cancel); br.addWidget(ok)
         layout.addLayout(br)
 
-    def _load(self):
+    def _load(self, reselect_product_id=None, check_ids=None):
+        # Remember which products were already checked so re-loading after
+        # attaching a drawing (or filtering) doesn't lose the selection.
+        if check_ids is None:
+            check_ids = {p["id"] for p in self.selected_products()} if self._list.count() else set()
         self._list.clear()
         products = db.get_products()
         last_category = None
         for p in products:
-            if p["category"] != last_category:
-                last_category = p["category"]
+            cat = p["category"] or "General"
+            if cat != last_category:
+                last_category = cat
                 hdr = QListWidgetItem(last_category)
                 hdr.setFlags(Qt.NoItemFlags)
                 f = hdr.font(); f.setBold(True); hdr.setFont(f)
@@ -2262,12 +2275,31 @@ class SubmittalProductPickerDialog(QDialog):
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, dict(p))
             if has_drawing:
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                item.setCheckState(Qt.Checked if p["id"] in check_ids else Qt.Unchecked)
             else:
-                item.setFlags(Qt.NoItemFlags)
+                # Still selectable (so "Attach Shop Drawing…" can target it),
+                # just not checkable until a drawing is attached.
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 item.setForeground(QColor("#999999"))
             self._list.addItem(item)
+            if reselect_product_id is not None and p["id"] == reselect_product_id:
+                self._list.setCurrentItem(item)
+
+    def _attach_drawing(self):
+        item = self._list.currentItem()
+        data = item.data(Qt.UserRole) if item else None
+        if data is None:
+            QMessageBox.information(self, "Select a Product",
+                                    "Click a product in the list first, then Attach Shop Drawing…")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Shop Drawing", "",
+            "Documents (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
+        if not path:
+            return
+        db.set_product_shop_drawing(data["id"], path)
+        self._load(reselect_product_id=data["id"])
 
     def _apply_filter(self, text):
         text = text.lower().strip()
@@ -2678,24 +2710,40 @@ class TakeoffPanel(QWidget):
                 if y>745: break
             prog.setValue(1)
 
+            known_image_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+            failed = []
             for i,(p,qty) in enumerate(drawings):
                 QApplication.processEvents()
                 if prog.wasCanceled(): break
                 prog.setValue(i+1)
-                ext = os.path.splitext(p["shop_drawing_path"])[1].lower()
-                if ext == ".pdf":
-                    src = fitz.open(p["shop_drawing_path"])
-                    out_doc.insert_pdf(src); src.close()
-                else:
-                    pg = out_doc.new_page(width=612,height=792)
-                    pg.insert_image(fitz.Rect(36,50,576,756), filename=p["shop_drawing_path"])
-                    qty_str = f"  (qty: {qty})" if qty is not None else ""
-                    pg.insert_text((36,36),f"{p['name']}    {p['code'] or ''}{qty_str}",
-                                    fontsize=10,fontname="helv",color=(0.4,0.4,0.4))
+                drawing_path = p["shop_drawing_path"]
+                # One bad/missing/unreadable file shouldn't take down the
+                # whole submittal — skip it and report it at the end instead.
+                if not drawing_path or not os.path.exists(drawing_path):
+                    failed.append(f"{p['name']} — file not found: {drawing_path}")
+                    continue
+                ext = os.path.splitext(drawing_path)[1].lower()
+                try:
+                    if ext == ".pdf":
+                        src = fitz.open(drawing_path)
+                        out_doc.insert_pdf(src); src.close()
+                    elif ext in known_image_exts:
+                        pg = out_doc.new_page(width=612,height=792)
+                        pg.insert_image(fitz.Rect(36,50,576,756), filename=drawing_path)
+                        qty_str = f"  (qty: {qty})" if qty is not None else ""
+                        pg.insert_text((36,36),f"{p['name']}    {p['code'] or ''}{qty_str}",
+                                        fontsize=10,fontname="helv",color=(0.4,0.4,0.4))
+                    else:
+                        failed.append(f"{p['name']} — unsupported file type: {ext or '(none)'}")
+                except Exception as item_err:
+                    failed.append(f"{p['name']} — {item_err}")
 
             prog.setValue(len(drawings)+1)
             out_doc.save(out_path); out_doc.close()
-            QMessageBox.information(self,"Done",f"Submittal saved:\n{out_path}")
+            msg = f"Submittal saved:\n{out_path}"
+            if failed:
+                msg += "\n\nSkipped (couldn't include):\n" + "\n".join(f"  {f}" for f in failed)
+            QMessageBox.information(self,"Done",msg)
             os.startfile(out_path)
         except Exception as e:
             QMessageBox.critical(self,"Error",f"Failed to build submittal:\n{e}")
@@ -3021,6 +3069,11 @@ class MainWindow(QMainWindow):
                      "and export quote-ready PDFs. Includes freeform wiring diagram and fire "
                      "alarm one-line diagram tabs.")
         a.triggered.connect(self._open_drawing_designer)
+        a = self._designers_menu.addAction("Fire Plan Builder")
+        a.setToolTip("Assemble an AHJ Fire Safety Plan submission package (starting with Calgary): "
+                     "Vital Building Information form, base building drawings, fire alarm zone "
+                     "drawings, and maintenance certificates, in the required order.")
+        a.triggered.connect(self._open_fire_plan_builder)
         self._designers_btn.setMenu(self._designers_menu)
         tb.addWidget(self._designers_btn)
 
@@ -4030,6 +4083,23 @@ class MainWindow(QMainWindow):
         # create a modal-within-modal loop that crashes on Windows builds.
         dlg = DrawingDesigner(self, project_name=proj_name)
         self._floor_plan_dlg = dlg  # keep reference so GC doesn't destroy it
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _open_fire_plan_builder(self):
+        if not self._project_id:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        from fire_plan_builder import FirePlanBuilderWindow
+        proj_name = next((p["name"] for p in db.get_projects() if p["id"] == self._project_id), "")
+        # Non-modal, same reasoning as Drawing Designer above — this window
+        # opens its own nested dialogs (VBI form, file pickers) and can
+        # launch Drawing Designer itself via its "Open Drawing Designer"
+        # shortcut, which would be blocked/frozen behind an app-modal loop.
+        dlg = FirePlanBuilderWindow(self, self._project_id, proj_name)
+        self._fire_plan_dlg = dlg   # keep reference so GC doesn't destroy it
         dlg.setAttribute(Qt.WA_DeleteOnClose)
         dlg.show()
         dlg.raise_()

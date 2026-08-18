@@ -1,5 +1,5 @@
 {
-  "version": "1.4.1",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.4.1/DFP_TakeoffPro_Setup_1.4.1.exe",
-  "notes": "Fix Manage Pages: renaming or deleting pages on an uploaded print was failing with \"save to original must be incremental\" — PyMuPDF refuses to save a trimmed/reordered PDF back over the exact file it was opened from. Manage Pages now writes the result to a scratch file first and swaps it into place, so rename and delete both work correctly again."
+  "version": "1.5.0",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.5.0/DFP_TakeoffPro_Setup_1.5.0.exe",
+  "notes": "New: Fire Plan Builder (Designers menu) — assembles an AHJ Fire Safety Plan submission package, starting with Calgary. Fill out a Vital Building Information form matching Calgary Fire's official FD 1019 sheet field-for-field, attach your Base Building Drawings and Fire Alarm Zone Drawings (exported from Drawing Designer) and any Maintenance Certificates, then build one correctly-ordered package PDF. Everything saves as you go — close and reopen a project days later and pick up right where you left off, including mid-form. Export a fill-in-the-blanks Questionnaire PDF at any point to send a customer for whatever info you're missing; dropdown-style questions list their valid answers so it's clear how to respond."
 }

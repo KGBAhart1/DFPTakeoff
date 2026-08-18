@@ -237,6 +237,27 @@ def init_db():
                 FOREIGN KEY (project_id) REFERENCES projects(id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fire_plans (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id          INTEGER NOT NULL UNIQUE,
+                ahj                 TEXT    DEFAULT 'calgary',
+                vbi_data            TEXT    DEFAULT '{}',
+                has_zoned_alarm     INTEGER DEFAULT 0,
+                base_building_path  TEXT    DEFAULT '',
+                alarm_zone_path     TEXT    DEFAULT '',
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fire_plan_certificates (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id  INTEGER NOT NULL,
+                label       TEXT    DEFAULT '',
+                path        TEXT    NOT NULL,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        """)
         conn.commit()
 
 
@@ -319,6 +340,12 @@ def update_product(pid, name, code, unit_cost, category,
             (name, code, unit_cost, category, shop_drawing_path, image_path,
              coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela, pid),
         )
+        conn.commit()
+
+
+def set_product_shop_drawing(product_id, path):
+    with get_conn() as conn:
+        conn.execute("UPDATE products SET shop_drawing_path=? WHERE id=?", (path, product_id))
         conn.commit()
 
 
@@ -438,6 +465,8 @@ def delete_project(project_id):
         conn.execute("DELETE FROM field_notes WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM field_lines WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM pdf_snips WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM fire_plans WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM fire_plan_certificates WHERE project_id=?", (project_id,))
         conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
         conn.commit()
 
@@ -888,6 +917,52 @@ def update_snip_geometry(snip_id, x, y, w, h):
 def delete_snip(snip_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM pdf_snips WHERE id=?", (snip_id,))
+        conn.commit()
+
+
+# ── Fire Plan Builder (AHJ submission packages) ─────────────────────────────────
+
+def get_fire_plan(project_id):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM fire_plans WHERE project_id=?", (project_id,)
+        ).fetchone()
+
+
+def upsert_fire_plan(project_id, ahj, vbi_data, has_zoned_alarm,
+                     base_building_path, alarm_zone_path):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO fire_plans "
+            "(id, project_id, ahj, vbi_data, has_zoned_alarm, base_building_path, alarm_zone_path) "
+            "VALUES ((SELECT id FROM fire_plans WHERE project_id=?), ?,?,?,?,?,?)",
+            (project_id, project_id, ahj, vbi_data, int(has_zoned_alarm),
+             base_building_path, alarm_zone_path),
+        )
+        conn.commit()
+
+
+def add_fire_plan_certificate(project_id, label, path):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO fire_plan_certificates (project_id, label, path) VALUES (?,?,?)",
+            (project_id, label, path),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_fire_plan_certificates(project_id):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM fire_plan_certificates WHERE project_id=? ORDER BY id",
+            (project_id,),
+        ).fetchall()
+
+
+def delete_fire_plan_certificate(cert_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM fire_plan_certificates WHERE id=?", (cert_id,))
         conn.commit()
 
 

@@ -629,6 +629,10 @@
    'C:\\Users\\Kevin\\OneDrive - Defense Fire '
    'Protection\\Takeoff\\field_note_dialog.py',
    'PYMODULE'),
+  ('fire_plan_builder',
+   'C:\\Users\\Kevin\\OneDrive - Defense Fire '
+   'Protection\\Takeoff\\fire_plan_builder.py',
+   'PYMODULE'),
   ('fitz',
    'C:\\Users\\Kevin\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\site-packages\\fitz\\__init__.py',
    'PYMODULE'),
