@@ -84,6 +84,23 @@ def color_for_id(eid):
     return MARK_COLORS[int(eid) % len(MARK_COLORS)]
 
 
+def _submittals_dir():
+    """Where submittal PDFs get saved by default. The installed app lives
+    in Program Files (installer.iss DefaultDirName={autopf}\\...), which a
+    normal (non-admin) user can't write to — os.makedirs() there raises an
+    uncaught PermissionError inside a button-click handler, which PyQt5
+    treats as a hard crash rather than showing an error dialog. When
+    frozen, use the user's Documents folder instead (always writable);
+    mirrors drawing_designer.py's _submittals_dir()."""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(os.path.expanduser("~"), "Documents", "DFP TakeoffPro")
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "Submittals")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
 def _arrow_wings(fx, fy, tx, ty, size=10, spread_deg=25):
     """Given a line from (fx,fy) to (tx,ty), return the two wing-tip points
     of an arrowhead at (tx,ty) — pure geometry, coordinate-system agnostic
@@ -2682,8 +2699,7 @@ class TakeoffPanel(QWidget):
         """drawings: list of (product_dict, qty_or_None). Shared by both the
         counts-based submittal and the no-counts product-picker submittal."""
         # Default to a Submittals subfolder
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Submittals")
-        os.makedirs(default_dir, exist_ok=True)
+        default_dir = _submittals_dir()
         out_path,_ = QFileDialog.getSaveFileName(
             self,"Save Submittal Package",
             os.path.join(default_dir, f"{pname}_Submittal.pdf"), "PDF (*.pdf)")

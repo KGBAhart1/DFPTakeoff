@@ -1,5 +1,5 @@
 {
-  "version": "1.5.0",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.5.0/DFP_TakeoffPro_Setup_1.5.0.exe",
-  "notes": "New: Fire Plan Builder (Designers menu) — assembles an AHJ Fire Safety Plan submission package, starting with Calgary. Fill out a Vital Building Information form matching Calgary Fire's official FD 1019 sheet field-for-field, attach your Base Building Drawings and Fire Alarm Zone Drawings (exported from Drawing Designer) and any Maintenance Certificates, then build one correctly-ordered package PDF. Everything saves as you go — close and reopen a project days later and pick up right where you left off, including mid-form. Export a fill-in-the-blanks Questionnaire PDF at any point to send a customer for whatever info you're missing; dropdown-style questions list their valid answers so it's clear how to respond."
+  "version": "1.5.1",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.5.1/DFP_TakeoffPro_Setup_1.5.1.exe",
+  "notes": "Fix a crash on \"Build Submittal — No Counts\" and Fire Plan Builder's package/questionnaire export. The installed app lives in Program Files, which a normal user account can't write to — those features tried to create their default save folder there, which crashed the app instantly instead of showing an error. They now default to Documents\\DFP TakeoffPro\\Submittals, same as everywhere else in the app."
 }

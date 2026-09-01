@@ -21,6 +21,23 @@ from PyQt5.QtCore import Qt
 import db
 
 
+def _submittals_dir():
+    """Where package/questionnaire PDFs get saved by default. The installed
+    app lives in Program Files, which a normal (non-admin) user can't
+    write to — os.makedirs() there raises an uncaught PermissionError
+    inside a button-click handler, which PyQt5 treats as a hard crash
+    rather than showing an error dialog. When frozen, use the user's
+    Documents folder instead (always writable); mirrors
+    drawing_designer.py's _submittals_dir()."""
+    if getattr(sys, "frozen", False):
+        base = os.path.join(os.path.expanduser("~"), "Documents", "DFP TakeoffPro")
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "Submittals")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AHJ registry — adding a new city later is a new entry here, not new logic
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -277,8 +294,7 @@ class VBIFormDialog(QDialog):
 
     def _export_questionnaire(self):
         values = self.result_data()
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Submittals")
-        os.makedirs(default_dir, exist_ok=True)
+        default_dir = _submittals_dir()
         building = self._project_meta.get("building_name") or self._project_meta.get("project_name", "VBI")
         default_name = os.path.join(default_dir, f"{building}_VBI_Questionnaire.pdf")
         path, _ = QFileDialog.getSaveFileName(self, "Export Questionnaire", default_name, "PDF (*.pdf)")
@@ -573,8 +589,7 @@ class FirePlanBuilderWindow(QDialog):
         self._refresh_status_labels()
 
     def _export_vbi_questionnaire(self):
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Submittals")
-        os.makedirs(default_dir, exist_ok=True)
+        default_dir = _submittals_dir()
         default_name = os.path.join(default_dir, f"{self._project_name or 'VBI'}_VBI_Questionnaire.pdf")
         path, _ = QFileDialog.getSaveFileName(self, "Export Questionnaire", default_name, "PDF (*.pdf)")
         if not path:
@@ -670,8 +685,7 @@ class FirePlanBuilderWindow(QDialog):
                 "Building has a zoned alarm system — attach Fire Alarm Zone Drawings first.")
             return
 
-        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Submittals")
-        os.makedirs(default_dir, exist_ok=True)
+        default_dir = _submittals_dir()
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Save Fire Safety Plan Package",
             os.path.join(default_dir, f"{self._project_name or 'FireSafetyPlan'}_FireSafetyPlan.pdf"),
