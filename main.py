@@ -2641,7 +2641,7 @@ class TakeoffPanel(QWidget):
         path,_ = QFileDialog.getSaveFileName(self,"Save Excel",f"{pname}{suffix}.xlsx","Excel (*.xlsx)")
         if not path: return
         try:
-            candela_breakdown = db.get_candela_breakdown(self._project_id, section_ids or None)
+            candela_breakdown = db.get_candela_breakdown_by_section(self._project_id, section_ids or None)
             excel_export.export_takeoff(pname, items, path, candela_breakdown)
             QMessageBox.information(self,"Exported",f"Saved to:\n{path}")
             os.startfile(path)
@@ -3061,6 +3061,17 @@ class MainWindow(QMainWindow):
         self.count_action = QAction("Start Counting", self); self.count_action.setCheckable(True)
         self.count_action.triggered.connect(self._toggle_counting); tb.addAction(self.count_action)
         a = QAction("Clear Marks (page)", self); a.triggered.connect(self.canvas.clear_marks_current_page); tb.addAction(a)
+        tb.addWidget(QLabel("  Candela:"))
+        self._active_candela_combo = QComboBox()
+        self._active_candela_combo.addItem("N/A", 0)
+        for cd in CANDELA_OPTIONS:
+            self._active_candela_combo.addItem(f"{cd} cd", cd)
+        self._active_candela_combo.setToolTip(
+            "Set a candela rating here, then count every device at that rating —\n"
+            "each new mark gets this candela automatically. Switch it and keep\n"
+            "counting for the next rating, instead of right-clicking each device.\n"
+            "Leave at N/A to use each product's own Default Candela as before.")
+        tb.addWidget(self._active_candela_combo)
         tb.addSeparator()
         a = QAction("Export PDF", self); a.triggered.connect(self._export_pdf_menu); tb.addAction(a)
         tb.addSeparator()
@@ -3815,11 +3826,17 @@ class MainWindow(QMainWindow):
         color = color_for_id(eid if etype=="product" else 1000+eid)
         label = entity["name"][0].upper()
         ctype, cr_m = _coverage_for_product(entity) if etype == "product" else ("", 0.0)
-        # Default Candela on the product just pre-fills each new placement —
-        # the value actually lives on the mark and can be changed per-device
-        # afterward (right-click -> Set Candela…), independent of every
-        # other plot of the same product.
-        candela = (entity.get("candela", 0) or 0.0) if etype == "product" else 0.0
+        # The toolbar's "Candela:" selector, when set, overrides the
+        # product's own Default Candela for every mark placed while it's
+        # active — set it once, count a batch of devices at that rating,
+        # switch it, count the next batch — instead of right-clicking each
+        # device individually. Leave it at N/A to fall back to whatever
+        # each product's own Default Candela is (previous behavior).
+        active_candela = self._active_candela_combo.currentData()
+        if active_candela:
+            candela = float(active_candela)
+        else:
+            candela = (entity.get("candela", 0) or 0.0) if etype == "product" else 0.0
 
         db_id = db.add_mark(self._project_id, self._pdf_path, self._page_index,
                             page_pt.x(), page_pt.y(), etype, eid, color, label, section_id, candela)

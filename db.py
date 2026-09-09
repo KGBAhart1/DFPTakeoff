@@ -671,6 +671,32 @@ def get_candela_breakdown(project_id, section_ids=None):
         return {r["candela"]: r["cnt"] for r in rows}
 
 
+def get_candela_breakdown_by_section(project_id, section_ids=None):
+    """Device count per (section, device, candela rating) for the export's
+    Candela Load Summary — nested under each area/section instead of one
+    flat project-wide total, e.g. Floor 1 -> Horn Strobe -> 15cd: 5, 110cd: 5.
+    Returns rows ordered by section sort order, then device name, then
+    candela. Unassigned (no-section) marks show under 'Unassigned'."""
+    with get_conn() as conn:
+        base_sql = """
+            SELECT COALESCE(s.name, 'Unassigned') as section_name,
+                   COALESCE(s.sort_order, 999999) as section_sort,
+                   COALESCE(p.name, 'Assembly') as device_name,
+                   m.candela, COUNT(*) as cnt
+            FROM marks m
+            LEFT JOIN sections s ON m.section_id = s.id
+            LEFT JOIN products p ON m.entity_type='product' AND m.entity_id = p.id
+            WHERE m.project_id=? AND m.candela > 0
+        """
+        params = [project_id]
+        if section_ids:
+            placeholders = ",".join("?" * len(section_ids))
+            base_sql += f" AND m.section_id IN ({placeholders})"
+            params.extend(section_ids)
+        base_sql += " GROUP BY section_name, device_name, m.candela ORDER BY section_sort, section_name, device_name, m.candela"
+        return conn.execute(base_sql, params).fetchall()
+
+
 def get_page_scale(project_id, pdf_path, page_index):
     """Return points_per_meter for this page, or None if not set."""
     with get_conn() as conn:

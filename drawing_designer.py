@@ -133,11 +133,11 @@ from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QLineEdit, QComboBox, QScrollArea,
     QTabWidget, QInputDialog, QFileDialog, QLayout, QSizePolicy,
     QSpinBox, QRadioButton, QButtonGroup, QListWidget, QListWidgetItem,
-    QToolButton,
+    QToolButton, QAbstractItemView, QGraphicsPathItem, QPlainTextEdit,
 )
 from PyQt5.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPainterPath,
-    QCursor, QPixmap, QIcon, QImage,
+    QCursor, QPixmap, QIcon, QImage, QPainterPathStroker,
 )
 from PyQt5.QtCore import Qt, QRectF, QPointF, QSizeF, pyqtSignal, QRect, QPoint, QSize, QTimer
 import fitz
@@ -798,6 +798,7 @@ FA_DEVICE_TYPES = {
     "horn_strobe_110": {"name":"Horn/Strobe (110cd)",    "category":"nac", "ma":183, "abbr":"HS110"},
     "speaker":         {"name":"Speaker",                "category":"nac", "ma":30,  "abbr":"SPK"},
     "speaker_strobe":  {"name":"Speaker/Strobe",         "category":"nac", "ma":88,  "abbr":"SPKS"},
+    "iso_module_nac":  {"name":"Isolator Module",        "category":"nac", "ma":0.0, "abbr":"ISO"},
 
     # Autocall TrueAlert conventional (non-addressable) — real nameplate mA
     # per manufacturer datasheets AC4906-0001 (VO), AC4906-0010 (weatherproof),
@@ -829,29 +830,226 @@ CIRCUIT_TYPE_INFO = {
 }
 BOOSTER_CAPACITY_PRESETS_MA = [2500, 3000, 4000, 6000, 6500, 8000]
 
+def elbow_points(x1, y1, x2, y2, mid_y=None):
+    """Vertices of a right-angle "elbow" connector from (x1,y1) to (x2,y2) —
+    drop straight down to `mid_y`, cross straight over, drop straight down
+    to the target — instead of one diagonal line, matching standard
+    schematic/riser connector routing. `mid_y` defaults to the vertical
+    midpoint but is a free parameter so a connector's jog can be dragged to
+    any height. Falls back to a single straight segment when the two points
+    already share an x (nothing to route around)."""
+    if abs(x1 - x2) < 0.5:
+        return [(x1, y1), (x2, y2)]
+    if mid_y is None:
+        mid_y = y1 + (y2 - y1) / 2
+    return [(x1, y1), (x1, mid_y), (x2, mid_y), (x2, y2)]
+
+
+def default_start_point(parent_node, child_node):
+    """Local (x,y) offset — from parent_node.pos() — where a connector to
+    child_node leaves the parent by default (before any user drag). Covers
+    three cases: a booster (or a circuit T-tapped off an isolator device)
+    branching off a specific point mid-line (child.tap_index); a circuit
+    that CONTINUES its parent's line end-to-end into the next box, in
+    series — not a branch — (child.continues_parent_line, leaving from the
+    parent's own terminus_point()); and the generic bottom-edge default."""
+    if isinstance(parent_node, CircuitNode) and getattr(child_node, "continues_parent_line", False):
+        return parent_node.terminus_point()
+    if isinstance(parent_node, CircuitNode) and child_node.tap_index is not None:
+        return QPointF(*parent_node.device_position(child_node.tap_index))
+    if isinstance(child_node, CircuitNode) and child_node.circuit_class == "A":
+        return QPointF(parent_node._w/2 - 20, parent_node._h)
+    return QPointF(parent_node._w/2, parent_node._h)
+
+
+def return_target_node(parent_node, child_node):
+    """The Panel/Booster that actually sources this Class A loop — walks
+    up through any chained CircuitNode ancestors (box1 -> box2 -> box3...)
+    to find it, so a circuit several boxes deep in a chain still closes
+    its RETURN leg at the real electrical source instead of at whichever
+    box happens to sit next to it in the chain. For a non-chained circuit
+    (parent is already the panel/booster) this is just parent_node itself.
+    Only called when the circuit is actually showing a return leg — see
+    CircuitNode.class_a_return_to_panel, which gates whether one is drawn
+    at all."""
+    node = parent_node
+    while isinstance(node, CircuitNode) and node.parent_node is not None:
+        node = node.parent_node
+    return node
+
+
+def default_end_point(child_node):
+    """Local (x,y) offset — from child_node.pos() — where a connector from
+    its parent arrives on child_node by default (before any user drag)."""
+    if isinstance(child_node, CircuitNode):
+        return QPointF(OL_MARGIN, OL_HEADER_H + OL_ROW_H/2)
+    return QPointF(child_node._w/2, 0)
+
+
+def default_return_start_point(circuit_node):
+    """Local (x,y) offset — from circuit_node.pos() — where a Class A
+    circuit's RETURN leg leaves the far end of its own wrapped line."""
+    rows = circuit_node.row_layout()
+    last = len(rows) - 1
+    cnt = len(rows[last]["devices"])
+    x = OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN + OL_DEV_SPACING*0.5
+    y = OL_HEADER_H + last*OL_ROW_H + OL_ROW_H/2
+    return QPointF(min(x, circuit_node._w - OL_MARGIN), y)
+
+
+def default_return_end_point(parent_node):
+    """Local (x,y) offset — from parent_node.pos() — where a Class A
+    circuit's RETURN leg arrives back at its source, offset from the OUT
+    leg's arrival point so both legs are visibly two separate connections
+    into the panel/booster rather than one line."""
+    return QPointF(parent_node._w/2 + 20, parent_node._h)
+
+
+def nearest_border_point(node, local_pos):
+    """Snap an arbitrary local point to the nearest spot on node's own
+    rectangle border — so a connector can be tied to any point along any
+    of the four sides of a panel/booster box, not just its fixed
+    top/bottom center."""
+    x = min(max(local_pos.x(), 0), node._w)
+    y = min(max(local_pos.y(), 0), node._h)
+    d_left, d_right, d_top, d_bottom = x, node._w-x, y, node._h-y
+    m = min(d_left, d_right, d_top, d_bottom)
+    if m == d_top: return QPointF(x, 0)
+    if m == d_bottom: return QPointF(x, node._h)
+    if m == d_left: return QPointF(0, y)
+    return QPointF(node._w, y)
+
+
+def snap_to_node(node, local_pos):
+    """Where a dragged connector endpoint actually lands on `node`: along
+    its wrapped line for a CircuitNode (no box border to snap to), or
+    along its rectangle border for a boxed node (panel/booster)."""
+    if isinstance(node, CircuitNode):
+        return node.nearest_line_point(local_pos)
+    return nearest_border_point(node, local_pos)
+
+
+def connector_anchor_points(parent_node, child_node, leg="main"):
+    """Scene-space (start, end) for one connector leg's two node-anchored
+    ends, honoring any user-dragged overrides stored on child_node (the
+    natural owner, since each child has exactly one parent) and falling
+    back to the smart default when unset."""
+    if leg == "return":
+        target = return_target_node(parent_node, child_node)
+        start_off = child_node.conn_return_start_offset or default_return_start_point(child_node)
+        end_off = child_node.conn_return_end_offset or default_return_end_point(target)
+        start = QPointF(child_node.pos().x()+start_off.x(), child_node.pos().y()+start_off.y())
+        end = QPointF(target.pos().x()+end_off.x(), target.pos().y()+end_off.y())
+    else:
+        start_off = child_node.conn_start_offset or default_start_point(parent_node, child_node)
+        end_off = child_node.conn_end_offset or default_end_point(child_node)
+        start = QPointF(parent_node.pos().x()+start_off.x(), parent_node.pos().y()+start_off.y())
+        end = QPointF(child_node.pos().x()+end_off.x(), child_node.pos().y()+end_off.y())
+    return start, end
+
+
+def build_orthogonal_points(start, waypoints, end):
+    """Reconstruct a connector's full point list from `start`, `end`, and a
+    list of {"axis": "h"|"v", "value": float} bends, GUARANTEEING every
+    segment is purely horizontal or vertical — never diagonal — no matter
+    where `start`/`end` end up moving to. "axis":"h" means this bend shares
+    its Y with the previous point (a horizontal segment leads into it) and
+    "value" is its free X; "axis":"v" is the mirror (vertical segment,
+    "value" is its free Y). If the bends don't happen to land the path
+    exactly on `end`'s shared coordinate, one extra corner is inserted
+    automatically so the final approach still can't be diagonal."""
+    pts = [start]
+    for wp in waypoints:
+        prev = pts[-1]
+        if wp["axis"] == "h":
+            pts.append(QPointF(wp["value"], prev.y()))
+        else:
+            pts.append(QPointF(prev.x(), wp["value"]))
+    last = pts[-1]
+    if abs(last.x()-end.x()) > 0.5 and abs(last.y()-end.y()) > 0.5:
+        pts.append(QPointF(last.x(), end.y()))
+    pts.append(end)
+    return pts
+
+
+def connector_points(parent_node, child_node, leg="main"):
+    """Full ordered list of scene points for one connector leg's rendered
+    path — [start, ...bends..., end]. Uses the user's own custom waypoints
+    once any exist (letting a connector be reshaped into whatever route is
+    needed, always axis-aligned — see build_orthogonal_points()), otherwise
+    falls back to the automatic single right-angle bend. Used by BOTH the
+    on-screen ConnectorItem and the PDF export's line-drawing pass, per
+    this file's convention that the two renderings stay in sync."""
+    start, end = connector_anchor_points(parent_node, child_node, leg)
+    waypoints = child_node.conn_return_waypoints if leg == "return" else child_node.conn_waypoints
+    if waypoints:
+        return build_orthogonal_points(start, waypoints, end)
+    pts = elbow_points(start.x(), start.y(), end.x(), end.y())
+    return [QPointF(x, y) for x, y in pts]
+
+
+def default_monitoring_info():
+    return {"panel_circuit": "", "monitoring_standard": "CAN/ULC S561",
+            "demarcation_terminals": 12, "breaker_note": ""}
+
+
 CIRCUIT_CLASS_INFO = {
-    "A": {"label": "Class A", "desc": "Loops back to panel/booster — no EOL needed"},
-    "B": {"label": "Class B", "desc": "Single run — ends in an EOL resistor"},
+    "A":      {"label": "Class A",              "desc": "Loops back to panel/booster — no EOL needed"},
+    "B":      {"label": "Class B",               "desc": "Single run — ends in an EOL resistor"},
+    "B_ADDR": {"label": "Class B (Addressable)", "desc": "Single run — no EOL resistor; supervision handled digitally by addressable devices"},
 }
 
 
-def expand_device_ticks(devices):
-    """Expand a [{'key','qty'}] tally into one abbreviation string per
-    individual device instance, in entry order."""
-    ticks = []
+def normalize_devices(devices):
+    """Expand any legacy qty-tally entries ({'key','qty','ma'}, no 'type' —
+    the only shape that existed before individually-labeled devices) into
+    that many individual device entries with a blank label, so old saved
+    files keep every device as a real, separately-editable/labelable tick
+    instead of silently losing the count. Entries already in the new
+    {'type':'device'|'floor_break', ...} shape pass through untouched."""
+    out = []
+    for d in devices or []:
+        t = d.get("type")
+        if t == "floor_break":
+            out.append({"type": "floor_break", "label": d.get("label", "")})
+        elif t == "device":
+            out.append({"type": "device", "key": d["key"], "label": d.get("label", ""),
+                        "ma": d.get("ma"), "note": d.get("note", "")})
+        elif "qty" in d:   # legacy tally, no "type" key
+            for _ in range(d.get("qty", 1)):
+                out.append({"type": "device", "key": d["key"], "label": "", "ma": d.get("ma"), "note": ""})
+        else:
+            out.append(d)
+    return out
+
+
+def circuit_line_rows(devices, per_row):
+    """Shared geometry (used by both on-screen paint and PDF export) for
+    laying a circuit out as a continuous horizontal line that WRAPS to a
+    new row — like text wrapping — instead of a fixed grid inside a box.
+    Devices accumulate onto the current row in entry order; a floor_break
+    entry closes the row and labels it (matching a real riser diagram,
+    where the floor/area label describes the row that just ended); running
+    out of row space without hitting a floor_break also wraps, but leaves
+    the new row unlabeled since it's still the same floor/area.
+
+    Returns a list of row dicts: {"devices": [entry, ...], "floor_label":
+    str|None}, one entry per device (never a floor_break) in "devices"."""
+    per_row = max(1, per_row)
+    rows = []
+    current = []
     for d in devices:
-        abbr = FA_DEVICE_TYPES.get(d["key"], {}).get("abbr", d["key"][:3].upper())
-        ticks.extend([abbr] * d["qty"])
-    return ticks
-
-
-def circuit_grid_layout(devices, box_w, cell_w=28, cell_h=16, left_pad=8, right_pad=8):
-    """Shared geometry (used by both on-screen paint and PDF export) for laying
-    individual device ticks out in a wrapping grid. Returns (ticks, cols, rows)."""
-    ticks = expand_device_ticks(devices)
-    cols = max(1, int((box_w-left_pad-right_pad)/cell_w))
-    rows = math.ceil(len(ticks)/cols) if ticks else 0
-    return ticks, cols, rows
+        if d.get("type") == "floor_break":
+            rows.append({"devices": current, "floor_label": d.get("label", "")})
+            current = []
+            continue
+        current.append(d)
+        if len(current) >= per_row:
+            rows.append({"devices": current, "floor_label": None})
+            current = []
+    if current or not rows:
+        rows.append({"devices": current, "floor_label": None})
+    return rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4456,15 +4654,21 @@ class WiringCanvas(QGraphicsView):
 #  tree (not user-positioned like the floor plan / wiring canvases).
 # ═══════════════════════════════════════════════════════════════════════════════
 
-OL_NODE_W = 220
+OL_NODE_W = 340
 OL_H_PANEL = 66
-OL_H_CIRCUIT_BASE = 96   # header + load line + terminus line, before device-grid rows
+OL_HEADER_H = 38         # title + load line, before the device line rows start
 OL_H_BOOSTER = 66
 OL_LEVEL_GAP = 50        # vertical gap between a node's bottom edge and its children's top
 OL_SIB_GAP = 24
-OL_TICK_W, OL_TICK_H = 28, 16
-OL_MIN_W, OL_MIN_H = 140, 50
+OL_MARGIN = 12           # left/right inset of the circuit's wrapping line from the box edge
+OL_ROW_H = 40            # one wrapped line row: tick + device icon + free-typed label
+OL_DEV_SPACING = 48      # horizontal spacing between devices along a row
+OL_TICK_LEN = 9          # length of the small perpendicular tick off the line
+OL_TERM_H = 24           # terminus row height, after all device line rows
+OL_MIN_W, OL_MIN_H = 200, 90
 OL_GRIP = 10             # resize-grip hit zone, bottom-right corner
+OL_GRID_PX = 20          # on-screen alignment-grid spacing — never drawn into the PDF export
+OL_GRID_MAJOR_EVERY = 5  # every 5th grid line drawn darker
 
 
 class OneLineNodeBase(QGraphicsItem):
@@ -4477,9 +4681,27 @@ class OneLineNodeBase(QGraphicsItem):
         self.children = []
         self.parent_node = None
         self._w = OL_NODE_W
-        self._h = OL_H_CIRCUIT_BASE
+        self._h = OL_HEADER_H + OL_ROW_H + OL_TERM_H
         self.manual_pos = False
         self.manual_size = False
+        # Position (index into the parent CircuitNode's devices list) where
+        # this node taps inline onto its parent's wrapped line, instead of
+        # hanging off the bottom edge — used for a booster tap AND for a
+        # circuit T-tapped off an isolator to continue the loop to the next
+        # floor. None = normal bottom-edge connection (or n/a — parent isn't
+        # a CircuitNode).
+        self.tap_index = None
+        # User-draggable overrides for the connector line FROM this node's
+        # parent TO this node (None = smart default; see connector_points()).
+        self.conn_start_offset = None   # QPointF local to the parent
+        self.conn_end_offset = None     # QPointF local to this node
+        self.conn_waypoints = None      # list[{"axis":"h"|"v","value":float}] | None = auto single bend
+        # Per-type resize floor — a global minimum taller than a panel/
+        # booster's own natural height would make them un-shrinkable (any
+        # drag toward smaller would just snap straight to the floor);
+        # subclasses with a smaller natural size override these in __init__.
+        self._min_w = OL_MIN_W
+        self._min_h = OL_MIN_H
         self._resizing = False
         self._resize_start = None
         self._press_pos = None
@@ -4523,8 +4745,8 @@ class OneLineNodeBase(QGraphicsItem):
             start_pos, start_w, start_h = self._resize_start
             delta = event.scenePos() - start_pos
             self.prepareGeometryChange()
-            self._w = max(OL_MIN_W, start_w + delta.x())
-            self._h = max(OL_MIN_H, start_h + delta.y())
+            self._w = max(self._min_w, start_w + delta.x())
+            self._h = max(self._min_h, start_h + delta.y())
             self.manual_size = True
             self.update()
             sc = self.scene()
@@ -4555,6 +4777,18 @@ class OneLineNodeBase(QGraphicsItem):
                 sc.update_connectors()
         return super().itemChange(change, value)
 
+    def loading_visible(self):
+        sc = self.scene()
+        return getattr(sc, "show_loading", True) if sc else True
+
+    def paint_resize_grip(self, painter):
+        """Small diagonal corner marks in the bottom-right, always drawn, so
+        the resize handle (a plain hit-zone with no other visual cue) is
+        actually discoverable."""
+        painter.setPen(QPen(QColor("#999"), 1))
+        for i in (4, 8):
+            painter.drawLine(QPointF(self._w-i, self._h), QPointF(self._w, self._h-i))
+
 
 class PanelNode(OneLineNodeBase):
     ITEM_TYPE = "fa_panel"
@@ -4565,6 +4799,7 @@ class PanelNode(OneLineNodeBase):
         self.nac_budget_ma = nac_budget_ma
         self.hidden = False
         self._h = OL_H_PANEL
+        self._min_w, self._min_h = 100, 40
         self.setZValue(2)
 
     def direct_nac_load_ma(self):
@@ -4583,14 +4818,16 @@ class PanelNode(OneLineNodeBase):
         painter.drawRoundedRect(QRectF(0,0,self._w,self._h), 6, 6)
         painter.setPen(QColor("#1a1a1a")); painter.setFont(QFont("Arial", 10, QFont.Bold))
         painter.drawText(QRectF(4,4,self._w-8,20), Qt.AlignCenter, self.name)
-        pct = (load/self.nac_budget_ma*100) if self.nac_budget_ma else 0
-        painter.setFont(QFont("Arial", 8))
-        painter.setPen(QColor("#c0392b") if over else QColor("#555"))
-        painter.drawText(QRectF(4,26,self._w-8,16), Qt.AlignCenter,
-                          f"Direct NAC: {load:.0f}/{self.nac_budget_ma:.0f} mA ({pct:.0f}%)")
-        if over:
-            painter.setFont(QFont("Arial", 8, QFont.Bold))
-            painter.drawText(QRectF(4,44,self._w-8,18), Qt.AlignCenter, "⚠ Over budget — add booster(s)")
+        if self.loading_visible():
+            pct = (load/self.nac_budget_ma*100) if self.nac_budget_ma else 0
+            painter.setFont(QFont("Arial", 8))
+            painter.setPen(QColor("#c0392b") if over else QColor("#555"))
+            painter.drawText(QRectF(4,26,self._w-8,16), Qt.AlignCenter,
+                              f"Direct NAC: {load:.0f}/{self.nac_budget_ma:.0f} mA ({pct:.0f}%)")
+            if over:
+                painter.setFont(QFont("Arial", 8, QFont.Bold))
+                painter.drawText(QRectF(4,44,self._w-8,18), Qt.AlignCenter, "⚠ Over budget — add booster(s)")
+        self.paint_resize_grip(painter)
 
     def contextMenuEvent(self, event):
         menu = QMenu()
@@ -4630,32 +4867,114 @@ class CircuitNode(OneLineNodeBase):
         info = CIRCUIT_TYPE_INFO[circuit_type]
         self.name = name or info["name"]
         self.capacity = capacity if capacity is not None else info["default_capacity"]
-        self.devices = devices or []       # [{"key":str, "qty":int, "ma":float|None}]
-        self.circuit_class = circuit_class if circuit_class in ("A","B") else "B"
+        self.devices = normalize_devices(devices)   # [{"type":"device","key","label","ma"} | {"type":"floor_break","label"}]
+        self.circuit_class = circuit_class if circuit_class in CIRCUIT_CLASS_INFO else "B"
         # Only meaningful for a standalone circuit (parent_node is None) —
         # printed on the box in place of a connector line back to its source,
         # e.g. "Panel — NAC 3" or "Booster 2 — NAC 1", since there's nothing
         # upstream drawn on this diagram to connect a line to.
         self.source_label = source_label
+        # Class A's RETURN leg (the loop back to its source) — same override
+        # pattern as conn_start_offset/conn_end_offset/conn_waypoints above,
+        # but for the second connector line only Class A circuits draw.
+        self.conn_return_start_offset = None
+        self.conn_return_end_offset = None
+        self.conn_return_waypoints = None
+        # A circuit whose parent is ANOTHER circuit normally branches off it
+        # mid-line at a specific device (tap_index — e.g. an isolator), like
+        # a booster tap. continues_parent_line instead means this circuit
+        # is a straight, in-series continuation of the parent's own line —
+        # the wire runs off the parent's terminus_point() into this box, not
+        # off to the side — for chaining isolated floor segments box to box
+        # (box1 -> box2 -> box3 -> ...).
+        self.continues_parent_line = False
+        # A Class A circuit's RETURN leg normally closes the loop back to
+        # its immediate parent; when this circuit sits several boxes deep
+        # in a chain, set this to send the RETURN leg straight back to the
+        # root panel instead, skipping the intermediate boxes.
+        self.class_a_return_to_panel = False
         self.setZValue(2)
         self._recompute_height()
+
+    def per_row(self):
+        return max(1, int((self._w - 2*OL_MARGIN) / OL_DEV_SPACING))
+
+    def row_layout(self):
+        return circuit_line_rows(self.devices, self.per_row())
+
+    def device_position(self, tap_index):
+        """Local (x, y) point on the wrapped line for the device sequence
+        position `tap_index` (an index into self.devices, including any
+        floor_break entries at that position) — used to tap a booster's
+        connector line into the middle of this circuit's run instead of
+        always off the bottom edge. Falls back to the right end of the
+        last row when the index is out of range (e.g. a booster added
+        after the last device, which is also the default at creation)."""
+        rows = self.row_layout()
+        seen = 0
+        for r, row in enumerate(rows):
+            n = len(row["devices"])
+            y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
+            if seen <= tap_index < seen + n:
+                i = tap_index - seen
+                x = OL_MARGIN + (i+0.5)*OL_DEV_SPACING
+                return (x, y)
+            seen += n
+            if row["floor_label"] is not None:
+                seen += 1   # the floor_break entry itself occupies one sequence slot
+        last_row = len(rows) - 1
+        return (self._w - OL_MARGIN, OL_HEADER_H + last_row*OL_ROW_H + OL_ROW_H/2)
+
+    def nearest_line_point(self, local_pos):
+        """Snap an arbitrary local point to the nearest spot actually ON
+        this circuit's wrapped line — used when a connector endpoint is
+        dropped onto a circuit, since a circuit has no box border to tie a
+        wire to, only the line itself."""
+        rows = self.row_layout()
+        if not rows:
+            return QPointF(OL_MARGIN, OL_HEADER_H + OL_ROW_H/2)
+        row_idx = round((local_pos.y() - OL_HEADER_H - OL_ROW_H/2) / OL_ROW_H)
+        row_idx = max(0, min(row_idx, len(rows)-1))
+        y = OL_HEADER_H + row_idx*OL_ROW_H + OL_ROW_H/2
+        x = min(max(local_pos.x(), OL_MARGIN), self._w - OL_MARGIN)
+        return QPointF(x, y)
+
+    def terminus_point(self):
+        """Local (x, y) where the wire physically ends — right after the
+        last device on the last row's line — so an EOL resistor (or the
+        Class B Addressable no-EOL cap) reads as sitting ON the wire,
+        touching the last device, instead of floating in a separate area
+        unrelated to where the devices actually stop."""
+        rows = self.row_layout()
+        last = len(rows) - 1
+        cnt = len(rows[last]["devices"])
+        x = OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN
+        y = OL_HEADER_H + last*OL_ROW_H + OL_ROW_H/2
+        return QPointF(min(x, self._w - OL_MARGIN - 40), y)
+
+    def has_continuation_child(self):
+        """True when another circuit continues this one's line in series
+        (box1 -> box2 -> box3...) — in which case this circuit doesn't
+        physically terminate here (no EOL/no-EOL symbol), the wire just
+        keeps going into that next box."""
+        return any(getattr(c, "continues_parent_line", False) for c in self.children)
 
     def _recompute_height(self):
         if self.manual_size:
             return
-        _, _, rows = circuit_grid_layout(self.devices, self._w, OL_TICK_W, OL_TICK_H)
-        grid_h = max(rows, 1) * OL_TICK_H
-        self._h = OL_H_CIRCUIT_BASE + grid_h
+        rows = self.row_layout()
+        self._h = OL_HEADER_H + len(rows)*OL_ROW_H + OL_TERM_H
 
     def total_load(self):
+        device_entries = [d for d in self.devices if d.get("type") == "device"]
         if self.circuit_type == "slc":
-            return sum(d["qty"] for d in self.devices)
+            return len(device_entries)
         total = 0.0
-        for d in self.devices:
+        for d in device_entries:
             ma = d.get("ma")
             if ma is None:
                 ma = FA_DEVICE_TYPES.get(d["key"], {}).get("ma", 0.0)
-            total += d["qty"]*ma
+            total += ma
         return total
 
     def utilization_pct(self):
@@ -4666,69 +4985,193 @@ class CircuitNode(OneLineNodeBase):
         info = CIRCUIT_TYPE_INFO[self.circuit_type]
         load = self.total_load()
         pct = self.utilization_pct()
-        if pct > 100: fill, border = QColor("#fdecea"), QColor("#c0392b")
-        elif pct > 80: fill, border = QColor("#fef5e7"), QColor("#e67e22")
-        else:          fill, border = QColor("#eafaf1"), QColor("#27ae60")
-        painter.setBrush(QBrush(fill))
-        painter.setPen(QPen(QColor("#ff7002") if self.isSelected() else border, 2))
-        painter.drawRoundedRect(QRectF(0,0,self._w,self._h), 6, 6)
+        if pct > 100: border = QColor("#c0392b")
+        elif pct > 80: border = QColor("#e67e22")
+        else:          border = QColor("#27ae60")
+        # No box — a circuit IS the line, like a real riser diagram. Only a
+        # thin dashed outline when selected, so it stays clickable/draggable
+        # without implying it's a physical enclosure the way the panel and
+        # booster boxes are.
+        if self.isSelected():
+            painter.setPen(QPen(QColor("#ff7002"), 1, Qt.DashLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRectF(0, 0, self._w, self._h))
         painter.setPen(QColor("#1a1a1a")); painter.setFont(QFont("Arial", 9, QFont.Bold))
         badge = "SLC" if self.circuit_type=="slc" else "NAC"
-        cls_tag = f" · Class {self.circuit_class}"
+        cls_tag = f" · {CIRCUIT_CLASS_INFO[self.circuit_class]['label']}"
         title = self.name
         if not self.has_visible_parent() and self.source_label:
             title = f"{self.name}  —  {self.source_label}"
-        painter.drawText(QRectF(4,3,self._w-8,15), Qt.AlignCenter, f"{title}  [{badge}{cls_tag}]")
-        painter.setFont(QFont("Arial", 8, QFont.Bold))
-        painter.setPen(border.darker(120))
-        unit = info["unit"]
-        painter.drawText(QRectF(4,19,self._w-8,14), Qt.AlignCenter,
-                          f"{load:.0f}/{self.capacity:.0f} {unit}  ({pct:.0f}%)")
+        painter.drawText(QRectF(OL_MARGIN-4, 0, self._w-OL_MARGIN, 15), Qt.AlignLeft,
+                          f"{title}  [{badge}{cls_tag}]")
+        if self.loading_visible():
+            painter.setFont(QFont("Arial", 8, QFont.Bold))
+            painter.setPen(border.darker(120))
+            unit = info["unit"]
+            painter.drawText(QRectF(OL_MARGIN-4, 15, self._w-OL_MARGIN, 14), Qt.AlignLeft,
+                              f"{load:.0f}/{self.capacity:.0f} {unit}  ({pct:.0f}%)")
 
-        # Individual device ticks in a wrapping grid — not just a tally count
-        ticks, cols, rows = circuit_grid_layout(self.devices, self._w, OL_TICK_W, OL_TICK_H)
-        grid_top = 36
-        painter.setFont(QFont("Arial", 6))
-        for i, abbr in enumerate(ticks):
-            col, row = i % cols, i // cols
-            x = 8 + col*OL_TICK_W
-            y = grid_top + row*OL_TICK_H
-            painter.setPen(QPen(border.darker(110), 1))
-            painter.setBrush(QBrush(QColor("white")))
-            painter.drawRect(QRectF(x, y, OL_TICK_W-3, OL_TICK_H-3))
-            painter.setPen(QColor("#333"))
-            painter.drawText(QRectF(x, y, OL_TICK_W-3, OL_TICK_H-3), Qt.AlignCenter, abbr)
-        if not ticks:
+        # The circuit is drawn as one continuous horizontal line that wraps
+        # to a new row when it runs out of width (like text wrapping) —
+        # every device is its own tick + free-typed label sitting directly
+        # on the line, and a row that closed on a floor-break gets a dashed
+        # continuation + label to the right, matching a real riser diagram.
+        rows = self.row_layout()
+        if not any(row["devices"] for row in rows):
             painter.setPen(QColor("#999")); painter.setFont(QFont("Arial", 7))
-            painter.drawText(QRectF(6, grid_top, self._w-12, 13), Qt.AlignLeft, "(no devices — right-click to add)")
+            painter.drawText(QRectF(6, OL_HEADER_H, self._w-12, 13), Qt.AlignLeft,
+                              "(no devices — right-click to add)")
+        line_pen = QPen(border.darker(110), 1.4)
+        for r, row in enumerate(rows):
+            y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
+            n = len(row["devices"])
+            line_end = OL_MARGIN + n*OL_DEV_SPACING if n else OL_MARGIN
+            painter.setPen(line_pen)
+            painter.drawLine(QPointF(OL_MARGIN, y), QPointF(max(line_end, OL_MARGIN), y))
+            for i, d in enumerate(row["devices"]):
+                x = OL_MARGIN + (i+0.5)*OL_DEV_SPACING
+                painter.setPen(line_pen)
+                painter.drawLine(QPointF(x, y), QPointF(x, y-OL_TICK_LEN))
+                abbr = FA_DEVICE_TYPES.get(d["key"], {}).get("abbr", d["key"][:3].upper())
+                painter.setPen(QPen(border.darker(110), 1))
+                painter.setBrush(QBrush(QColor("white")))
+                painter.drawRect(QRectF(x-13, y-OL_TICK_LEN-13, 26, 12))
+                painter.setPen(QColor("#333")); painter.setFont(QFont("Arial", 6, QFont.Bold))
+                painter.drawText(QRectF(x-13, y-OL_TICK_LEN-13, 26, 12), Qt.AlignCenter, abbr)
+                if d.get("note"):
+                    painter.setPen(QPen(QColor("#b8860b"), 1.4))
+                    painter.setFont(QFont("Arial", 8, QFont.Bold))
+                    painter.drawText(QRectF(x+8, y-OL_TICK_LEN-17, 10, 12), Qt.AlignCenter, "*")
+                label = d.get("label", "")
+                if label:
+                    painter.setFont(QFont("Arial", 6))
+                    painter.setPen(QColor("#333"))
+                    painter.drawText(QRectF(x-OL_DEV_SPACING/2+2, y+3, OL_DEV_SPACING-4, 20),
+                                      Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, label)
+            if row["floor_label"] is not None:
+                dash_x0 = max(line_end, OL_MARGIN)
+                painter.setPen(QPen(border.darker(130), 1, Qt.DashLine))
+                painter.drawLine(QPointF(dash_x0, y), QPointF(self._w-OL_MARGIN, y))
+                painter.setPen(QColor("#333")); painter.setFont(QFont("Arial", 6, QFont.Bold))
+                painter.drawText(QRectF(dash_x0+4, y-12, self._w-OL_MARGIN-dash_x0-6, 11),
+                                  Qt.AlignLeft, row["floor_label"])
 
-        # Terminus: Class B ends in an EOL resistor; Class A loops back to its source
-        term_y = self._h - 16
-        painter.setPen(QPen(QColor("#555"), 1.3))
-        if self.circuit_class == "B":
-            zx = self._w/2 - 16
-            pts = [QPointF(zx+i*4, term_y+6+((-1)**i)*4) for i in range(9)]
-            painter.drawPolyline(QPolygonF(pts))
-            painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#555"))
-            painter.drawText(QRectF(zx+36, term_y-2, 60, 14), Qt.AlignLeft, "EOL")
+        # Booster panels tap directly onto this circuit's line inline (a
+        # small box straddling the run) rather than hanging off the bottom
+        # edge; a circuit T-tapped off an isolator (continuing the loop to
+        # the next floor, drawn as its own independent line elsewhere on
+        # the canvas — not inside this box) gets a small T-mark instead,
+        # matching a real riser diagram.
+        for c in self.children:
+            if c.tap_index is None or getattr(c, "hidden", False):
+                continue
+            tx, ty = self.device_position(c.tap_index)
+            if isinstance(c, BoosterNode):
+                painter.setPen(QPen(QColor("#7d3c98"), 1.4))
+                painter.setBrush(QBrush(QColor("#f5eefc")))
+                painter.drawRect(QRectF(tx-16, ty-7, 32, 14))
+                painter.setFont(QFont("Arial", 5, QFont.Bold)); painter.setPen(QColor("#5b2c6f"))
+                painter.drawText(QRectF(tx-16, ty-7, 32, 14), Qt.AlignCenter, c.name)
+            elif isinstance(c, CircuitNode):
+                painter.setPen(QPen(QColor("#1a5276"), 1.6))
+                painter.drawLine(QPointF(tx, ty), QPointF(tx, ty+10))
+                painter.drawLine(QPointF(tx-6, ty+10), QPointF(tx+6, ty+10))
+                painter.setFont(QFont("Arial", 5, QFont.Bold)); painter.setPen(QColor("#1a5276"))
+                painter.drawText(QRectF(tx+8, ty+2, 90, 11), Qt.AlignLeft, f"T → {c.name}")
+
+        # Terminus: Class B physically ends in an EOL resistor; Class B
+        # (Addressable) is still a single run but has no physical EOL —
+        # supervision is digital. Class A draws NOTHING here — it doesn't
+        # terminate at all, it loops back to its source, which is shown by
+        # the actual second connector line (the RETURN leg) landing back on
+        # the panel/booster, not by a symbol drawn on the circuit itself
+        # (a single line + an in-box "return" icon reads, to an electrician,
+        # as the loop returning to ITSELF rather than to the panel). Drawn
+        # right at the end of the last row's line — touching the last
+        # device — not floating in a separate area below the devices.
+        if self.circuit_class in ("B", "B_ADDR") and not self.has_continuation_child():
+            tp = self.terminus_point()
+            painter.setPen(QPen(border.darker(110), 1.4))
+            painter.drawLine(QPointF(tp.x(), tp.y()), QPointF(tp.x()+8, tp.y()))
+            painter.setPen(QPen(QColor("#555"), 1.3))
+            if self.circuit_class == "B":
+                zx = tp.x() + 8
+                pts = [QPointF(zx+i*4, tp.y()+((-1)**i)*4) for i in range(9)]
+                painter.drawPolyline(QPolygonF(pts))
+                painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#555"))
+                painter.drawText(QRectF(zx+38, tp.y()-8, 40, 14), Qt.AlignLeft, "EOL")
+            else:
+                lx = tp.x() + 8
+                painter.drawLine(QPointF(lx, tp.y()), QPointF(lx+10, tp.y()))
+                painter.drawLine(QPointF(lx+10, tp.y()-6), QPointF(lx+10, tp.y()+6))
+                painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#555"))
+                painter.drawText(QRectF(lx+16, tp.y()-8, 110, 14), Qt.AlignLeft, "No EOL (addressable)")
+        self.paint_resize_grip(painter)
+
+    def isolator_key(self):
+        return {"slc": "iso_module", "nac": "iso_module_nac"}[self.circuit_type]
+
+    def isolator_devices(self):
+        """[(raw_index_into_self.devices, device_dict), ...] for every
+        isolator module on this circuit, in order — the valid T-tap points
+        for continuing this loop to the next floor via a new, independent
+        circuit (see contextMenuEvent's "T-tap off isolator" action)."""
+        key = self.isolator_key()
+        return [(i, d) for i, d in enumerate(self.devices)
+                if d.get("type") == "device" and d.get("key") == key]
+
+    def _add_isolator_tap(self, sc):
+        isolators = self.isolator_devices()
+        if not isolators:
+            return
+        if len(isolators) == 1:
+            idx = isolators[0][0]
         else:
-            painter.drawArc(QRectF(self._w/2-10, term_y-2, 20, 16), 30*16, 300*16)
-            painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#555"))
-            painter.drawText(QRectF(self._w/2+12, term_y-2, 100, 14), Qt.AlignLeft, "Class A return")
+            labels = [f"Isolator #{n+1}" + (f" — {d.get('label')}" if d.get("label") else "")
+                      for n, (i, d) in enumerate(isolators)]
+            item, ok = QInputDialog.getItem(None, "T-Tap Off Isolator",
+                                             "Tap after which isolator?", labels, 0, False)
+            if not ok:
+                return
+            idx = isolators[labels.index(item)][0]
+        c = sc.add_circuit(self, self.circuit_type, tap_index=idx)
+        c.name = f"{self.name} — Next Floor"
+
+    def _add_next_box(self, sc):
+        """Chain another circuit straight off the END of this one's line —
+        an in-series continuation (box1 -> box2 -> box3...), not a T-tap
+        branch — e.g. isolated floor segments joined at isolators."""
+        c = sc.add_circuit(self, self.circuit_type)
+        c.continues_parent_line = True
+        c.name = f"{self.name} — Next Box"
+        self.update()   # this circuit's own EOL symbol must disappear now
 
     def contextMenuEvent(self, event):
         menu = QMenu()
         edit_a = menu.addAction("Edit Devices / Capacity…")
+        add_boost_a = None
+        if self.circuit_type == "slc":
+            add_boost_a = menu.addAction("+ Add Booster (tap on this circuit)")
+        add_next_a = menu.addAction("+ Add Circuit (Continue to Next Box)")
+        add_tap_a = menu.addAction("+ Add Circuit (T-tap off isolator)…") if self.isolator_devices() else None
         del_a = menu.addAction("Delete Circuit")
         chosen = menu.exec_(event.screenPos())
         sc = self.scene()
-        if chosen == edit_a:
+        if chosen == add_boost_a and sc:
+            sc.add_booster(self)
+        elif chosen == add_next_a and sc:
+            self._add_next_box(sc)
+        elif chosen == add_tap_a and sc:
+            self._add_isolator_tap(sc)
+        elif chosen == edit_a:
             dlg = CircuitEditDialog(self.circuit_type, self.name, self.capacity, self.devices, self.circuit_class,
-                                     source_label=self.source_label)
+                                     source_label=self.source_label,
+                                     class_a_return_to_panel=self.class_a_return_to_panel)
             if dlg.exec_() == QDialog.Accepted:
                 v = dlg.values()
                 self.name = v["name"]; self.capacity = v["capacity"]; self.devices = v["devices"]
                 self.circuit_class = v["circuit_class"]; self.source_label = v["source_label"]
+                self.class_a_return_to_panel = v["class_a_return_to_panel"]
                 self.prepareGeometryChange()
                 self._recompute_height()
                 self.update()
@@ -4740,12 +5183,19 @@ class CircuitNode(OneLineNodeBase):
 class BoosterNode(OneLineNodeBase):
     ITEM_TYPE = "fa_booster"
 
-    def __init__(self, name="Booster 1", capacity_ma=3000.0):
+    def __init__(self, name="Booster 1", capacity_ma=3000.0, tap_index=None):
         super().__init__()
         self.name = name
         self.capacity_ma = capacity_ma
         self.hidden = False
+        # Where along the parent circuit's wrapped line this booster taps in
+        # inline, as an index into the parent CircuitNode's devices list —
+        # None means "not tapped inline" (parent isn't a CircuitNode, or this
+        # booster hangs off the panel directly) and the old bottom-edge
+        # connector line is used instead.
+        self.tap_index = tap_index
         self._h = OL_H_BOOSTER
+        self._min_w, self._min_h = 90, 40
         self.setZValue(2)
 
     def total_load(self):
@@ -4764,11 +5214,13 @@ class BoosterNode(OneLineNodeBase):
         painter.drawRoundedRect(QRectF(0,0,self._w,self._h), 6, 6)
         painter.setPen(QColor("#1a1a1a")); painter.setFont(QFont("Arial", 9, QFont.Bold))
         painter.drawText(QRectF(4,4,self._w-8,18), Qt.AlignCenter, f"⚡ {self.name}")
-        pct = (load/self.capacity_ma*100) if self.capacity_ma else 0
-        painter.setFont(QFont("Arial", 8))
-        painter.setPen(QColor("#c0392b") if over else QColor("#555"))
-        painter.drawText(QRectF(4,26,self._w-8,16), Qt.AlignCenter,
-                          f"{load:.0f}/{self.capacity_ma:.0f} mA ({pct:.0f}%)")
+        if self.loading_visible():
+            pct = (load/self.capacity_ma*100) if self.capacity_ma else 0
+            painter.setFont(QFont("Arial", 8))
+            painter.setPen(QColor("#c0392b") if over else QColor("#555"))
+            painter.drawText(QRectF(4,26,self._w-8,16), Qt.AlignCenter,
+                              f"{load:.0f}/{self.capacity_ma:.0f} mA ({pct:.0f}%)")
+        self.paint_resize_grip(painter)
 
     def contextMenuEvent(self, event):
         menu = QMenu()
@@ -4795,6 +5247,225 @@ class BoosterNode(OneLineNodeBase):
             self.update(); sc.update_connectors(); sc.layout_changed.emit()
 
 
+class ConnectorItem(QGraphicsPathItem):
+    """A wire between a parent node and a child node — fully user-routable:
+    both endpoints snap onto wherever they're dragged on their owning node
+    (any point along a box's border, or anywhere along a circuit's line —
+    see snap_to_node()), and any bend point can be dragged, added, or
+    removed via right-click — but every segment always stays purely
+    horizontal or vertical (see build_orthogonal_points()); a bend can only
+    slide along the one axis its own segment runs on, so the connector can
+    be fully reshaped without ever going diagonal. `leg` is "main" (the
+    normal parent->child wire) or "return" (a Class A circuit's second
+    wire, back to its own source — see connector_points()). Overrides are
+    persisted on the CHILD node (conn_start_offset/conn_end_offset/
+    conn_waypoints, or the conn_return_* equivalents for the return leg)
+    since each child has exactly one parent."""
+    HANDLE_R = 7
+
+    def __init__(self, parent_node, child_node, leg="main"):
+        super().__init__()
+        self.parent_node = parent_node
+        self.child_node = child_node
+        self.leg = leg
+        self.setFlag(QGraphicsItem.ItemIsSelectable)
+        # Endpoints sit exactly ON a panel/booster's border by default, which
+        # overlaps that node's own clickable area — a higher z-value than
+        # every node (they're all at 2) means a click there always reaches
+        # the connector/its handles first, instead of being swallowed by the
+        # box underneath.
+        self.setZValue(3)
+        self.setAcceptHoverEvents(True)
+        self._drag = None
+        self._pts = []
+        self.rebuild()
+
+    def _attrs(self):
+        if self.leg == "return":
+            return "conn_return_start_offset", "conn_return_end_offset", "conn_return_waypoints"
+        return "conn_start_offset", "conn_end_offset", "conn_waypoints"
+
+    def rebuild(self):
+        pts_q = connector_points(self.parent_node, self.child_node, self.leg)
+        self._pts = [(p.x(), p.y()) for p in pts_q]
+        _, _, wp_attr = self._attrs()
+        wps = getattr(self.child_node, wp_attr)
+        # How many of the interior points are real, draggable bends vs. an
+        # automatic extra corner build_orthogonal_points() had to insert to
+        # keep the last leg from going diagonal (not stored anywhere, so
+        # not a drag target). In auto mode (wps is None) every interior
+        # point IS still a legitimate drag target — grabbing one is what
+        # promotes it into a real, persisted waypoint (_ensure_waypoints()).
+        self._n_waypoints = len(wps) if wps is not None else (len(self._pts) - 2)
+        path = QPainterPath(QPointF(*self._pts[0]))
+        for p in self._pts[1:]:
+            path.lineTo(QPointF(*p))
+        self.setPath(path)
+        pen = QPen(QColor("#c0392b") if self.isSelected() else QColor("#888"), 1.6)
+        if self.leg == "return":
+            pen.setStyle(Qt.DashLine)
+        self.setPen(pen)
+
+    def shape(self):
+        stroker = QPainterPathStroker(); stroker.setWidth(10)
+        return stroker.createStroke(self.path())
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if self.leg == "return":
+            painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#7d3c98"))
+            painter.drawText(QPointF(self._pts[0][0]+4, self._pts[0][1]-4), "RETURN")
+        elif isinstance(self.child_node, CircuitNode) and self.child_node.circuit_class == "A":
+            painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#1a5276"))
+            painter.drawText(QPointF(self._pts[0][0]+4, self._pts[0][1]-4), "OUT")
+        if self.isSelected() and self._pts:
+            painter.setPen(QPen(QColor("#c0392b"), 1))
+            painter.setBrush(QBrush(QColor("#ff7002")))
+            for p in (self._pts[0], self._pts[-1]):
+                painter.drawRect(QRectF(p[0]-self.HANDLE_R, p[1]-self.HANDLE_R, self.HANDLE_R*2, self.HANDLE_R*2))
+            painter.setBrush(QBrush(QColor("#3498db")))
+            for p in self._pts[1:-1]:
+                painter.drawEllipse(QPointF(*p), self.HANDLE_R, self.HANDLE_R)
+
+    def _handle_at(self, pos):
+        if not self._pts:
+            return None
+        def close(px, py):
+            return abs(pos.x()-px) <= self.HANDLE_R*2.5 and abs(pos.y()-py) <= self.HANDLE_R*2.5
+        if close(*self._pts[0]): return ("start", None)
+        if close(*self._pts[-1]): return ("end", None)
+        for i in range(1, len(self._pts)-1):
+            if close(*self._pts[i]) and i-1 < self._n_waypoints:
+                return ("waypoint", i-1)   # index into the stored waypoints list
+        return None
+
+    def _ensure_waypoints(self):
+        """Materialize an explicit, user-owned, axis-locked waypoint list
+        the first time any bend is dragged or a waypoint is added — seeded
+        from whatever is currently rendered (the automatic single bend) so
+        the shape doesn't jump when the user starts reshaping it. Each bend
+        remembers whether it's reached by a horizontal or vertical segment,
+        so later dragging can only slide it along that one axis — the
+        connector can be reshaped freely but never goes diagonal."""
+        _, _, wp_attr = self._attrs()
+        if getattr(self.child_node, wp_attr) is None:
+            wps = []
+            for i in range(1, len(self._pts)-1):
+                prev = self._pts[i-1]; cur = self._pts[i]
+                if abs(cur[1]-prev[1]) < 0.5:
+                    wps.append({"axis": "h", "value": cur[0]})
+                else:
+                    wps.append({"axis": "v", "value": cur[1]})
+            setattr(self.child_node, wp_attr, wps)
+            self._n_waypoints = len(wps)
+        return wp_attr
+
+    def mousePressEvent(self, event):
+        # Select AND grab in the same click — a click precise enough to land
+        # on an endpoint shouldn't need a separate first click just to
+        # "arm" the handles; that extra step was the main reason these were
+        # hard to grab.
+        was_selected = self.isSelected()
+        if not was_selected:
+            self.setSelected(True)
+        h = self._handle_at(event.pos())
+        if h:
+            self._drag = h
+            if h[0] == "waypoint":
+                self._ensure_waypoints()
+            self.rebuild(); self.update()
+            event.accept()
+            return
+        if not was_selected:
+            self.rebuild(); self.update()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag:
+            kind, idx = self._drag
+            pos = event.pos()
+            start_attr, end_attr, wp_attr = self._attrs()
+            if kind == "start":
+                owner = self.parent_node if self.leg == "main" else self.child_node
+                setattr(self.child_node, start_attr, snap_to_node(owner, pos - owner.pos()))
+            elif kind == "end":
+                owner = self.child_node if self.leg == "main" else return_target_node(self.parent_node, self.child_node)
+                setattr(self.child_node, end_attr, snap_to_node(owner, pos - owner.pos()))
+            elif kind == "waypoint":
+                wp = getattr(self.child_node, wp_attr)[idx]
+                wp["value"] = pos.y() if wp["axis"] == "v" else pos.x()
+            self.rebuild()
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag:
+            self._drag = None
+            event.accept()
+            sc = self.scene()
+            if sc:
+                sc.layout_changed.emit()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _nearest_segment(self, pos):
+        """Which segment of the current path a point is closest to — its
+        index, and whether that segment is horizontal or vertical (every
+        segment is one or the other, by construction)."""
+        best_i, best_d = 0, None
+        for i in range(len(self._pts)-1):
+            x1, y1 = self._pts[i]; x2, y2 = self._pts[i+1]
+            dx, dy = x2-x1, y2-y1
+            length2 = dx*dx + dy*dy
+            t = 0.0 if length2 == 0 else max(0.0, min(1.0, ((pos.x()-x1)*dx + (pos.y()-y1)*dy) / length2))
+            px, py = x1 + t*dx, y1 + t*dy
+            d = (pos.x()-px)**2 + (pos.y()-py)**2
+            if best_d is None or d < best_d:
+                best_d, best_i = d, i
+        x1, y1 = self._pts[best_i]; x2, y2 = self._pts[best_i+1]
+        horizontal = abs(y1-y2) < 0.5
+        return best_i, horizontal
+
+    def contextMenuEvent(self, event):
+        pos = event.pos()
+        handle = self._handle_at(pos)
+        menu = QMenu()
+        remove_a = menu.addAction("Remove Waypoint") if handle and handle[0] == "waypoint" else None
+        add_a = menu.addAction("Add Waypoint Here")
+        menu.addSeparator()
+        reset_a = menu.addAction("Reset Connector Routing")
+        chosen = menu.exec_(event.screenPos())
+        sc = self.scene()
+        start_attr, end_attr, wp_attr = self._attrs()
+        if chosen == add_a:
+            # A new bend jogs PERPENDICULAR to whichever segment was
+            # clicked — inserting along the segment itself wouldn't add a
+            # turn, just a redundant collinear point — keeping the whole
+            # path axis-aligned by construction (see build_orthogonal_points).
+            seg_i, horizontal = self._nearest_segment(pos)
+            new_wp = {"axis": "v", "value": pos.y()} if horizontal else {"axis": "h", "value": pos.x()}
+            self._ensure_waypoints()
+            insert_at = min(seg_i, len(getattr(self.child_node, wp_attr)))
+            getattr(self.child_node, wp_attr).insert(insert_at, new_wp)
+            self.rebuild(); self.update()
+            if sc: sc.layout_changed.emit()
+        elif chosen == remove_a:
+            del getattr(self.child_node, wp_attr)[handle[1]]
+            self.rebuild(); self.update()
+            if sc: sc.layout_changed.emit()
+        elif chosen == reset_a:
+            setattr(self.child_node, start_attr, None)
+            setattr(self.child_node, end_attr, None)
+            setattr(self.child_node, wp_attr, None)
+            self.rebuild(); self.update()
+            if sc: sc.layout_changed.emit()
+
+
 class OneLineScene(QGraphicsScene):
     layout_changed = pyqtSignal()
     status_changed = pyqtSignal(str)
@@ -4807,7 +5478,31 @@ class OneLineScene(QGraphicsScene):
         self.addItem(self.panel)
         self.standalone = []    # standalone CircuitNodes — no panel/booster parent
         self._connectors = []
+        self.monitoring_info = default_monitoring_info()
+        self.show_loading = True   # toggle: mA/device-count/% text on panel, boosters, circuits
+        self.show_grid = False     # on-screen alignment aid only — never drawn into the PDF export
+        self.general_notes = []    # free-text notes for this sheet, not tied to any device
         self.auto_arrange()
+
+    def drawBackground(self, painter, rect):
+        painter.fillRect(rect, QBrush(QColor("white")))
+        if not self.show_grid:
+            return
+        step = OL_GRID_PX
+        left = int(rect.left()/step)-1
+        right = int(rect.right()/step)+1
+        top = int(rect.top()/step)-1
+        bottom = int(rect.bottom()/step)+1
+        minor_pen = QPen(QColor("#eef0f1"), 1)
+        major_pen = QPen(QColor("#d8dcde"), 1)
+        for i in range(left, right+1):
+            x = i*step
+            painter.setPen(major_pen if i % OL_GRID_MAJOR_EVERY == 0 else minor_pen)
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+        for j in range(top, bottom+1):
+            y = j*step
+            painter.setPen(major_pen if j % OL_GRID_MAJOR_EVERY == 0 else minor_pen)
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
 
     def set_mode_select(self):
         """No-op — the one-line diagram has no draw/place tool modes, this
@@ -4847,9 +5542,10 @@ class OneLineScene(QGraphicsScene):
                 node.setPos(max_right + OL_SIB_GAP*3, self.panel.pos().y())
         node.manual_pos = False
 
-    def add_circuit(self, parent_node, circuit_type):
+    def add_circuit(self, parent_node, circuit_type, tap_index=None):
         c = CircuitNode(circuit_type)
         c.parent_node = parent_node
+        c.tap_index = tap_index
         parent_node.children.append(c)
         self.addItem(c)
         self._place_new_node(c)
@@ -4869,7 +5565,13 @@ class OneLineScene(QGraphicsScene):
 
     def add_booster(self, parent_node):
         n = sum(1 for nd in self.all_nodes() if isinstance(nd, BoosterNode)) + 1
-        b = BoosterNode(name=f"Booster {n}")
+        # Tapping inline only makes sense off a circuit's own wrapped line
+        # (an initiating/SLC circuit feeding a sub-panel, matching a real
+        # riser's FABP taps) — default the tap point to the end of the
+        # devices added so far, so adding devices then a booster taps it in
+        # right after them.
+        tap_index = len(parent_node.devices) if isinstance(parent_node, CircuitNode) else None
+        b = BoosterNode(name=f"Booster {n}", tap_index=tap_index)
         b.parent_node = parent_node
         parent_node.children.append(b)
         self.addItem(b)
@@ -4909,7 +5611,6 @@ class OneLineScene(QGraphicsScene):
         self.update_connectors()
 
     def update_connectors(self):
-        from PyQt5.QtWidgets import QGraphicsLineItem
         for ln in self._connectors:
             self.removeItem(ln)
         self._connectors = []
@@ -4917,12 +5618,13 @@ class OneLineScene(QGraphicsScene):
         def walk(n):
             for c in n.children:
                 if not getattr(n, "hidden", False) and not getattr(c, "hidden", False):
-                    line = QGraphicsLineItem(n.pos().x()+n._w/2, n.pos().y()+n._h,
-                                              c.pos().x()+c._w/2, c.pos().y())
-                    line.setPen(QPen(QColor("#888"), 1.6))
-                    line.setZValue(0.5)
-                    self.addItem(line)
-                    self._connectors.append(line)
+                    item = ConnectorItem(n, c, "main")
+                    self.addItem(item)
+                    self._connectors.append(item)
+                    if isinstance(c, CircuitNode) and c.circuit_class == "A" and c.class_a_return_to_panel:
+                        ritem = ConnectorItem(n, c, "return")
+                        self.addItem(ritem)
+                        self._connectors.append(ritem)
                 # Keep recursing even when n or c is hidden, so a hidden
                 # node's children (e.g. circuits under a hidden booster)
                 # still get their own subtrees connected.
@@ -4987,22 +5689,39 @@ class OneLineScene(QGraphicsScene):
         QMessageBox.information(None, "Loading / Booster Planner", "\n".join(lines))
 
     def to_dict(self):
+        def _pt(p):
+            return None if p is None else {"x": p.x(), "y": p.y()}
+        def _pts(ps):
+            # Waypoints are plain {"axis","value"} dicts already — JSON-safe as-is.
+            return None if ps is None else list(ps)
         def node_dict(n):
             base = {"x": n.pos().x(), "y": n.pos().y(), "w": n._w, "h": n._h,
-                    "manual_pos": n.manual_pos, "manual_size": n.manual_size}
+                    "manual_pos": n.manual_pos, "manual_size": n.manual_size,
+                    "conn_start_offset": _pt(n.conn_start_offset),
+                    "conn_end_offset": _pt(n.conn_end_offset),
+                    "conn_waypoints": _pts(n.conn_waypoints)}
             if isinstance(n, PanelNode):
                 base.update({"type":"panel", "name":n.name, "nac_budget_ma":n.nac_budget_ma,
                               "hidden": n.hidden})
             elif isinstance(n, BoosterNode):
-                base.update({"type":"booster", "name":n.name, "capacity_ma":n.capacity_ma, "hidden":n.hidden})
+                base.update({"type":"booster", "name":n.name, "capacity_ma":n.capacity_ma, "hidden":n.hidden,
+                              "tap_index": n.tap_index})
             elif isinstance(n, CircuitNode):
                 base.update({"type":"circuit", "circuit_type":n.circuit_type, "name":n.name,
                               "capacity":n.capacity, "devices":n.devices, "circuit_class":n.circuit_class,
-                              "source_label": n.source_label})
+                              "source_label": n.source_label, "tap_index": n.tap_index,
+                              "continues_parent_line": n.continues_parent_line,
+                              "class_a_return_to_panel": n.class_a_return_to_panel,
+                              "conn_return_start_offset": _pt(n.conn_return_start_offset),
+                              "conn_return_end_offset": _pt(n.conn_return_end_offset),
+                              "conn_return_waypoints": _pts(n.conn_return_waypoints)})
             base["children"] = [node_dict(c) for c in n.children]
             return base
         return {"panel": node_dict(self.panel),
-                "standalone": [node_dict(s) for s in self.standalone]}
+                "standalone": [node_dict(s) for s in self.standalone],
+                "monitoring_info": self.monitoring_info,
+                "show_loading": self.show_loading,
+                "general_notes": self.general_notes}
 
     def _apply_geom(self, node, cd):
         if "x" in cd and "y" in cd:
@@ -5014,12 +5733,18 @@ class OneLineScene(QGraphicsScene):
 
     def load_dict(self, d):
         self.clear_all()
+        self.monitoring_info = {**default_monitoring_info(), **(d or {}).get("monitoring_info", {})}
+        self.show_loading = (d or {}).get("show_loading", True)
+        self.general_notes = list((d or {}).get("general_notes", []))
         if not d:
             self.auto_arrange(); return
         # New format is {"panel": {...}, "standalone": [...]}; a bare dict
         # with "type":"panel" at the top level is the old flat, panel-only,
-        # no-geometry format from before drag/resize/standalone existed.
-        if "panel" in d:
+        # no-geometry format from before drag/resize/standalone existed —
+        # and the ONLY case that legitimately needs an auto-arrange on load,
+        # since it never recorded any x/y at all.
+        is_legacy_flat_format = "panel" not in d
+        if not is_legacy_flat_format:
             panel_d, standalone_d = d["panel"], d.get("standalone", [])
         else:
             panel_d, standalone_d = d, []
@@ -5028,17 +5753,33 @@ class OneLineScene(QGraphicsScene):
         self.panel.hidden = panel_d.get("hidden", False)
         self._apply_geom(self.panel, panel_d)
 
+        def _unpt(d):
+            return None if d is None else QPointF(d["x"], d["y"])
+        def _unpts(ds):
+            # Waypoints are plain {"axis","value"} dicts already — JSON-safe as-is.
+            return None if ds is None else list(ds)
+
         def build(parent_node, cd):
             t = cd.get("type")
             if t == "circuit":
                 node = CircuitNode(cd.get("circuit_type","nac"), cd.get("name"),
                                     cd.get("capacity"), cd.get("devices", []), cd.get("circuit_class", "B"),
                                     source_label=cd.get("source_label", ""))
+                node.tap_index = cd.get("tap_index")
+                node.continues_parent_line = cd.get("continues_parent_line", False)
+                node.class_a_return_to_panel = cd.get("class_a_return_to_panel", False)
+                node.conn_return_start_offset = _unpt(cd.get("conn_return_start_offset"))
+                node.conn_return_end_offset = _unpt(cd.get("conn_return_end_offset"))
+                node.conn_return_waypoints = _unpts(cd.get("conn_return_waypoints"))
             elif t == "booster":
-                node = BoosterNode(cd.get("name","Booster"), cd.get("capacity_ma",3000.0))
+                node = BoosterNode(cd.get("name","Booster"), cd.get("capacity_ma",3000.0),
+                                    cd.get("tap_index"))
                 node.hidden = cd.get("hidden", False)
             else:
                 return None
+            node.conn_start_offset = _unpt(cd.get("conn_start_offset"))
+            node.conn_end_offset = _unpt(cd.get("conn_end_offset"))
+            node.conn_waypoints = _unpts(cd.get("conn_waypoints"))
             node.parent_node = parent_node
             if parent_node is not None:
                 parent_node.children.append(node)
@@ -5055,9 +5796,10 @@ class OneLineScene(QGraphicsScene):
             if node is not None:
                 self.standalone.append(node)
 
-        if any(not n.manual_pos for n in self.all_nodes()):
+        if is_legacy_flat_format:
             self.auto_arrange()
-        self.update_connectors()
+        else:
+            self.update_connectors()   # positions are already final — just draw the wires
         self.layout_changed.emit()
 
 
@@ -5154,12 +5896,73 @@ class BoosterEditDialog(QDialog):
         return {"name": self.name_edit.text().strip() or "Booster", "capacity_ma": float(data)}
 
 
+class MonitoringBlockDialog(QDialog):
+    """Edit the project-level fields for the monitoring/demarcation-box
+    schematic block (Alarm/Trouble/Supervisory relays -> terminal box ->
+    central-station monitoring company) drawn once at the bottom of the
+    exported one-line — a fixed schematic template since it's structurally
+    the same on every job, just filled in with these values."""
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Monitoring Block"); self.setMinimumWidth(380)
+        l = QFormLayout(self); l.setSpacing(10); l.setContentsMargins(16,16,16,16)
+        info = {**default_monitoring_info(), **(info or {})}
+        self.panel_circuit_edit = QLineEdit(info["panel_circuit"])
+        self.panel_circuit_edit.setPlaceholderText("e.g. FACP — Relay Board")
+        self.standard_edit = QLineEdit(info["monitoring_standard"])
+        self.terminals_spin = QSpinBox(); self.terminals_spin.setRange(1, 100)
+        self.terminals_spin.setValue(info["demarcation_terminals"])
+        self.breaker_note_edit = QLineEdit(info["breaker_note"])
+        self.breaker_note_edit.setPlaceholderText("e.g. Dedicated breaker, red-tagged")
+        l.addRow("Panel / circuit reference:", self.panel_circuit_edit)
+        l.addRow("Monitoring standard:", self.standard_edit)
+        l.addRow("Demarcation box terminals:", self.terminals_spin)
+        l.addRow("Breaker note:", self.breaker_note_edit)
+        br = QHBoxLayout()
+        ok = QPushButton("OK"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        ca = QPushButton("Cancel"); ca.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ca); br.addWidget(ok)
+        l.addRow(br)
+
+    def values(self):
+        return {"panel_circuit": self.panel_circuit_edit.text().strip(),
+                "monitoring_standard": self.standard_edit.text().strip() or "CAN/ULC S561",
+                "demarcation_terminals": self.terminals_spin.value(),
+                "breaker_note": self.breaker_note_edit.text().strip()}
+
+
+class SheetNotesDialog(QDialog):
+    """Free-text notes for this sheet, not tied to any device — one per
+    line — printed alongside the device notes in the exported title block."""
+    def __init__(self, notes, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sheet Notes"); self.setMinimumSize(420, 320)
+        l = QVBoxLayout(self); l.setSpacing(10); l.setContentsMargins(16,16,16,16)
+        hint = QLabel("One note per line — shown in the exported title block alongside any device notes.")
+        hint.setStyleSheet("color:#666;font-size:11px;")
+        hint.setWordWrap(True)
+        l.addWidget(hint)
+        self.text_edit = QPlainTextEdit("\n".join(notes))
+        self.text_edit.setPlaceholderText('e.g. "Riser routing per architect\'s revised set, dated Aug 12"')
+        l.addWidget(self.text_edit, 1)
+        br = QHBoxLayout()
+        ok = QPushButton("OK"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
+        ok.clicked.connect(self.accept)
+        ca = QPushButton("Cancel"); ca.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ca); br.addWidget(ok)
+        l.addLayout(br)
+
+    def values(self):
+        return [line.strip() for line in self.text_edit.toPlainText().splitlines() if line.strip()]
+
+
 class CircuitEditDialog(QDialog):
     """Edit a circuit's name/capacity, its individual device tally, and its
     NFPA 72 wiring class (A = loops back to the panel/booster, no EOL needed;
     B = single run, ends in an end-of-line resistor)."""
     def __init__(self, circuit_type, name, capacity, devices, circuit_class="B", parent=None,
-                 source_label=""):
+                 source_label="", class_a_return_to_panel=False):
         super().__init__(parent)
         self.circuit_type = circuit_type
         self._keys = FA_NAC_DEVICE_KEYS if circuit_type=="nac" else FA_SLC_DEVICE_KEYS
@@ -5182,10 +5985,30 @@ class CircuitEditDialog(QDialog):
 
         self.class_a_rb = QRadioButton(f"{CIRCUIT_CLASS_INFO['A']['label']} — {CIRCUIT_CLASS_INFO['A']['desc']}")
         self.class_b_rb = QRadioButton(f"{CIRCUIT_CLASS_INFO['B']['label']} — {CIRCUIT_CLASS_INFO['B']['desc']}")
-        (self.class_a_rb if circuit_class=="A" else self.class_b_rb).setChecked(True)
-        cls_grp = QButtonGroup(self); cls_grp.addButton(self.class_a_rb); cls_grp.addButton(self.class_b_rb)
+        self.class_b_addr_rb = QRadioButton(f"{CIRCUIT_CLASS_INFO['B_ADDR']['label']} — {CIRCUIT_CLASS_INFO['B_ADDR']['desc']}")
+        {"A": self.class_a_rb, "B_ADDR": self.class_b_addr_rb}.get(circuit_class, self.class_b_rb).setChecked(True)
+        cls_grp = QButtonGroup(self)
+        for rb in (self.class_a_rb, self.class_b_rb, self.class_b_addr_rb):
+            cls_grp.addButton(rb)
         form.addRow("Wiring class:", self.class_a_rb)
         form.addRow("", self.class_b_rb)
+        form.addRow("", self.class_b_addr_rb)
+
+        self.return_to_panel_cb = QCheckBox("This box closes the loop — show the return wire")
+        self.return_to_panel_cb.setChecked(class_a_return_to_panel)
+        self.return_to_panel_cb.setToolTip(
+            "Off by default so building a chain (box1 -> box2 -> box3...) doesn't draw a\n"
+            "return wire on every box while you're still adding the next one. Check this on\n"
+            "whichever box actually closes the loop and its RETURN leg is drawn straight back\n"
+            "to the real source panel/booster — skipping any boxes in between. Every Class A\n"
+            "box still shows as Class A in its label whether or not this is checked.")
+
+        def _update_return_cb_enabled():
+            self.return_to_panel_cb.setEnabled(self.class_a_rb.isChecked())
+        for rb in (self.class_a_rb, self.class_b_rb, self.class_b_addr_rb):
+            rb.toggled.connect(_update_return_cb_enabled)
+        _update_return_cb_enabled()
+        form.addRow("", self.return_to_panel_cb)
 
         self.source_edit = QLineEdit(source_label)
         self.source_edit.setPlaceholderText("e.g. Panel — NAC 3, or Booster 2 — NAC 1")
@@ -5195,18 +6018,35 @@ class CircuitEditDialog(QDialog):
         form.addRow("Source label:", self.source_edit)
         l.addLayout(form)
 
-        self.tbl = QTableWidget(0, 4)
-        headers = ["Device", "Qty", "mA ea" if circuit_type=="nac" else "", ""]
+        self.tbl = QTableWidget(0, 5)
+        headers = ["Device", "Location / label", "mA" if circuit_type=="nac" else "", "Note", ""]
         self.tbl.setHorizontalHeaderLabels(headers)
-        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.tbl.verticalHeader().setVisible(False)
-        for d in devices:
-            self._add_row(d["key"], d["qty"], d.get("ma"))
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        for d in normalize_devices(devices):
+            if d.get("type") == "floor_break":
+                self._add_floor_row(d.get("label", ""))
+            else:
+                self._add_row(d["key"], d.get("label", ""), d.get("ma"), d.get("note", ""))
         l.addWidget(self.tbl)
 
+        btn_row = QHBoxLayout()
         add_btn = QPushButton("+ Add Device Row")
-        add_btn.clicked.connect(lambda: self._add_row(self._keys[0], 1, None))
-        l.addWidget(add_btn)
+        add_btn.clicked.connect(lambda: self._add_row(self._keys[0], "", None))
+        floor_btn = QPushButton("+ Insert Floor Separator")
+        floor_btn.setToolTip(
+            "Marks where one floor's devices end and the next begins along\n"
+            "the one-line — use Move Up/Down to place it where you want.")
+        floor_btn.clicked.connect(lambda: self._add_floor_row(""))
+        up_btn = QPushButton("▲ Move Up"); up_btn.clicked.connect(lambda: self._move_row(-1))
+        down_btn = QPushButton("▼ Move Down"); down_btn.clicked.connect(lambda: self._move_row(1))
+        btn_row.addWidget(add_btn); btn_row.addWidget(floor_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(up_btn); btn_row.addWidget(down_btn)
+        l.addLayout(btn_row)
 
         l.addWidget(self.total_lbl)
         self.cap_spin.valueChanged.connect(self._refresh_total)
@@ -5219,43 +6059,109 @@ class CircuitEditDialog(QDialog):
         br.addStretch(); br.addWidget(ca); br.addWidget(ok)
         l.addLayout(br)
 
-    def _add_row(self, key, qty, ma_override):
+    def _add_row(self, key, label, ma_override, note=""):
         r = self.tbl.rowCount(); self.tbl.insertRow(r)
         combo = QComboBox()
         for k in self._keys:
             combo.addItem(FA_DEVICE_TYPES[k]["name"], k)
         idx = combo.findData(key)
         combo.setCurrentIndex(idx if idx >= 0 else 0)
-        qty_spin = QSpinBox(); qty_spin.setRange(1, 999); qty_spin.setValue(qty)
+        label_edit = QLineEdit(label)
+        label_edit.setPlaceholderText('e.g. "East Stair", "Kitchen Hood Suppression"')
         ma_spin = QDoubleSpinBox(); ma_spin.setRange(0, 2000); ma_spin.setSuffix(" mA")
         default_ma = FA_DEVICE_TYPES.get(key, {}).get("ma", 0.0)
         ma_spin.setValue(ma_override if ma_override is not None else default_ma)
         ma_spin.setEnabled(self.circuit_type == "nac")
+        note_btn = QPushButton()
+        note_btn.setFixedWidth(28)
         rm_btn = QPushButton("✕"); rm_btn.setFixedWidth(24)
 
         def _on_type_changed(_i, combo=combo, ma_spin=ma_spin):
             k = combo.currentData()
             ma_spin.setValue(FA_DEVICE_TYPES.get(k, {}).get("ma", 0.0))
         combo.currentIndexChanged.connect(_on_type_changed)
-        qty_spin.valueChanged.connect(self._refresh_total)
         ma_spin.valueChanged.connect(self._refresh_total)
 
-        row = {"combo":combo, "qty":qty_spin, "ma":ma_spin}
+        row = {"combo":combo, "label":label_edit, "ma":ma_spin, "note":note, "note_btn":note_btn}
+
+        def _refresh_note_btn():
+            has_note = bool(row["note"].strip())
+            note_btn.setText("📝•" if has_note else "📝")
+            note_btn.setToolTip(row["note"] or 'Add a note for the exported device schedule '
+                                 '(e.g. "Not exact count — 10 on site, drew 3 to represent")')
+
+        def _edit_note():
+            text, ok = QInputDialog.getMultiLineText(
+                self, "Device Note",
+                'Shown in the exported device schedule next to this device —\n'
+                'e.g. "Not exact count — 10 on site, drew 3 to represent qty".',
+                row["note"])
+            if ok:
+                row["note"] = text.strip()
+                _refresh_note_btn()
+        note_btn.clicked.connect(_edit_note)
+        _refresh_note_btn()
+
         rm_btn.clicked.connect(lambda: self._remove_row(row))
-        self.tbl.setCellWidget(r, 0, combo); self.tbl.setCellWidget(r, 1, qty_spin)
-        self.tbl.setCellWidget(r, 2, ma_spin); self.tbl.setCellWidget(r, 3, rm_btn)
+        self.tbl.setCellWidget(r, 0, combo); self.tbl.setCellWidget(r, 1, label_edit)
+        self.tbl.setCellWidget(r, 2, ma_spin); self.tbl.setCellWidget(r, 3, note_btn)
+        self.tbl.setCellWidget(r, 4, rm_btn)
         self._rows.append(row)
         self._refresh_total()
 
+    def _add_floor_row(self, label):
+        r = self.tbl.rowCount(); self.tbl.insertRow(r)
+        edit = QLineEdit(label)
+        edit.setPlaceholderText('Floor separator label, e.g. "2nd Floor"')
+        edit.setStyleSheet("background:#eef2f3;font-weight:bold;")
+        rm_btn = QPushButton("✕"); rm_btn.setFixedWidth(24)
+        row = {"floor_edit": edit}
+        rm_btn.clicked.connect(lambda: self._remove_row(row))
+        self.tbl.setSpan(r, 0, 1, 4)   # merge Device/Label/mA/Note columns into one label field
+        self.tbl.setCellWidget(r, 0, edit)
+        self.tbl.setCellWidget(r, 4, rm_btn)
+        self._rows.append(row)
+
     def _remove_row(self, row):
-        i = self._rows.index(row)
-        self.tbl.removeRow(i)
-        self._rows.pop(i)
+        self._rows.remove(row)
+        self._rebuild_table_from_rows()
+
+    def _move_row(self, delta):
+        i = self.tbl.currentRow()
+        if i < 0 or i >= len(self._rows):
+            return
+        j = i + delta
+        if j < 0 or j >= len(self._rows):
+            return
+        self._rows[i], self._rows[j] = self._rows[j], self._rows[i]
+        self._rebuild_table_from_rows()
+        self.tbl.selectRow(j)
+
+    def _rebuild_table_from_rows(self):
+        """Recreate every table row from self._rows in its current (possibly
+        just reordered) sequence — simplest way to keep the table's visual
+        row order and self._rows in lockstep without manual widget-index
+        bookkeeping."""
+        snapshot = []
+        for row in self._rows:
+            if "floor_edit" in row:
+                snapshot.append(("floor", row["floor_edit"].text()))
+            else:
+                ma = row["ma"].value() if self.circuit_type == "nac" else None
+                snapshot.append(("device", row["combo"].currentData(), row["label"].text(), ma, row["note"]))
+        self.tbl.setRowCount(0)
+        self._rows = []
+        for entry in snapshot:
+            if entry[0] == "floor":
+                self._add_floor_row(entry[1])
+            else:
+                self._add_row(entry[1], entry[2], entry[3], entry[4])
         self._refresh_total()
 
     def _refresh_total(self):
+        device_rows = [r for r in self._rows if "combo" in r]
         if self.circuit_type == "nac":
-            total = sum(r["qty"].value()*r["ma"].value() for r in self._rows)
+            total = sum(r["ma"].value() for r in device_rows)
             cap = self.cap_spin.value()
             pct = (total/cap*100) if cap else 0
             self.total_lbl.setText(f"Total load: {total:.0f} mA / {cap:.0f} mA  ({pct:.0f}%)"
@@ -5263,7 +6169,7 @@ class CircuitEditDialog(QDialog):
             self.total_lbl.setStyleSheet(
                 "font-weight:bold;padding:4px;color:%s;" % ("#c0392b" if total > cap else "#27ae60"))
         else:
-            total = sum(r["qty"].value() for r in self._rows)
+            total = len(device_rows)
             cap = self.cap_spin.value()
             pct = (total/cap*100) if cap else 0
             self.total_lbl.setText(f"Total devices: {total:.0f} / {cap:.0f}  ({pct:.0f}%)"
@@ -5274,16 +6180,23 @@ class CircuitEditDialog(QDialog):
     def values(self):
         devices = []
         for r in self._rows:
+            if "floor_edit" in r:
+                label = r["floor_edit"].text().strip() or "Floor Break"
+                devices.append({"type": "floor_break", "label": label})
+                continue
             key = r["combo"].currentData()
-            qty = r["qty"].value()
+            label = r["label"].text().strip()
             ma = r["ma"].value() if self.circuit_type == "nac" else None
             default_ma = FA_DEVICE_TYPES.get(key, {}).get("ma", 0.0)
-            devices.append({"key": key, "qty": qty,
-                             "ma": ma if (ma is not None and abs(ma-default_ma) > 1e-6) else None})
+            devices.append({"type": "device", "key": key, "label": label,
+                             "ma": ma if (ma is not None and abs(ma-default_ma) > 1e-6) else None,
+                             "note": r["note"].strip()})
         return {"name": self.name_edit.text().strip() or CIRCUIT_TYPE_INFO[self.circuit_type]["name"],
                 "capacity": self.cap_spin.value(), "devices": devices,
-                "circuit_class": "A" if self.class_a_rb.isChecked() else "B",
-                "source_label": self.source_edit.text().strip()}
+                "circuit_class": ("A" if self.class_a_rb.isChecked()
+                                  else "B_ADDR" if self.class_b_addr_rb.isChecked() else "B"),
+                "source_label": self.source_edit.text().strip(),
+                "class_a_return_to_panel": self.return_to_panel_cb.isChecked()}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5389,6 +6302,17 @@ class ProjectInfoDialog(QDialog):
         l.addRow("Location:", self.location)
         l.addRow("Job #:", self.job_number)
         l.addRow("Designer:", self.designer)
+
+        self._logo_path = meta.get("logo_path", "")
+        logo_row = QHBoxLayout()
+        self.logo_lbl = QLabel()
+        self.logo_lbl.setStyleSheet("color:#666;font-size:10px;")
+        self._refresh_logo_label()
+        browse_btn = QPushButton("Browse…"); browse_btn.clicked.connect(self._browse_logo)
+        clear_btn = QPushButton("Clear"); clear_btn.clicked.connect(self._clear_logo)
+        logo_row.addWidget(self.logo_lbl, 1); logo_row.addWidget(browse_btn); logo_row.addWidget(clear_btn)
+        l.addRow("Logo (export cover page):", logo_row)
+
         br = QHBoxLayout()
         ok = QPushButton("OK"); ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
         ok.clicked.connect(self.accept)
@@ -5396,9 +6320,24 @@ class ProjectInfoDialog(QDialog):
         br.addStretch(); br.addWidget(ca); br.addWidget(ok)
         l.addRow(br)
 
+    def _refresh_logo_label(self):
+        self.logo_lbl.setText(os.path.basename(self._logo_path) if self._logo_path else "(none)")
+
+    def _browse_logo(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Logo Image", "",
+                                               "Images (*.png *.jpg *.jpeg *.bmp)")
+        if path:
+            self._logo_path = path
+            self._refresh_logo_label()
+
+    def _clear_logo(self):
+        self._logo_path = ""
+        self._refresh_logo_label()
+
     def values(self):
         return {"customer": self.customer.text().strip(), "location": self.location.text().strip(),
-                "job_number": self.job_number.text().strip(), "designer": self.designer.text().strip()}
+                "job_number": self.job_number.text().strip(), "designer": self.designer.text().strip(),
+                "logo_path": self._logo_path}
 
 
 class WallSettingsDialog(QDialog):
@@ -5427,6 +6366,42 @@ class WallSettingsDialog(QDialog):
         return self.custom.value()
 
 
+def add_cover_page(doc, project_meta, sheet_title, drawing_name=None):
+    """A plain Letter-size cover page — logo (if the project has one set in
+    Project Info), sheet title/drawing name, and the project metadata —
+    inserted at the front of the export. Used once per document: a single
+    sheet's own export gets one automatically, and the "Export All Sheets"
+    combined PDF gets exactly one shared one instead of a repeat per sheet."""
+    project_meta = project_meta or {}
+    pw, ph = 8.5*72, 11*72
+    page = doc.new_page(width=pw, height=ph)
+    y = 100
+    logo_path = project_meta.get("logo_path", "")
+    if logo_path and os.path.isfile(logo_path):
+        try:
+            box_w, box_h = 220, 130
+            rect = fitz.Rect(pw/2-box_w/2, 70, pw/2+box_w/2, 70+box_h)
+            page.insert_image(rect, filename=logo_path, keep_proportion=True)
+            y = 70 + box_h + 40
+        except Exception:
+            pass
+    page.insert_text(fitz.Point(72, y), sheet_title, fontsize=22, fontname="helv", color=(0,0,0))
+    y += 8
+    page.draw_line(fitz.Point(72, y), fitz.Point(pw-72, y), color=(0.7,0.7,0.7), width=0.8)
+    y += 30
+    if drawing_name:
+        page.insert_text(fitz.Point(72, y), drawing_name, fontsize=14, fontname="hebo", color=(0.2,0.2,0.2))
+        y += 30
+    for label, key in [("Customer", "customer"), ("Location", "location"),
+                        ("Job #", "job_number"), ("Designer", "designer")]:
+        val = project_meta.get(key, "")
+        if val:
+            page.insert_text(fitz.Point(72, y), f"{label}:  {val}", fontsize=11, color=(0.2,0.2,0.2))
+            y += 20
+    page.insert_text(fitz.Point(72, y+10), f"Date: {datetime.date.today().strftime('%b %d, %Y')}",
+                      fontsize=10, color=(0.4,0.4,0.4))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  One-Line Diagram PDF export — not to scale, auto-picks the smallest
 #  standard sheet the tree fits on (shrinking only if it exceeds ARCH E).
@@ -5447,11 +6422,39 @@ def _oneline_node_color(n):
     return (0,0,0)
 
 
-def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIAGRAM"):
+def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIAGRAM", doc=None, drawing_name=None):
+    """Renders one sheet's diagram (main page + device schedule) into `doc`,
+    a fitz.Document. When `doc` is None (the normal single-sheet case), a
+    new document is created and saved/closed to `path` here; when the
+    caller passes an existing `doc` (exporting several sheets into one
+    combined PDF), the pages are just appended and the caller is
+    responsible for saving/closing it.
+
+    `sheet_title` is the drawing TYPE/project label (e.g. the project name
+    or "ONE-LINE DIAGRAM"); `drawing_name` is the specific sheet/area this
+    page covers (e.g. "Common Areas", "In Suites") — shown as its own
+    clearly labeled line in the title block so it's obvious, at a glance,
+    which sheet a printed page actually is."""
     project_meta = project_meta or {}
+    owns_doc = doc is None
     nodes = scene.all_nodes()
     xs = [n.pos().x() for n in nodes] + [n.pos().x()+n._w for n in nodes]
     ys = [n.pos().y() for n in nodes] + [n.pos().y()+n._h for n in nodes]
+
+    def _walk_bounds(node):
+        for c in node.children:
+            if not getattr(node, "hidden", False) and not getattr(c, "hidden", False):
+                legs = [("main", node, c)]
+                if isinstance(c, CircuitNode) and c.circuit_class == "A" and c.class_a_return_to_panel:
+                    legs.append(("return", node, c))
+                for leg, parent_n, child_n in legs:
+                    for p in connector_points(parent_n, child_n, leg):
+                        xs.append(p.x()); ys.append(p.y())
+            _walk_bounds(c)
+    _walk_bounds(scene.panel)
+    for s in scene.standalone:
+        _walk_bounds(s)
+
     min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
     content_w, content_h = max(1.0, max_x-min_x), max(1.0, max_y-min_y)
 
@@ -5476,7 +6479,12 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
         chosen = (pw_in, ph_in, scale)
     pw_in, ph_in, scale = chosen
 
-    doc = fitz.open()
+    if doc is None:
+        doc = fitz.open()
+        # Only a standalone single-sheet export gets its own cover page —
+        # the combined "Export All Sheets" PDF adds one shared cover page
+        # itself (see _ol_export_all_sheets) instead of one per sheet.
+        add_cover_page(doc, project_meta, sheet_title, drawing_name)
     page = doc.new_page(width=pw_in*72, height=ph_in*72)
     origin_x = margin_pt + max(0.0, (pw_in*72-2*margin_pt - content_w*scale)/2)
     origin_y = margin_pt + max(0.0, (ph_in*72-2*margin_pt-title_h_pt - content_h*scale)/2)
@@ -5490,12 +6498,21 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
     # UNDER the shape's opaque box fills once they're painted.
     shape = page.new_shape()
 
+    connector_legs = []   # (leg, start_scene, end_scene) — for pass-2 OUT/RETURN labels
+
     def walk_lines(node):
         for c in node.children:
             if not getattr(node, "hidden", False) and not getattr(c, "hidden", False):
-                p1 = tx(node.pos().x()+node._w/2, node.pos().y()+node._h)
-                p2 = tx(c.pos().x()+c._w/2, c.pos().y())
-                shape.draw_line(p1, p2); shape.finish(color=(0.55,0.55,0.55), width=1.2)
+                legs = [("main", node, c)]
+                if isinstance(c, CircuitNode) and c.circuit_class == "A" and c.class_a_return_to_panel:
+                    legs.append(("return", node, c))
+                for leg, parent_n, child_n in legs:
+                    pts = [tx(p.x(), p.y()) for p in connector_points(parent_n, child_n, leg)]
+                    for a, b in zip(pts, pts[1:]):
+                        col = (0.49,0.24,0.6) if leg == "return" else (0.55,0.55,0.55)
+                        dashes = "[3 2] 0" if leg == "return" else None
+                        shape.draw_line(a, b); shape.finish(color=col, width=1.2, dashes=dashes)
+                    connector_legs.append((leg, pts[0], child_n))
             walk_lines(c)   # keep recursing even when node/c is hidden
     walk_lines(scene.panel)
     for s in scene.standalone:
@@ -5507,28 +6524,70 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
         p1 = tx(n.pos().x(), n.pos().y())
         p2 = tx(n.pos().x()+n._w, n.pos().y()+n._h)
         col = _oneline_node_color(n)
-        shape.draw_rect(fitz.Rect(p1.x, p1.y, p2.x, p2.y))
-        shape.finish(color=col, fill=(0.97,0.97,0.97), width=1.4)
+        if not isinstance(n, CircuitNode):
+            # Circuits are just the wire itself, matching a real riser
+            # diagram — only the panel/booster physical enclosures get a box.
+            shape.draw_rect(fitz.Rect(p1.x, p1.y, p2.x, p2.y))
+            shape.finish(color=col, fill=(0.97,0.97,0.97), width=1.4)
         if isinstance(n, CircuitNode):
-            # Individual device tick boxes
-            ticks, cols, rows = circuit_grid_layout(n.devices, n._w, OL_TICK_W, OL_TICK_H)
-            for i, abbr in enumerate(ticks):
-                col_i, row_i = i % cols, i // cols
-                tx0 = n.pos().x() + 8 + col_i*OL_TICK_W
-                ty0 = n.pos().y() + 36 + row_i*OL_TICK_H
-                tp1 = tx(tx0, ty0); tp2 = tx(tx0+OL_TICK_W-3, ty0+OL_TICK_H-3)
-                shape.draw_rect(fitz.Rect(tp1.x, tp1.y, tp2.x, tp2.y))
-                shape.finish(color=(0.4,0.4,0.4), fill=(1,1,1), width=0.6)
-            # Terminus: Class B EOL resistor zigzag, Class A return arc
-            term_y = n.pos().y() + n._h - 16
-            if n.circuit_class == "B":
-                zx = n.pos().x() + n._w/2 - 16
-                pts = [tx(zx+i*4, term_y+6+((-1)**i)*4) for i in range(9)]
-                shape.draw_polyline(pts); shape.finish(color=(0.3,0.3,0.3), width=1.0)
-            else:
-                c = tx(n.pos().x()+n._w/2, term_y+6)
-                r = 8*scale
-                shape.draw_circle(c, r); shape.finish(color=(0.3,0.3,0.3), width=1.0)
+            # Continuous horizontal line that wraps to a new row, with each
+            # device as its own tick + icon directly on the line and a
+            # dashed continuation + label wherever a row closes on a
+            # floor-break — mirrors CircuitNode.paint() exactly, per this
+            # file's own convention that the on-screen and PDF renderings
+            # must stay in sync.
+            rows = n.row_layout()
+            for r, row in enumerate(rows):
+                y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
+                cnt = len(row["devices"])
+                line_end_x = n.pos().x() + (OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN)
+                lp1 = tx(n.pos().x()+OL_MARGIN, y); lp2 = tx(max(line_end_x, n.pos().x()+OL_MARGIN), y)
+                shape.draw_line(lp1, lp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
+                for i, d in enumerate(row["devices"]):
+                    dx = n.pos().x() + OL_MARGIN + (i+0.5)*OL_DEV_SPACING
+                    tp1 = tx(dx, y); tp2 = tx(dx, y-OL_TICK_LEN)
+                    shape.draw_line(tp1, tp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
+                    bp1 = tx(dx-13, y-OL_TICK_LEN-13); bp2 = tx(dx+13, y-OL_TICK_LEN-1)
+                    shape.draw_rect(fitz.Rect(bp1.x, bp1.y, bp2.x, bp2.y))
+                    shape.finish(color=(0.4,0.4,0.4), fill=(1,1,1), width=0.6)
+                if row["floor_label"] is not None:
+                    dash_x0 = max(line_end_x, n.pos().x()+OL_MARGIN)
+                    fp1 = tx(dash_x0, y); fp2 = tx(n.pos().x()+n._w-OL_MARGIN, y)
+                    shape.draw_line(fp1, fp2); shape.finish(color=(0.35,0.35,0.35), width=0.6, dashes="[2 2] 0")
+            for c in n.children:
+                if c.tap_index is None or getattr(c, "hidden", False):
+                    continue
+                bx, by = n.device_position(c.tap_index)
+                if isinstance(c, BoosterNode):
+                    bp1 = tx(n.pos().x()+bx-16, n.pos().y()+by-7); bp2 = tx(n.pos().x()+bx+16, n.pos().y()+by+7)
+                    shape.draw_rect(fitz.Rect(bp1.x, bp1.y, bp2.x, bp2.y))
+                    shape.finish(color=(0.49,0.24,0.6), fill=(0.96,0.93,0.99), width=0.7)
+                elif isinstance(c, CircuitNode):
+                    tp1 = tx(n.pos().x()+bx, n.pos().y()+by); tp2 = tx(n.pos().x()+bx, n.pos().y()+by+10)
+                    shape.draw_line(tp1, tp2); shape.finish(color=(0.1,0.32,0.46), width=1.1)
+                    tp3 = tx(n.pos().x()+bx-6, n.pos().y()+by+10); tp4 = tx(n.pos().x()+bx+6, n.pos().y()+by+10)
+                    shape.draw_line(tp3, tp4); shape.finish(color=(0.1,0.32,0.46), width=1.1)
+            # Terminus: Class B EOL resistor zigzag; Class B (Addressable)
+            # simple line-end cap, no EOL. Class A draws nothing here — it
+            # loops back to its source via the actual RETURN connector leg
+            # drawn above, not a symbol on the circuit itself. Drawn right
+            # at the end of the last row's line, touching the last device —
+            # mirrors CircuitNode.paint() exactly.
+            if n.circuit_class in ("B", "B_ADDR") and not n.has_continuation_child():
+                tp = n.terminus_point()
+                stub1 = tx(n.pos().x()+tp.x(), n.pos().y()+tp.y())
+                stub2 = tx(n.pos().x()+tp.x()+8, n.pos().y()+tp.y())
+                shape.draw_line(stub1, stub2); shape.finish(color=(0.4,0.4,0.4), width=1.0)
+                if n.circuit_class == "B":
+                    zx = n.pos().x() + tp.x() + 8
+                    pts = [tx(zx+i*4, n.pos().y()+tp.y()+((-1)**i)*4) for i in range(9)]
+                    shape.draw_polyline(pts); shape.finish(color=(0.3,0.3,0.3), width=1.0)
+                else:
+                    lx = n.pos().x() + tp.x() + 8
+                    ly = n.pos().y() + tp.y()
+                    lp1 = tx(lx, ly); lp2 = tx(lx+10, ly); lp3 = tx(lx+10, ly-6); lp4 = tx(lx+10, ly+6)
+                    shape.draw_line(lp1, lp2); shape.finish(color=(0.3,0.3,0.3), width=1.0)
+                    shape.draw_line(lp3, lp4); shape.finish(color=(0.3,0.3,0.3), width=1.0)
     shape.commit()
 
     # Pass 2: text, now safely on top of the committed boxes/lines.
@@ -5537,121 +6596,151 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
             continue
         p1 = tx(n.pos().x(), n.pos().y())
         col = _oneline_node_color(n)
+        show_loading = getattr(scene, "show_loading", True)
         if isinstance(n, PanelNode):
             page.insert_text(fitz.Point(p1.x+6, p1.y+16*scale+4), n.name,
                               fontsize=9, fontname="helv", color=(0,0,0))
-            page.insert_text(fitz.Point(p1.x+6, p1.y+32*scale+4),
-                              f"Direct NAC: {n.direct_nac_load_ma():.0f}/{n.nac_budget_ma:.0f} mA",
-                              fontsize=7, color=col)
+            if show_loading:
+                page.insert_text(fitz.Point(p1.x+6, p1.y+32*scale+4),
+                                  f"Direct NAC: {n.direct_nac_load_ma():.0f}/{n.nac_budget_ma:.0f} mA",
+                                  fontsize=7, color=col)
         elif isinstance(n, BoosterNode):
             page.insert_text(fitz.Point(p1.x+6, p1.y+18*scale+4), f"Booster: {n.name}",
                               fontsize=9, fontname="helv", color=(0,0,0))
-            page.insert_text(fitz.Point(p1.x+6, p1.y+34*scale+4),
-                              f"{n.total_load():.0f}/{n.capacity_ma:.0f} mA", fontsize=7, color=col)
+            if show_loading:
+                page.insert_text(fitz.Point(p1.x+6, p1.y+34*scale+4),
+                                  f"{n.total_load():.0f}/{n.capacity_ma:.0f} mA", fontsize=7, color=col)
         elif isinstance(n, CircuitNode):
             info = CIRCUIT_TYPE_INFO[n.circuit_type]
             title = n.name
             if not n.has_visible_parent() and n.source_label:
                 title = f"{n.name}  —  {n.source_label}"
             page.insert_text(fitz.Point(p1.x+5, p1.y+13*scale+4),
-                              f"{title} [{info['name']} · Class {n.circuit_class}]",
+                              f"{title} [{info['name']} · {CIRCUIT_CLASS_INFO[n.circuit_class]['label']}]",
                               fontsize=7.5, fontname="helv", color=(0,0,0))
-            page.insert_text(fitz.Point(p1.x+5, p1.y+27*scale+4),
-                              f"{n.total_load():.0f}/{n.capacity:.0f} {info['unit']} ({n.utilization_pct():.0f}%)",
-                              fontsize=6.5, color=col)
-            ticks, cols, rows = circuit_grid_layout(n.devices, n._w, OL_TICK_W, OL_TICK_H)
-            for i, abbr in enumerate(ticks):
-                col_i, row_i = i % cols, i // cols
-                tx0 = n.pos().x() + 8 + col_i*OL_TICK_W
-                ty0 = n.pos().y() + 36 + row_i*OL_TICK_H
-                tp = tx(tx0+2, ty0+(OL_TICK_H-3)*0.7)
-                page.insert_text(tp, abbr, fontsize=5, color=(0.2,0.2,0.2))
-            if not ticks:
+            if show_loading:
+                page.insert_text(fitz.Point(p1.x+5, p1.y+27*scale+4),
+                                  f"{n.total_load():.0f}/{n.capacity:.0f} {info['unit']} ({n.utilization_pct():.0f}%)",
+                                  fontsize=6.5, color=col)
+            rows = n.row_layout()
+            if not any(row["devices"] for row in rows):
                 page.insert_text(fitz.Point(p1.x+5, p1.y+40*scale+4), "(no devices)",
                                   fontsize=6, color=(0.6,0.6,0.6))
-            term_y_scene = n.pos().y() + n._h - 16
-            if n.circuit_class == "B":
-                lbl_x = n.pos().x()+n._w/2 - 16 + 36
-                page.insert_text(tx(lbl_x, term_y_scene+2), "EOL", fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
-            else:
-                lbl_x = n.pos().x()+n._w/2 + 12
-                page.insert_text(tx(lbl_x, term_y_scene+2), "Class A return",
-                                  fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
+            for r, row in enumerate(rows):
+                y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
+                cnt = len(row["devices"])
+                line_end_x = n.pos().x() + (OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN)
+                for i, d in enumerate(row["devices"]):
+                    dx = n.pos().x() + OL_MARGIN + (i+0.5)*OL_DEV_SPACING
+                    abbr = FA_DEVICE_TYPES.get(d["key"], {}).get("abbr", d["key"][:3].upper())
+                    tp = tx(dx-12, y-OL_TICK_LEN-4)
+                    page.insert_text(tp, abbr, fontsize=5, fontname="hebo", color=(0.2,0.2,0.2))
+                    if d.get("note"):
+                        page.insert_text(tx(dx+9, y-OL_TICK_LEN-6), "*", fontsize=7, fontname="hebo",
+                                          color=(0.72,0.53,0.04))
+                    label = d.get("label", "")
+                    if label:
+                        lp = tx(dx-OL_DEV_SPACING/2+2, y+11)
+                        page.insert_text(lp, label, fontsize=5, color=(0.2,0.2,0.2))
+                if row["floor_label"] is not None:
+                    dash_x0 = max(line_end_x, n.pos().x()+OL_MARGIN)
+                    lp = tx(dash_x0+4, y-3)
+                    page.insert_text(lp, row["floor_label"], fontsize=5.5, fontname="hebo", color=(0.2,0.2,0.2))
+            for c in n.children:
+                if c.tap_index is None or getattr(c, "hidden", False):
+                    continue
+                bx, by = n.device_position(c.tap_index)
+                if isinstance(c, BoosterNode):
+                    bp = tx(n.pos().x()+bx-15, n.pos().y()+by+2)
+                    page.insert_text(bp, c.name, fontsize=4.5, fontname="hebo", color=(0.36,0.17,0.44))
+                elif isinstance(c, CircuitNode):
+                    bp = tx(n.pos().x()+bx+8, n.pos().y()+by+9)
+                    page.insert_text(bp, f"T -> {c.name}", fontsize=4.5, fontname="hebo", color=(0.1,0.32,0.46))
+            if n.circuit_class in ("B", "B_ADDR") and not n.has_continuation_child():
+                tp = n.terminus_point()
+                if n.circuit_class == "B":
+                    lbl_x = n.pos().x()+tp.x()+8+38
+                    page.insert_text(tx(lbl_x, n.pos().y()+tp.y()-6), "EOL",
+                                      fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
+                else:
+                    lbl_x = n.pos().x()+tp.x()+8+16
+                    page.insert_text(tx(lbl_x, n.pos().y()+tp.y()-6), "No EOL (addressable)",
+                                      fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
+
+    # OUT/RETURN labels at the panel/booster end of each connector leg —
+    # mirrors ConnectorItem.paint() so a Class A circuit's two wires both
+    # read as going TO the panel, not as a loop drawn on the circuit itself.
+    for leg, start_pt, child_n in connector_legs:
+        if leg == "return":
+            page.insert_text(fitz.Point(start_pt.x+3, start_pt.y-3), "RETURN",
+                              fontsize=5.5, fontname="hebo", color=(0.49,0.24,0.6))
+        elif isinstance(child_n, CircuitNode) and child_n.circuit_class == "A":
+            page.insert_text(fitz.Point(start_pt.x+3, start_pt.y-3), "OUT",
+                              fontsize=5.5, fontname="hebo", color=(0.1,0.32,0.46))
 
     tb_y = ph_in*72 - title_h_pt
     page.draw_line(fitz.Point(margin_pt, tb_y), fitz.Point(pw_in*72-margin_pt, tb_y), color=(0,0,0), width=1.0)
     page.insert_text(fitz.Point(margin_pt, tb_y+18), sheet_title, fontsize=13, fontname="helv", color=(0,0,0))
-    page.insert_text(fitz.Point(margin_pt, tb_y+36),
+    next_y = tb_y + 36
+    if drawing_name:
+        # The specific sheet/area this page covers — a separate, clearly
+        # labeled line so it doesn't get lost inside sheet_title (which is
+        # usually just the project name / drawing type).
+        page.insert_text(fitz.Point(margin_pt, next_y), f"Drawing: {drawing_name}",
+                          fontsize=10.5, fontname="hebo", color=(0,0,0))
+        next_y += 18
+    page.insert_text(fitz.Point(margin_pt, next_y),
                       f"Project: {project_meta.get('customer','')}   {project_meta.get('job_number','')}",
                       fontsize=8, color=(0.2,0.2,0.2))
-    page.insert_text(fitz.Point(margin_pt, tb_y+50),
+    page.insert_text(fitz.Point(margin_pt, next_y+14),
                       f"Date: {datetime.date.today().strftime('%b %d, %Y')}", fontsize=8, color=(0.2,0.2,0.2))
 
-    # Device schedule page(s) — spells out what each on-diagram abbreviation
-    # tick actually is (full name, manufacturer part #, mA, quantity) per
-    # circuit, so the diagram is usable by a contractor without this app.
-    circuits = [n for n in scene.all_nodes() if isinstance(n, CircuitNode)]
-    if circuits:
-        sched_pw, sched_ph = 8.5*72, 11*72
-        row_h = 14
-        state = {"page": None, "y": 0.0}
-
-        def _new_sched_page():
-            state["page"] = doc.new_page(width=sched_pw, height=sched_ph)
-            state["page"].insert_text(fitz.Point(margin_pt, margin_pt+14), "DEVICE SCHEDULE",
-                                       fontsize=13, fontname="helv", color=(0,0,0))
-            state["page"].insert_text(
-                fitz.Point(margin_pt, margin_pt+30),
-                f"Project: {project_meta.get('customer','')}   {project_meta.get('job_number','')}",
-                fontsize=8, color=(0.2,0.2,0.2))
-            state["y"] = margin_pt + 54
-
-        _new_sched_page()
-        for c in circuits:
-            info = CIRCUIT_TYPE_INFO[c.circuit_type]
-            if state["y"] > sched_ph - margin_pt - 60:
-                _new_sched_page()
-            state["page"].insert_text(
-                fitz.Point(margin_pt, state["y"]),
-                f"{c.name}  —  {info['name']} · Class {c.circuit_class}  —  "
-                f"{c.total_load():.0f}/{c.capacity:.0f} {info['unit']} ({c.utilization_pct():.0f}%)",
-                fontsize=9.5, fontname="helv", color=(0,0,0))
-            state["y"] += row_h + 4
-            if not c.devices:
-                state["page"].insert_text(fitz.Point(margin_pt+14, state["y"]), "(no devices)",
-                                           fontsize=8, color=(0.6,0.6,0.6))
-                state["y"] += row_h
-            for d in c.devices:
-                if state["y"] > sched_ph - margin_pt - 30:
-                    _new_sched_page()
+    # General sheet notes (not tied to any device) plus device notes (e.g.
+    # "not exact count") — both printed in the title block, not a separate
+    # schedule page, so they're seen right where the sheet is identified
+    # rather than buried elsewhere in the document.
+    notes = list(getattr(scene, "general_notes", []))
+    for n in scene.all_nodes():
+        if not isinstance(n, CircuitNode):
+            continue
+        for d in n.devices:
+            if d.get("type") == "device" and d.get("note"):
                 dev = FA_DEVICE_TYPES.get(d["key"], {})
-                ma = d.get("ma")
-                if ma is None:
-                    ma = dev.get("ma", 0.0)
-                label = f"{dev.get('abbr','?')}   {dev.get('name', d['key'])}"
-                part = dev.get("part")
-                if part:
-                    label += f"   [{part}]"
-                line = f"{label}   x{d['qty']}   @ {ma:.0f} mA ea   = {d['qty']*ma:.0f} mA"
-                state["page"].insert_text(fitz.Point(margin_pt+14, state["y"]), line,
-                                           fontsize=8, color=(0.1,0.1,0.1))
-                state["y"] += row_h
-            state["y"] += 10
+                abbr = dev.get("abbr", d["key"][:3].upper())
+                loc = d.get("label", "")
+                tag = f"{abbr} ({loc})" if loc else abbr
+                notes.append(f"{tag}: {d['note']}")
+    if notes:
+        notes_x = pw_in*72/2
+        page.insert_text(fitz.Point(notes_x, tb_y+18), "NOTES:", fontsize=9, fontname="hebo", color=(0,0,0))
+        max_lines = max(1, int((title_h_pt-22)/11))
+        shown, remaining = notes[:max_lines], len(notes) - max_lines
+        avail_w = pw_in*72 - margin_pt - notes_x
+        for i, note in enumerate(shown):
+            # Rough char budget so a long note doesn't run off the sheet edge.
+            max_chars = max(20, int(avail_w/4.3))
+            text = note if len(note) <= max_chars else note[:max_chars-1]+"…"
+            page.insert_text(fitz.Point(notes_x, tb_y+32+i*11), text, fontsize=7, color=(0.3,0.3,0.3))
+        if remaining > 0:
+            page.insert_text(fitz.Point(notes_x, tb_y+32+len(shown)*11), f"+ {remaining} more…",
+                              fontsize=7, fontname="heit", color=(0.5,0.5,0.5))
 
-    doc.save(path)
-    doc.close()
+    if owns_doc:
+        doc.save(path)
+        doc.close()
 
 
 class OneLinePreviewDialog(QDialog):
     """Export preview — a throwaway clone of the diagram the user can drag
     and resize freely (via the same drag/resize behavior as the live canvas)
     before generating the PDF. Nothing here touches the working diagram."""
-    def __init__(self, source_scene, project_meta, sheet_title, parent=None):
+    def __init__(self, source_scene, project_meta, sheet_title, parent=None, drawing_name=None):
         super().__init__(parent)
         self.setWindowTitle("Export Preview — arrange boxes, then Export")
         self.resize(1150, 780)
         self.project_meta = project_meta
         self.sheet_title = sheet_title
+        self.drawing_name = drawing_name
         self.export_path = None
 
         self.scene = OneLineScene()
@@ -5690,7 +6779,8 @@ class OneLinePreviewDialog(QDialog):
         if not path:
             return
         try:
-            export_oneline_pdf(self.scene, path, self.project_meta, self.sheet_title)
+            export_oneline_pdf(self.scene, path, self.project_meta, self.sheet_title,
+                                drawing_name=self.drawing_name)
         except Exception as e:
             _log_error("OneLinePreviewDialog._do_export", e)
             QMessageBox.critical(self, "Export Failed", str(e))
@@ -5724,9 +6814,14 @@ class DrawingDesigner(QDialog):
         self.wire_scene.status_changed.connect(self._on_status)
         self.wire_canvas = WiringCanvas(self.wire_scene)
 
-        self.oneline_scene = OneLineScene()
-        self.oneline_scene.layout_changed.connect(self._on_changed)
-        self.oneline_scene.status_changed.connect(self._on_status)
+        # Multiple named sheets (e.g. a main riser + a separate sheet per
+        # booster's sub-riser, matching a real drawing set's E7.01/E7.02
+        # split) — self.oneline_scene always points at the ACTIVE sheet's
+        # scene, so every existing call site that reads it keeps working
+        # unmodified; only _ol_switch_sheet() reassigns it.
+        self.oneline_sheets = [self._ol_make_sheet("Sheet 1")]
+        self.oneline_sheet_idx = 0
+        self.oneline_scene = self.oneline_sheets[0]["scene"]
         self.oneline_canvas = OneLineCanvas(self.oneline_scene)
 
         self._build_ui()
@@ -5820,8 +6915,47 @@ class DrawingDesigner(QDialog):
         self._loading_btn.triggered.connect(self._ol_check_loading)
         self._ol_menu.addAction("Auto-Arrange").triggered.connect(self._ol_auto_arrange)
         self._ol_menu.addAction("Import FQQ (.xlsm)").triggered.connect(self._import_fqq)
+        self._ol_menu.addSeparator()
+        self._ol_menu.addAction("Edit Monitoring Block…").triggered.connect(self._ol_edit_monitoring_block)
+        self._ol_menu.addAction("Edit Sheet Notes…").triggered.connect(self._ol_edit_sheet_notes)
+        self._ol_menu.addSeparator()
+        self._ol_show_loading_a = self._ol_menu.addAction("Show Loading (mA / % / device count)")
+        self._ol_show_loading_a.setCheckable(True)
+        self._ol_show_loading_a.setChecked(True)
+        self._ol_show_loading_a.triggered.connect(self._ol_toggle_show_loading)
+        self._ol_show_grid_a = self._ol_menu.addAction("Show Alignment Grid (screen only)")
+        self._ol_show_grid_a.setCheckable(True)
+        self._ol_show_grid_a.setChecked(False)
+        self._ol_show_grid_a.setToolTip("On-screen alignment aid only — never appears in the PDF export.")
+        self._ol_show_grid_a.triggered.connect(self._ol_toggle_show_grid)
+        self._ol_menu.addSeparator()
+        self._ol_menu.addAction("Export All Sheets (PDF)…").triggered.connect(self._ol_export_all_sheets)
         self._ol_tools_btn.setMenu(self._ol_menu)
         tbl.addWidget(self._ol_tools_btn)
+
+        self._ol_sheet_combo = QComboBox()
+        self._ol_sheet_combo.setMinimumWidth(130)
+        self._ol_sheet_combo.setToolTip("One-Line sheet — e.g. a main riser plus one sheet per booster's own sub-riser.")
+        # The combo's OWN stylesheet doesn't reliably reach its popup list in
+        # Qt — without an explicit QComboBox QAbstractItemView rule the
+        # dropdown falls back to a near-black-on-black default that's
+        # unreadable against this app's dark toolbar theme.
+        self._ol_sheet_combo.setStyleSheet(
+            "QComboBox { background:white; color:#1a1a1a; border:1px solid #888; "
+            "border-radius:3px; padding:3px 6px; font-weight:bold; }"
+            "QComboBox:hover { border-color:#ff7002; }"
+            "QComboBox QAbstractItemView { background:white; color:#1a1a1a; "
+            "selection-background-color:#ff7002; selection-color:white; "
+            "border:1px solid #888; outline:0; }")
+        self._ol_sheet_combo.currentIndexChanged.connect(self._ol_switch_sheet)
+        self._ol_refresh_sheet_combo()
+        tbl.addWidget(self._ol_sheet_combo)
+        self._ol_sheet_add_btn = _btn("+ Sheet", self._ol_add_sheet, color="#1a5276")
+        tbl.addWidget(self._ol_sheet_add_btn)
+        self._ol_sheet_rename_btn = _btn("Rename Sheet", self._ol_rename_sheet)
+        tbl.addWidget(self._ol_sheet_rename_btn)
+        self._ol_sheet_del_btn = _btn("Delete Sheet", self._ol_delete_sheet, color="#c0392b")
+        tbl.addWidget(self._ol_sheet_del_btn)
         tbl.addWidget(_sep())
 
         tbl.addWidget(_btn("Fit View", self._fit))
@@ -5903,6 +7037,10 @@ class DrawingDesigner(QDialog):
         self._fp_tools_btn.setEnabled(idx == 0)
         self._bg_tools_btn.setEnabled(idx == 0)
         self._ol_tools_btn.setEnabled(idx == 2)
+        self._ol_sheet_combo.setEnabled(idx == 2)
+        self._ol_sheet_add_btn.setEnabled(idx == 2)
+        self._ol_sheet_rename_btn.setEnabled(idx == 2)
+        self._ol_sheet_del_btn.setEnabled(idx == 2)
         self._wall_btn.setEnabled(idx == 0); self._wall_btn.setChecked(False)
         self._thickness_btn.setEnabled(idx == 0)
         self._zone_btn.setEnabled(idx == 0); self._zone_btn.setChecked(False)
@@ -6119,6 +7257,95 @@ class DrawingDesigner(QDialog):
     def _ol_auto_arrange(self):
         self.oneline_scene.auto_arrange()
 
+    def _ol_edit_monitoring_block(self):
+        sc = self.oneline_scene
+        dlg = MonitoringBlockDialog(sc.monitoring_info, self)
+        if dlg.exec_() == QDialog.Accepted:
+            sc.monitoring_info = dlg.values()
+            self._dirty = True
+            self._update_title()
+
+    def _ol_edit_sheet_notes(self):
+        sc = self.oneline_scene
+        dlg = SheetNotesDialog(sc.general_notes, self)
+        if dlg.exec_() == QDialog.Accepted:
+            sc.general_notes = dlg.values()
+            self._dirty = True
+            self._update_title()
+
+    def _ol_toggle_show_loading(self, checked):
+        self.oneline_scene.show_loading = checked
+        self.oneline_scene.update()
+        self._dirty = True
+        self._update_title()
+
+    def _ol_toggle_show_grid(self, checked):
+        # Screen-only — export_oneline_pdf never reads show_grid, so this
+        # doesn't need to be persisted or to mark the project dirty.
+        self.oneline_scene.show_grid = checked
+        self.oneline_scene.update()
+
+    # ── One-Line multi-sheet management ─────────────────────────────────────
+    # Separate named sheets (e.g. a main riser + one sheet per booster's own
+    # sub-riser) so a job with several boosters doesn't have to cram every
+    # circuit onto one page, matching a real drawing set split across
+    # multiple riser sheets.
+
+    def _ol_make_sheet(self, name):
+        sc = OneLineScene()
+        sc.layout_changed.connect(self._on_changed)
+        sc.status_changed.connect(self._on_status)
+        return {"name": name, "scene": sc}
+
+    def _ol_refresh_sheet_combo(self):
+        self._ol_sheet_combo.blockSignals(True)
+        self._ol_sheet_combo.clear()
+        for sh in self.oneline_sheets:
+            self._ol_sheet_combo.addItem(sh["name"])
+        self._ol_sheet_combo.setCurrentIndex(self.oneline_sheet_idx)
+        self._ol_sheet_combo.blockSignals(False)
+
+    def _ol_switch_sheet(self, idx):
+        if idx < 0 or idx >= len(self.oneline_sheets):
+            return
+        self.oneline_sheet_idx = idx
+        self.oneline_scene = self.oneline_sheets[idx]["scene"]
+        self.oneline_canvas.setScene(self.oneline_scene)
+        self.oneline_canvas.fit_all()
+        self._ol_show_loading_a.setChecked(self.oneline_scene.show_loading)
+        self._ol_show_grid_a.setChecked(self.oneline_scene.show_grid)
+
+    def _ol_add_sheet(self):
+        name, ok = QInputDialog.getText(self, "New Sheet", "Sheet name:",
+                                         text=f"Sheet {len(self.oneline_sheets)+1}")
+        if not ok or not name.strip():
+            return
+        self.oneline_sheets.append(self._ol_make_sheet(name.strip()))
+        self._ol_refresh_sheet_combo()
+        self._ol_switch_sheet(len(self.oneline_sheets)-1)
+        self._dirty = True; self._update_title()
+
+    def _ol_rename_sheet(self):
+        cur = self.oneline_sheets[self.oneline_sheet_idx]
+        name, ok = QInputDialog.getText(self, "Rename Sheet", "Sheet name:", text=cur["name"])
+        if ok and name.strip():
+            cur["name"] = name.strip()
+            self._ol_refresh_sheet_combo()
+            self._dirty = True; self._update_title()
+
+    def _ol_delete_sheet(self):
+        if len(self.oneline_sheets) <= 1:
+            QMessageBox.information(self, "Delete Sheet", "A project needs at least one One-Line sheet.")
+            return
+        cur = self.oneline_sheets[self.oneline_sheet_idx]
+        if QMessageBox.question(self, "Delete Sheet", f'Delete "{cur["name"]}"? This cannot be undone.',
+                                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        del self.oneline_sheets[self.oneline_sheet_idx]
+        self._ol_refresh_sheet_combo()
+        self._ol_switch_sheet(min(self.oneline_sheet_idx, len(self.oneline_sheets)-1))
+        self._dirty = True; self._update_title()
+
     def _import_fqq(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import Autocall FQQ Quote", "",
                                                "Autocall FQQ (*.xlsm);;All Files (*)")
@@ -6140,7 +7367,10 @@ class DrawingDesigner(QDialog):
         for dname, devices in by_designation.items():
             for i, tally in enumerate(bin_pack_nac_devices(devices, capacity), start=1):
                 c = sc.add_circuit(sc.panel, "nac")
-                c.name = f"{dname} NAC-{i}"; c.capacity = capacity; c.devices = tally
+                c.name = f"{dname} NAC-{i}"; c.capacity = capacity
+                c.devices = normalize_devices(tally)
+                for d in c.devices:
+                    d["label"] = dname
                 c.circuit_class = "B"
                 c.prepareGeometryChange(); c._recompute_height(); c.update()
                 n_circuits += 1
@@ -6182,6 +7412,11 @@ class DrawingDesigner(QDialog):
         self._project_meta = dlg.values()
         self._current_file = None
         self.fp_scene.clear_all(); self.wire_scene.clear_all()
+        self.oneline_sheets = [self._ol_make_sheet("Sheet 1")]
+        self.oneline_sheet_idx = 0
+        self.oneline_scene = self.oneline_sheets[0]["scene"]
+        self.oneline_canvas.setScene(self.oneline_scene)
+        self._ol_refresh_sheet_combo()
         self._dirty = False; self._update_title()
 
     def _project_to_dict(self):
@@ -6191,14 +7426,29 @@ class DrawingDesigner(QDialog):
             "saved": datetime.datetime.now().isoformat(),
             "floor_plan": self.fp_scene.to_dict(),
             "wiring": self.wire_scene.to_dict(),
-            "oneline": self.oneline_scene.to_dict(),
+            "oneline_sheets": [{"name": sh["name"], "scene": sh["scene"].to_dict()}
+                               for sh in self.oneline_sheets],
         }
 
     def _load_project_dict(self, d):
         self._project_meta = d.get("meta", {})
         self.fp_scene.load_dict(d.get("floor_plan", {}))
         self.wire_scene.load_dict(d.get("wiring", {}))
-        self.oneline_scene.load_dict(d.get("oneline", {}))
+        sheets_d = d.get("oneline_sheets")
+        if sheets_d:
+            self.oneline_sheets = []
+            for sd in sheets_d:
+                sh = self._ol_make_sheet(sd.get("name", "Sheet"))
+                sh["scene"].load_dict(sd.get("scene", {}))
+                self.oneline_sheets.append(sh)
+        else:
+            # Pre-multi-sheet save file — a single bare "oneline" scene dict.
+            self.oneline_sheets = [self._ol_make_sheet("Sheet 1")]
+            self.oneline_sheets[0]["scene"].load_dict(d.get("oneline", {}))
+        self.oneline_sheet_idx = 0
+        self.oneline_scene = self.oneline_sheets[0]["scene"]
+        self.oneline_canvas.setScene(self.oneline_scene)
+        self._ol_refresh_sheet_combo()
         for name in LAYER_ORDER:
             self.layer_panel.set_checked(name, self.fp_scene.layers_visible.get(name, True))
         self._dirty = False; self._update_title()
@@ -6355,14 +7605,48 @@ class DrawingDesigner(QDialog):
         if len(self.oneline_scene.all_nodes()) <= 1 and not self.oneline_scene.standalone:
             QMessageBox.information(self, "Nothing to Export", "Add a loop, NAC circuit, or booster first.")
             return
-        sheet_title = self._project_meta.get("customer","ONE-LINE DIAGRAM") or "ONE-LINE DIAGRAM"
-        dlg = OneLinePreviewDialog(self.oneline_scene, self._project_meta, sheet_title, self)
+        cur_name = self.oneline_sheets[self.oneline_sheet_idx]["name"]
+        base_title = self._project_meta.get("customer","ONE-LINE DIAGRAM") or "ONE-LINE DIAGRAM"
+        dlg = OneLinePreviewDialog(self.oneline_scene, self._project_meta, base_title, self,
+                                    drawing_name=cur_name)
         if dlg.exec_() == QDialog.Accepted and dlg.export_path:
             QMessageBox.information(self, "Exported", f"PDF saved:\n{dlg.export_path}")
             try:
                 os.startfile(dlg.export_path)
             except Exception:
                 pass
+
+    def _ol_export_all_sheets(self):
+        exportable = [sh for sh in self.oneline_sheets
+                      if len(sh["scene"].all_nodes()) > 1 or sh["scene"].standalone]
+        if not exportable:
+            QMessageBox.information(self, "Nothing to Export", "Add a loop, NAC circuit, or booster to at least one sheet first.")
+            return
+        cust = self._project_meta.get("customer","OneLine") or "OneLine"
+        bad = re.compile(r'[<>:"/\\|?*\s]+')
+        default_name = bad.sub("_", cust) + "_OneLine_AllSheets.pdf"
+        path = os.path.join(_submittals_dir(), default_name)
+        path, _ = QFileDialog.getSaveFileName(self, "Export All One-Line Sheets", path, "PDF Files (*.pdf)")
+        if not path:
+            return
+        base_title = self._project_meta.get("customer","ONE-LINE DIAGRAM") or "ONE-LINE DIAGRAM"
+        n = len(exportable)
+        doc = fitz.open()
+        try:
+            add_cover_page(doc, self._project_meta, base_title)
+            for i, sh in enumerate(exportable, start=1):
+                drawing_name = sh["name"] + (f"  (Sheet {i} of {n})" if n > 1 else "")
+                export_oneline_pdf(sh["scene"], None, self._project_meta, base_title, doc=doc,
+                                    drawing_name=drawing_name)
+            doc.save(path); doc.close()
+            QMessageBox.information(self, "Exported", f"PDF saved:\n{path}")
+            try:
+                os.startfile(path)
+            except Exception:
+                pass
+        except Exception as e:
+            _log_error("_ol_export_all_sheets", e)
+            QMessageBox.critical(self, "Export Failed", str(e))
 
     def _show_help(self):
         from help_system import HelpDialog, DRAWING_DESIGNER_MANUAL

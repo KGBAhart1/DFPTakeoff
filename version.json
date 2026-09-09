@@ -1,5 +1,5 @@
 {
-  "version": "1.5.1",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.5.1/DFP_TakeoffPro_Setup_1.5.1.exe",
-  "notes": "Fix a crash on \"Build Submittal — No Counts\" and Fire Plan Builder's package/questionnaire export. The installed app lives in Program Files, which a normal user account can't write to — those features tried to create their default save folder there, which crashed the app instantly instead of showing an error. They now default to Documents\\DFP TakeoffPro\\Submittals, same as everywhere else in the app."
+  "version": "1.6.0",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.0/DFP_TakeoffPro_Setup_1.6.0.exe",
+  "notes": "One-Line Diagram rebuilt to match real fire alarm riser drawings: circuits render as wrapped horizontal lines (not boxes) with individually labeled devices, floor dividers, and touching EOL/no-EOL terminus symbols. Add multiple named sheets per project and export them combined into one PDF with a logo cover page. Circuits can chain box-to-box (isolator-to-isolator) or T-tap off an isolator, and Class A circuits now show explicit OUT/RETURN wires you control per-box instead of an ambiguous loop symbol. Every connector is draggable, stays perfectly horizontal/vertical, and can be reshaped with added waypoints. Added device and sheet-level notes, a show/hide toggle for all loading (mA/%) readouts, and an on-screen alignment grid that never appears in exports. Also: Candela Load Summary in the takeoff Excel export is now nested by area/section, and a toolbar Candela selector lets you batch-count devices at one rating without right-clicking each one."
 }

@@ -7,10 +7,12 @@ COLS = 7   # A-G  (#, Category, Product, Code, Qty, Unit Cost, Total)
 
 
 def export_takeoff(project_name, items, output_path, candela_breakdown=None):
-    """candela_breakdown: optional {candela_value: device_count} across the
-    whole project (see db.get_candela_breakdown) — each placed device's
-    candela is set independently on the print, so this is sourced from the
-    marks themselves rather than from any one line item."""
+    """candela_breakdown: optional rows from db.get_candela_breakdown_by_section
+    (section_name, device_name, candela, cnt), pre-sorted by section then
+    device then candela — each placed device's candela is set independently
+    on the print, so this is sourced from the marks themselves rather than
+    from any one line item. Rendered nested under each area/section, e.g.
+    Floor 1 -> Horn Strobe (10) -> 15 cd: 5, 110 cd: 5."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Takeoff"
@@ -126,36 +128,61 @@ def export_takeoff(project_name, items, output_path, candela_breakdown=None):
     row += 1
 
     if candela_breakdown:
+        # Nest rows into {section_name: {device_name: [(candela, cnt), ...]}} —
+        # rows already arrive sorted by section/device/candela, and a plain
+        # dict preserves that insertion order, so no re-sorting needed here.
+        sections = {}
+        for r in candela_breakdown:
+            sections.setdefault(r["section_name"], {}).setdefault(r["device_name"], []).append(
+                (r["candela"], r["cnt"]))
+
         row += 2
         ws.merge_cells(f"A{row}:G{row}")
         hdr = ws[f"A{row}"]
-        hdr.value     = "CANDELA LOAD SUMMARY  (device count per candela rating — for NAC circuit loading calcs)"
+        hdr.value     = "CANDELA LOAD SUMMARY BY AREA  (for NAC circuit loading calcs)"
         hdr.font      = Font(bold=True, size=11, color=WHITE)
         hdr.fill      = hfill(DARK)
         hdr.alignment = Alignment(vertical="center", indent=1)
         ws.row_dimensions[row].height = 20
         row += 1
 
-        c1 = ws.cell(row=row, column=1, value="Candela"); c1.font = Font(bold=True, size=10)
-        c2 = ws.cell(row=row, column=2, value="Device Count"); c2.font = Font(bold=True, size=10)
-        for c in (c1, c2):
-            c.fill = hfill(LIGHT); c.border = border
-            c.alignment = Alignment(horizontal="center", vertical="center")
-        row += 1
-
-        for candela in sorted(candela_breakdown.keys()):
-            c1 = ws.cell(row=row, column=1, value=f"{candela:g} cd")
-            c2 = ws.cell(row=row, column=2, value=candela_breakdown[candela])
-            for c in (c1, c2):
-                c.border = border
-                c.alignment = Alignment(horizontal="center", vertical="center")
+        grand_device_total = 0
+        for section_name, devices in sections.items():
+            ws.merge_cells(f"A{row}:G{row}")
+            sh = ws[f"A{row}"]
+            sh.value     = f"  {section_name.upper()}"
+            sh.font      = Font(bold=True, size=10, color=WHITE)
+            sh.fill      = hfill("5D6D7E")
+            sh.alignment = Alignment(vertical="center")
+            ws.row_dimensions[row].height = 16
             row += 1
+
+            for device_name, entries in devices.items():
+                device_total = sum(cnt for _, cnt in entries)
+                grand_device_total += device_total
+                c1 = ws.cell(row=row, column=1, value=f"  {device_name}")
+                c1.font = Font(bold=True, size=10)
+                c2 = ws.cell(row=row, column=2, value=device_total)
+                c2.font = Font(bold=True, size=10)
+                for c in (c1, c2):
+                    c.border = border
+                    c.alignment = Alignment(horizontal="left" if c.column == 1 else "center", vertical="center")
+                row += 1
+
+                for candela, cnt in entries:
+                    c1 = ws.cell(row=row, column=1, value=f"    {candela:g} cd")
+                    c2 = ws.cell(row=row, column=2, value=cnt)
+                    fill = hfill(LIGHT)
+                    for c in (c1, c2):
+                        c.fill = fill; c.border = border
+                        c.alignment = Alignment(horizontal="left" if c.column == 1 else "center", vertical="center")
+                    row += 1
 
         total_row_cell = ws.cell(row=row, column=1, value="Total")
         total_row_cell.font = Font(bold=True, size=10)
         total_row_cell.border = border
-        total_row_cell.alignment = Alignment(horizontal="center", vertical="center")
-        total_qty_cell = ws.cell(row=row, column=2, value=sum(candela_breakdown.values()))
+        total_row_cell.alignment = Alignment(horizontal="left", vertical="center")
+        total_qty_cell = ws.cell(row=row, column=2, value=grand_device_total)
         total_qty_cell.font = Font(bold=True, size=10)
         total_qty_cell.border = border
         total_qty_cell.alignment = Alignment(horizontal="center", vertical="center")
