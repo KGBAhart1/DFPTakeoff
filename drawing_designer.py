@@ -1040,8 +1040,18 @@ def circuit_line_rows(devices, per_row):
     current = []
     for d in devices:
         if d.get("type") == "floor_break":
-            rows.append({"devices": current, "floor_label": d.get("label", "")})
-            current = []
+            if not current and rows and rows[-1]["floor_label"] is None:
+                # This floor break landed exactly where a row had already
+                # wrapped on device count alone (current is empty because
+                # the last device filled the previous row exactly) — label
+                # THAT row instead of creating a stray, device-less row of
+                # its own (which rendered as a floor divider spanning the
+                # full width with nothing on it, and an extra wrap-link
+                # jog for no reason).
+                rows[-1]["floor_label"] = d.get("label", "")
+            else:
+                rows.append({"devices": current, "floor_label": d.get("label", "")})
+                current = []
             continue
         current.append(d)
         if len(current) >= per_row:
@@ -5022,12 +5032,31 @@ class CircuitNode(OneLineNodeBase):
             painter.drawText(QRectF(6, OL_HEADER_H, self._w-12, 13), Qt.AlignLeft,
                               "(no devices — right-click to add)")
         line_pen = QPen(border.darker(110), 1.4)
+        right_edge = self._w - OL_MARGIN
+        row_ends = [max(OL_MARGIN + len(row["devices"])*OL_DEV_SPACING, OL_MARGIN) for row in rows]
+
+        # Pass 1: the row-to-row wrap connectors, drawn FIRST so each row's
+        # own line (pass 2, including any dashed floor-separator stretch)
+        # always paints on TOP of them — otherwise a solid connector drawn
+        # over a dash would show through its gaps and hide it. Every
+        # connector drops from the row's real end (its last device, or the
+        # box's right edge if it closed on a floor separator) and always
+        # lands at the TRUE left start of the next row — never partway
+        # through it — so it reads as one clean corner, not a T-junction.
+        for r in range(len(rows)-1):
+            y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
+            next_y = OL_HEADER_H + (r+1)*OL_ROW_H + OL_ROW_H/2
+            drop_x = right_edge if rows[r]["floor_label"] is not None else row_ends[r]
+            painter.setPen(line_pen)
+            painter.drawLine(QPointF(drop_x, y), QPointF(drop_x, next_y))
+            painter.drawLine(QPointF(drop_x, next_y), QPointF(OL_MARGIN, next_y))
+
+        # Pass 2: each row's own line, devices, and floor-separator dash.
         for r, row in enumerate(rows):
             y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-            n = len(row["devices"])
-            line_end = OL_MARGIN + n*OL_DEV_SPACING if n else OL_MARGIN
+            line_end = row_ends[r]
             painter.setPen(line_pen)
-            painter.drawLine(QPointF(OL_MARGIN, y), QPointF(max(line_end, OL_MARGIN), y))
+            painter.drawLine(QPointF(OL_MARGIN, y), QPointF(line_end, y))
             for i, d in enumerate(row["devices"]):
                 x = OL_MARGIN + (i+0.5)*OL_DEV_SPACING
                 painter.setPen(line_pen)
@@ -5049,11 +5078,10 @@ class CircuitNode(OneLineNodeBase):
                     painter.drawText(QRectF(x-OL_DEV_SPACING/2+2, y+3, OL_DEV_SPACING-4, 20),
                                       Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, label)
             if row["floor_label"] is not None:
-                dash_x0 = max(line_end, OL_MARGIN)
                 painter.setPen(QPen(border.darker(130), 1, Qt.DashLine))
-                painter.drawLine(QPointF(dash_x0, y), QPointF(self._w-OL_MARGIN, y))
+                painter.drawLine(QPointF(line_end, y), QPointF(right_edge, y))
                 painter.setPen(QColor("#333")); painter.setFont(QFont("Arial", 6, QFont.Bold))
-                painter.drawText(QRectF(dash_x0+4, y-12, self._w-OL_MARGIN-dash_x0-6, 11),
+                painter.drawText(QRectF(line_end+4, y-12, right_edge-line_end-6, 11),
                                   Qt.AlignLeft, row["floor_label"])
 
         # Booster panels tap directly onto this circuit's line inline (a
@@ -6537,11 +6565,31 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
             # file's own convention that the on-screen and PDF renderings
             # must stay in sync.
             rows = n.row_layout()
+            right_edge_x = n.pos().x() + n._w - OL_MARGIN
+            row_ends = [max(n.pos().x()+OL_MARGIN + len(row["devices"])*OL_DEV_SPACING,
+                             n.pos().x()+OL_MARGIN) for row in rows]
+
+            # Pass 1: row-to-row wrap connectors, drawn FIRST so each row's
+            # own line (pass 2, including any dashed floor-separator
+            # stretch) always paints on TOP of them — otherwise a solid
+            # connector drawn over a dash would show through its gaps and
+            # hide it. Every connector drops from the row's real end (its
+            # last device, or the right edge if it closed on a floor
+            # separator) and always lands at the TRUE left start of the
+            # next row, never partway through it. Mirrors CircuitNode.paint().
+            for r in range(len(rows)-1):
+                y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
+                next_y = n.pos().y() + OL_HEADER_H + (r+1)*OL_ROW_H + OL_ROW_H/2
+                drop_x = right_edge_x if rows[r]["floor_label"] is not None else row_ends[r]
+                jp1 = tx(drop_x, y); jp2 = tx(drop_x, next_y); jp3 = tx(n.pos().x()+OL_MARGIN, next_y)
+                shape.draw_line(jp1, jp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
+                shape.draw_line(jp2, jp3); shape.finish(color=(0.4,0.4,0.4), width=0.9)
+
+            # Pass 2: each row's own line, devices, and floor-separator dash.
             for r, row in enumerate(rows):
                 y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-                cnt = len(row["devices"])
-                line_end_x = n.pos().x() + (OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN)
-                lp1 = tx(n.pos().x()+OL_MARGIN, y); lp2 = tx(max(line_end_x, n.pos().x()+OL_MARGIN), y)
+                line_end_x = row_ends[r]
+                lp1 = tx(n.pos().x()+OL_MARGIN, y); lp2 = tx(line_end_x, y)
                 shape.draw_line(lp1, lp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
                 for i, d in enumerate(row["devices"]):
                     dx = n.pos().x() + OL_MARGIN + (i+0.5)*OL_DEV_SPACING
@@ -6551,8 +6599,7 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
                     shape.draw_rect(fitz.Rect(bp1.x, bp1.y, bp2.x, bp2.y))
                     shape.finish(color=(0.4,0.4,0.4), fill=(1,1,1), width=0.6)
                 if row["floor_label"] is not None:
-                    dash_x0 = max(line_end_x, n.pos().x()+OL_MARGIN)
-                    fp1 = tx(dash_x0, y); fp2 = tx(n.pos().x()+n._w-OL_MARGIN, y)
+                    fp1 = tx(line_end_x, y); fp2 = tx(right_edge_x, y)
                     shape.draw_line(fp1, fp2); shape.finish(color=(0.35,0.35,0.35), width=0.6, dashes="[2 2] 0")
             for c in n.children:
                 if c.tap_index is None or getattr(c, "hidden", False):
