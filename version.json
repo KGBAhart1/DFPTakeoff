@@ -1,5 +1,5 @@
 {
-  "version": "1.6.1",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.1/DFP_TakeoffPro_Setup_1.6.1.exe",
-  "notes": "Fixes how a One-Line Diagram circuit's wrapped line connects itself when it wraps to a new row (too many devices, or a floor separator). Previously a wrap could land in the middle of the next row's floor-separator dash instead of cleanly at its left start, and a solid connector line could get drawn on top of a dash and hide it. Every wrap now connects with a clean right-angle corner from the true end of one row to the true start of the next, and dashes always render on top so they're never hidden."
+  "version": "1.6.2",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.2/DFP_TakeoffPro_Setup_1.6.2.exe",
+  "notes": "One-Line Diagram: cover page is now landscape to match the printed sheets, and added a Junction Box (JB) device type you can T-tap a new circuit off of, the same way isolator modules work."
 }

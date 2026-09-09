@@ -786,6 +786,7 @@ FA_DEVICE_TYPES = {
     "monitor_module": {"name":"Monitor Module",    "category":"slc", "ma":0.0, "abbr":"MM"},
     "control_module": {"name":"Control Module",    "category":"slc", "ma":0.0, "abbr":"CM"},
     "iso_module":     {"name":"Isolator Module",   "category":"slc", "ma":0.0, "abbr":"ISO"},
+    "jb":             {"name":"Junction Box",      "category":"slc", "ma":0.0, "abbr":"JB"},
     # NAC (notification) — current-draw limited
     "horn":            {"name":"Horn",                  "category":"nac", "ma":56,  "abbr":"H"},
     "strobe_15":       {"name":"Strobe (15cd)",          "category":"nac", "ma":42,  "abbr":"S15"},
@@ -799,6 +800,7 @@ FA_DEVICE_TYPES = {
     "speaker":         {"name":"Speaker",                "category":"nac", "ma":30,  "abbr":"SPK"},
     "speaker_strobe":  {"name":"Speaker/Strobe",         "category":"nac", "ma":88,  "abbr":"SPKS"},
     "iso_module_nac":  {"name":"Isolator Module",        "category":"nac", "ma":0.0, "abbr":"ISO"},
+    "jb_nac":          {"name":"Junction Box",           "category":"nac", "ma":0.0, "abbr":"JB"},
 
     # Autocall TrueAlert conventional (non-addressable) — real nameplate mA
     # per manufacturer datasheets AC4906-0001 (VO), AC4906-0010 (weatherproof),
@@ -845,6 +847,21 @@ def elbow_points(x1, y1, x2, y2, mid_y=None):
     return [(x1, y1), (x1, mid_y), (x2, mid_y), (x2, y2)]
 
 
+def _box_facing_y(box_node, other_node):
+    """0 (top) or box_node._h (bottom) — whichever side of a panel/booster
+    box actually faces `other_node`, based on their CURRENT scene
+    positions. Auto-arrange always puts a parent above its children, so a
+    fixed "always exit the bottom" default works fine there — but once the
+    user manually drags things into a different layout (e.g. the panel
+    placed BELOW its circuits, matching how a real riser is usually drawn
+    with the FACP at the bottom and floors stacked going up), that fixed
+    default routes the wire out the side facing AWAY from the other node,
+    forcing it to loop around the box to get back to it. Facing the exit
+    toward wherever the other node actually is avoids that."""
+    other_is_above = other_node.pos().y() < box_node.pos().y()
+    return 0.0 if other_is_above else box_node._h
+
+
 def default_start_point(parent_node, child_node):
     """Local (x,y) offset — from parent_node.pos() — where a connector to
     child_node leaves the parent by default (before any user drag). Covers
@@ -852,14 +869,17 @@ def default_start_point(parent_node, child_node):
     branching off a specific point mid-line (child.tap_index); a circuit
     that CONTINUES its parent's line end-to-end into the next box, in
     series — not a branch — (child.continues_parent_line, leaving from the
-    parent's own terminus_point()); and the generic bottom-edge default."""
+    parent's own terminus_point()); and the generic box-edge default, which
+    faces whichever side of the box the child is actually on."""
     if isinstance(parent_node, CircuitNode) and getattr(child_node, "continues_parent_line", False):
         return parent_node.terminus_point()
     if isinstance(parent_node, CircuitNode) and child_node.tap_index is not None:
         return QPointF(*parent_node.device_position(child_node.tap_index))
-    if isinstance(child_node, CircuitNode) and child_node.circuit_class == "A":
-        return QPointF(parent_node._w/2 - 20, parent_node._h)
-    return QPointF(parent_node._w/2, parent_node._h)
+    is_class_a = isinstance(child_node, CircuitNode) and child_node.circuit_class == "A"
+    x = parent_node._w/2 - 20 if is_class_a else parent_node._w/2
+    if isinstance(parent_node, CircuitNode):
+        return QPointF(x, parent_node._h)   # circuits have no "box side" to face — keep the old default
+    return QPointF(x, _box_facing_y(parent_node, child_node))
 
 
 def return_target_node(parent_node, child_node):
@@ -878,12 +898,13 @@ def return_target_node(parent_node, child_node):
     return node
 
 
-def default_end_point(child_node):
+def default_end_point(child_node, parent_node=None):
     """Local (x,y) offset — from child_node.pos() — where a connector from
     its parent arrives on child_node by default (before any user drag)."""
     if isinstance(child_node, CircuitNode):
         return QPointF(OL_MARGIN, OL_HEADER_H + OL_ROW_H/2)
-    return QPointF(child_node._w/2, 0)
+    y = _box_facing_y(child_node, parent_node) if parent_node is not None else 0.0
+    return QPointF(child_node._w/2, y)
 
 
 def default_return_start_point(circuit_node):
@@ -897,12 +918,13 @@ def default_return_start_point(circuit_node):
     return QPointF(min(x, circuit_node._w - OL_MARGIN), y)
 
 
-def default_return_end_point(parent_node):
+def default_return_end_point(parent_node, child_node):
     """Local (x,y) offset — from parent_node.pos() — where a Class A
     circuit's RETURN leg arrives back at its source, offset from the OUT
     leg's arrival point so both legs are visibly two separate connections
-    into the panel/booster rather than one line."""
-    return QPointF(parent_node._w/2 + 20, parent_node._h)
+    into the panel/booster rather than one line. Faces whichever side of
+    the box the circuit is actually on (see _box_facing_y)."""
+    return QPointF(parent_node._w/2 + 20, _box_facing_y(parent_node, child_node))
 
 
 def nearest_border_point(node, local_pos):
@@ -937,12 +959,12 @@ def connector_anchor_points(parent_node, child_node, leg="main"):
     if leg == "return":
         target = return_target_node(parent_node, child_node)
         start_off = child_node.conn_return_start_offset or default_return_start_point(child_node)
-        end_off = child_node.conn_return_end_offset or default_return_end_point(target)
+        end_off = child_node.conn_return_end_offset or default_return_end_point(target, child_node)
         start = QPointF(child_node.pos().x()+start_off.x(), child_node.pos().y()+start_off.y())
         end = QPointF(target.pos().x()+end_off.x(), target.pos().y()+end_off.y())
     else:
         start_off = child_node.conn_start_offset or default_start_point(parent_node, child_node)
-        end_off = child_node.conn_end_offset or default_end_point(child_node)
+        end_off = child_node.conn_end_offset or default_end_point(child_node, parent_node)
         start = QPointF(parent_node.pos().x()+start_off.x(), parent_node.pos().y()+start_off.y())
         end = QPointF(child_node.pos().x()+end_off.x(), child_node.pos().y()+end_off.y())
     return start, end
@@ -984,7 +1006,14 @@ def connector_points(parent_node, child_node, leg="main"):
     waypoints = child_node.conn_return_waypoints if leg == "return" else child_node.conn_waypoints
     if waypoints:
         return build_orthogonal_points(start, waypoints, end)
-    pts = elbow_points(start.x(), start.y(), end.x(), end.y())
+    # A Class A circuit's OUT and RETURN legs both run between roughly the
+    # same two points, so their default single-elbow jogs would otherwise
+    # land at nearly the same height and visually cross/overlap along most
+    # of their length. Biasing RETURN's jog to 1/3 instead of the default
+    # 1/2 keeps the two legs visibly separate rather than running in
+    # parallel through the same corridor.
+    mid_y = start.y() + (end.y() - start.y())/3 if leg == "return" else None
+    pts = elbow_points(start.x(), start.y(), end.x(), end.y(), mid_y)
     return [QPointF(x, y) for x, y in pts]
 
 
@@ -5038,18 +5067,19 @@ class CircuitNode(OneLineNodeBase):
         # Pass 1: the row-to-row wrap connectors, drawn FIRST so each row's
         # own line (pass 2, including any dashed floor-separator stretch)
         # always paints on TOP of them — otherwise a solid connector drawn
-        # over a dash would show through its gaps and hide it. Every
-        # connector drops from the row's real end (its last device, or the
-        # box's right edge if it closed on a floor separator) and always
-        # lands at the TRUE left start of the next row — never partway
-        # through it — so it reads as one clean corner, not a T-junction.
+        # over a dash would show through its gaps and hide it. Routed with
+        # the exact same two-bend elbow (drop, cross, drop) used for the
+        # connector BETWEEN separate circuit boxes elsewhere on the
+        # diagram, so a row wrapping to a new line reads exactly like that
+        # familiar shape instead of a different, one-off corner style.
         for r in range(len(rows)-1):
             y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
             next_y = OL_HEADER_H + (r+1)*OL_ROW_H + OL_ROW_H/2
             drop_x = right_edge if rows[r]["floor_label"] is not None else row_ends[r]
+            pts = elbow_points(drop_x, y, OL_MARGIN, next_y)
             painter.setPen(line_pen)
-            painter.drawLine(QPointF(drop_x, y), QPointF(drop_x, next_y))
-            painter.drawLine(QPointF(drop_x, next_y), QPointF(OL_MARGIN, next_y))
+            for p1, p2 in zip(pts, pts[1:]):
+                painter.drawLine(QPointF(*p1), QPointF(*p2))
 
         # Pass 2: each row's own line, devices, and floor-separator dash.
         for r, row in enumerate(rows):
@@ -5139,14 +5169,24 @@ class CircuitNode(OneLineNodeBase):
     def isolator_key(self):
         return {"slc": "iso_module", "nac": "iso_module_nac"}[self.circuit_type]
 
+    def jb_key(self):
+        return {"slc": "jb", "nac": "jb_nac"}[self.circuit_type]
+
+    def tap_keys(self):
+        """Device keys on this circuit that a new circuit can T-tap off of —
+        isolator modules (loop isolation) and junction boxes (a plain
+        physical tap point, no isolation function)."""
+        return (self.isolator_key(), self.jb_key())
+
     def isolator_devices(self):
         """[(raw_index_into_self.devices, device_dict), ...] for every
-        isolator module on this circuit, in order — the valid T-tap points
-        for continuing this loop to the next floor via a new, independent
-        circuit (see contextMenuEvent's "T-tap off isolator" action)."""
-        key = self.isolator_key()
+        isolator module or junction box on this circuit, in order — the
+        valid T-tap points for continuing this loop to the next floor via
+        a new, independent circuit (see contextMenuEvent's "T-tap off
+        isolator/JB" action)."""
+        keys = self.tap_keys()
         return [(i, d) for i, d in enumerate(self.devices)
-                if d.get("type") == "device" and d.get("key") == key]
+                if d.get("type") == "device" and d.get("key") in keys]
 
     def _add_isolator_tap(self, sc):
         isolators = self.isolator_devices()
@@ -5155,10 +5195,11 @@ class CircuitNode(OneLineNodeBase):
         if len(isolators) == 1:
             idx = isolators[0][0]
         else:
-            labels = [f"Isolator #{n+1}" + (f" — {d.get('label')}" if d.get("label") else "")
+            labels = [f"{FA_DEVICE_TYPES.get(d.get('key'), {}).get('name', 'Tap')} #{n+1}" +
+                      (f" — {d.get('label')}" if d.get("label") else "")
                       for n, (i, d) in enumerate(isolators)]
-            item, ok = QInputDialog.getItem(None, "T-Tap Off Isolator",
-                                             "Tap after which isolator?", labels, 0, False)
+            item, ok = QInputDialog.getItem(None, "T-Tap Off Isolator/JB",
+                                             "Tap after which device?", labels, 0, False)
             if not ok:
                 return
             idx = isolators[labels.index(item)][0]
@@ -5181,7 +5222,7 @@ class CircuitNode(OneLineNodeBase):
         if self.circuit_type == "slc":
             add_boost_a = menu.addAction("+ Add Booster (tap on this circuit)")
         add_next_a = menu.addAction("+ Add Circuit (Continue to Next Box)")
-        add_tap_a = menu.addAction("+ Add Circuit (T-tap off isolator)…") if self.isolator_devices() else None
+        add_tap_a = menu.addAction("+ Add Circuit (T-tap off isolator/JB)…") if self.isolator_devices() else None
         del_a = menu.addAction("Delete Circuit")
         chosen = menu.exec_(event.screenPos())
         sc = self.scene()
@@ -6395,13 +6436,15 @@ class WallSettingsDialog(QDialog):
 
 
 def add_cover_page(doc, project_meta, sheet_title, drawing_name=None):
-    """A plain Letter-size cover page — logo (if the project has one set in
-    Project Info), sheet title/drawing name, and the project metadata —
-    inserted at the front of the export. Used once per document: a single
-    sheet's own export gets one automatically, and the "Export All Sheets"
-    combined PDF gets exactly one shared one instead of a repeat per sheet."""
+    """A plain landscape Letter-size cover page — logo (if the project has
+    one set in Project Info), sheet title/drawing name, and the project
+    metadata — inserted at the front of the export. Landscape to match the
+    one-line diagram sheets themselves, which are always landscape. Used
+    once per document: a single sheet's own export gets one automatically,
+    and the "Export All Sheets" combined PDF gets exactly one shared one
+    instead of a repeat per sheet."""
     project_meta = project_meta or {}
-    pw, ph = 8.5*72, 11*72
+    pw, ph = 11*72, 8.5*72
     page = doc.new_page(width=pw, height=ph)
     y = 100
     logo_path = project_meta.get("logo_path", "")
@@ -6573,17 +6616,16 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
             # own line (pass 2, including any dashed floor-separator
             # stretch) always paints on TOP of them — otherwise a solid
             # connector drawn over a dash would show through its gaps and
-            # hide it. Every connector drops from the row's real end (its
-            # last device, or the right edge if it closed on a floor
-            # separator) and always lands at the TRUE left start of the
-            # next row, never partway through it. Mirrors CircuitNode.paint().
+            # hide it. Routed with the exact same two-bend elbow (drop,
+            # cross, drop) used for the connector BETWEEN separate circuit
+            # boxes elsewhere on the diagram. Mirrors CircuitNode.paint().
             for r in range(len(rows)-1):
                 y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
                 next_y = n.pos().y() + OL_HEADER_H + (r+1)*OL_ROW_H + OL_ROW_H/2
                 drop_x = right_edge_x if rows[r]["floor_label"] is not None else row_ends[r]
-                jp1 = tx(drop_x, y); jp2 = tx(drop_x, next_y); jp3 = tx(n.pos().x()+OL_MARGIN, next_y)
-                shape.draw_line(jp1, jp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
-                shape.draw_line(jp2, jp3); shape.finish(color=(0.4,0.4,0.4), width=0.9)
+                pts = [tx(px, py) for px, py in elbow_points(drop_x, y, n.pos().x()+OL_MARGIN, next_y)]
+                for p1, p2 in zip(pts, pts[1:]):
+                    shape.draw_line(p1, p2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
 
             # Pass 2: each row's own line, devices, and floor-separator dash.
             for r, row in enumerate(rows):
