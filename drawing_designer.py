@@ -4938,6 +4938,33 @@ class CircuitNode(OneLineNodeBase):
     def per_row(self):
         return max(1, int((self._w - 2*OL_MARGIN) / OL_DEV_SPACING))
 
+    def hoverMoveEvent(self, event):
+        # Horizontal resize cursor, not the diagonal one — dragging the grip
+        # only ever changes width (see mouseMoveEvent below).
+        self.setCursor(Qt.SizeHorCursor if self._in_grip(event.pos()) else Qt.ArrowCursor)
+        QGraphicsItem.hoverMoveEvent(self, event)
+
+    def mouseMoveEvent(self, event):
+        # Dragging the corner grip resizes WIDTH only — that's what controls
+        # how many devices fit on a row before the line wraps to the next
+        # one (per_row(), above). Height always follows from that via
+        # _recompute_height(); it's never an independent, free-dragged value
+        # the way it is for the base class's Panel/Booster boxes.
+        if self._resizing:
+            start_pos, start_w, start_h = self._resize_start
+            delta = event.scenePos() - start_pos
+            self.prepareGeometryChange()
+            self._w = max(self._min_w, start_w + delta.x())
+            self.manual_size = True
+            self._recompute_height()
+            self.update()
+            sc = self.scene()
+            if sc:
+                sc.update_connectors()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def row_layout(self):
         return circuit_line_rows(self.devices, self.per_row())
 
@@ -4999,8 +5026,11 @@ class CircuitNode(OneLineNodeBase):
         return any(getattr(c, "continues_parent_line", False) for c in self.children)
 
     def _recompute_height(self):
-        if self.manual_size:
-            return
+        # Unlike Panel/Booster boxes, a circuit's height is never a free
+        # user choice — it's just "however many wrapped rows the current
+        # width forces the device list into", so it's always recomputed
+        # fresh even after a manual width resize (see mouseMoveEvent below,
+        # which resizes width only and leaves height to this).
         rows = self.row_layout()
         self._h = OL_HEADER_H + len(rows)*OL_ROW_H + OL_TERM_H
 

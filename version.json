@@ -1,5 +1,5 @@
 {
-  "version": "1.6.2",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.2/DFP_TakeoffPro_Setup_1.6.2.exe",
-  "notes": "One-Line Diagram: cover page is now landscape to match the printed sheets, and added a Junction Box (JB) device type you can T-tap a new circuit off of, the same way isolator modules work."
+  "version": "1.6.3",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.3/DFP_TakeoffPro_Setup_1.6.3.exe",
+  "notes": "One-Line Diagram: circuits can now be resized wider or narrower by dragging their corner handle, which controls how many devices fit on a row before the line wraps to the next one. Height always adjusts automatically to match."
 }
