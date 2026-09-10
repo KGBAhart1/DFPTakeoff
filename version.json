@@ -1,5 +1,5 @@
 {
-  "version": "1.6.3",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.3/DFP_TakeoffPro_Setup_1.6.3.exe",
-  "notes": "One-Line Diagram: circuits can now be resized wider or narrower by dragging their corner handle, which controls how many devices fit on a row before the line wraps to the next one. Height always adjusts automatically to match."
+  "version": "1.6.4",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.4/DFP_TakeoffPro_Setup_1.6.4.exe",
+  "notes": "One-Line Diagram: right-click a connector wire to insert a new circuit or booster block right into the middle of it. Right-click a circuit or booster to delete just that one block and reconnect everything after it to its parent, instead of taking the whole chain down with it."
 }

@@ -5253,7 +5253,9 @@ class CircuitNode(OneLineNodeBase):
             add_boost_a = menu.addAction("+ Add Booster (tap on this circuit)")
         add_next_a = menu.addAction("+ Add Circuit (Continue to Next Box)")
         add_tap_a = menu.addAction("+ Add Circuit (T-tap off isolator/JB)…") if self.isolator_devices() else None
-        del_a = menu.addAction("Delete Circuit")
+        menu.addSeparator()
+        del_a = menu.addAction("Delete Circuit (and Everything After It)")
+        del_only_a = menu.addAction("Delete This Block Only (Keep Rest)") if self.children else None
         chosen = menu.exec_(event.screenPos())
         sc = self.scene()
         if chosen == add_boost_a and sc:
@@ -5277,6 +5279,8 @@ class CircuitNode(OneLineNodeBase):
                 if sc: sc.relayout(); sc.layout_changed.emit()
         elif chosen == del_a and sc:
             sc.remove_node(self)
+        elif chosen == del_only_a and sc:
+            sc.remove_node_keep_children(self)
 
 
 class BoosterNode(OneLineNodeBase):
@@ -5326,7 +5330,8 @@ class BoosterNode(OneLineNodeBase):
         add_nac = menu.addAction("+ Add NAC Circuit")
         menu.addSeparator()
         edit_a = menu.addAction("Edit Booster…")
-        del_a = menu.addAction("Delete Booster")
+        del_a = menu.addAction("Delete Booster (and Everything After It)")
+        del_only_a = menu.addAction("Delete This Block Only (Keep Rest)") if self.children else None
         menu.addSeparator()
         hide_a = menu.addAction("Show Booster Box" if self.hidden else "Hide Booster Box")
         chosen = menu.exec_(event.screenPos())
@@ -5341,9 +5346,22 @@ class BoosterNode(OneLineNodeBase):
                 self.update(); sc.layout_changed.emit()
         elif chosen == del_a:
             sc.remove_node(self)
+        elif chosen == del_only_a:
+            sc.remove_node_keep_children(self)
         elif chosen == hide_a:
             self.hidden = not self.hidden
             self.update(); sc.update_connectors(); sc.layout_changed.emit()
+
+
+def _prompt_insert_block_kind():
+    """Small picker for ConnectorItem's "Insert Block Here…" — which kind of
+    node to splice into an existing parent->child wire. Returns "slc",
+    "nac", "booster", or None if cancelled."""
+    labels = ["SLC Circuit", "NAC Circuit", "Booster"]
+    kinds = ["slc", "nac", "booster"]
+    item, ok = QInputDialog.getItem(None, "Insert Block", "Insert which kind of block?",
+                                     labels, 0, False)
+    return kinds[labels.index(item)] if ok else None
 
 
 class ConnectorItem(QGraphicsPathItem):
@@ -5534,6 +5552,9 @@ class ConnectorItem(QGraphicsPathItem):
         pos = event.pos()
         handle = self._handle_at(pos)
         menu = QMenu()
+        insert_a = menu.addAction("Insert Block Here…") if self.leg == "main" else None
+        if insert_a:
+            menu.addSeparator()
         remove_a = menu.addAction("Remove Waypoint") if handle and handle[0] == "waypoint" else None
         add_a = menu.addAction("Add Waypoint Here")
         menu.addSeparator()
@@ -5541,7 +5562,11 @@ class ConnectorItem(QGraphicsPathItem):
         chosen = menu.exec_(event.screenPos())
         sc = self.scene()
         start_attr, end_attr, wp_attr = self._attrs()
-        if chosen == add_a:
+        if chosen == insert_a:
+            kind = _prompt_insert_block_kind()
+            if kind and sc:
+                sc.insert_node_between(self.parent_node, self.child_node, kind)
+        elif chosen == add_a:
             # A new bend jogs PERPENDICULAR to whichever segment was
             # clicked — inserting along the segment itself wouldn't add a
             # turn, just a redundant collinear point — keeping the whole
@@ -5679,6 +5704,44 @@ class OneLineScene(QGraphicsScene):
         self.layout_changed.emit()
         return b
 
+    def insert_node_between(self, parent_node, child_node, kind):
+        """Splice a brand-new node into an existing parent->child wire, so
+        it becomes parent->new->child — for when a box was left out while
+        building the riser and needs to go in after the fact, instead of
+        rebuilding the whole chain from that point down. `kind` is "slc",
+        "nac", or "booster"."""
+        if kind == "booster":
+            n = sum(1 for nd in self.all_nodes() if isinstance(nd, BoosterNode)) + 1
+            new_node = BoosterNode(name=f"Booster {n}")
+        else:
+            new_node = CircuitNode(kind)
+        idx = parent_node.children.index(child_node)
+        new_node.parent_node = parent_node
+        parent_node.children[idx] = new_node
+        new_node.children = [child_node]
+        child_node.parent_node = new_node
+        # None of the child's old connector/tap overrides mean anything
+        # against the newly-spliced-in node — they described a wire to the
+        # old parent's geometry, which no longer exists.
+        child_node.tap_index = None
+        child_node.continues_parent_line = False
+        child_node.conn_start_offset = None
+        child_node.conn_end_offset = None
+        child_node.conn_waypoints = None
+        child_node.conn_return_start_offset = None
+        child_node.conn_return_end_offset = None
+        child_node.conn_return_waypoints = None
+        self.addItem(new_node)
+        # Drop the new node where the child used to connect from, and slot
+        # the child in right below it — a reasonable default the user can
+        # still drag from afterward, without disturbing anything else.
+        old_pos = child_node.pos()
+        new_node.setPos(old_pos)
+        child_node.setPos(old_pos.x(), old_pos.y() + new_node._h + OL_LEVEL_GAP)
+        self.update_connectors()
+        self.layout_changed.emit()
+        return new_node
+
     def remove_node(self, node):
         if node is self.panel:
             return
@@ -5688,6 +5751,40 @@ class OneLineScene(QGraphicsScene):
             node.parent_node.children.remove(node)
         if node in self.standalone:
             self.standalone.remove(node)
+        self.removeItem(node)
+        self.update_connectors()
+        self.layout_changed.emit()
+
+    def remove_node_keep_children(self, node):
+        """Delete just this one block, reconnecting its children straight to
+        its own parent (or promoting them to standalone roots, if it had
+        none) instead of taking its whole subtree down with it — the
+        inverse of insert_node_between()."""
+        if node is self.panel:
+            return
+        kids = list(node.children)
+        parent = node.parent_node
+        for c in kids:
+            c.parent_node = parent
+            # The old tap/connector geometry described a wire to the block
+            # being removed — none of it means anything against its new
+            # parent (see the matching reset in insert_node_between()).
+            c.tap_index = None
+            c.continues_parent_line = False
+            c.conn_start_offset = None
+            c.conn_end_offset = None
+            c.conn_waypoints = None
+            c.conn_return_start_offset = None
+            c.conn_return_end_offset = None
+            c.conn_return_waypoints = None
+        if parent is not None:
+            idx = parent.children.index(node)
+            parent.children[idx:idx+1] = kids
+        elif node in self.standalone:
+            idx = self.standalone.index(node)
+            self.standalone[idx:idx+1] = kids
+        else:
+            self.standalone.extend(kids)
         self.removeItem(node)
         self.update_connectors()
         self.layout_changed.emit()
