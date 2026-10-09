@@ -330,8 +330,10 @@ MANUFACTURERS = {
             {"model": "WHDR-600  (6 gal    / 22.7 L — 18 fp)",  "gal": 6.0,  "max_flow": 18},
         ],
         "nozzle_types": MFR_NOZZLE_TYPES["kidde"],
-        "bad_appliances": ["ecology_unit"],
-        "bad_reason": "Ecology/precipitator — verify compatibility with Kidde WHDR",
+        "bad_appliances": [],   # ecology unit OK only for Parker SmogHog PSG — see ApplianceItem.eco_cfg
+        "bad_reason": "Ecology unit — Kidde WHDR only covers Parker SmogHog PSG, Air Quality Engineering "
+                      "AUTOCLEAN/SMOKEMASTER and Cadexair KAC PCUs (set the model via Edit Appliance); "
+                      "other makes need Kidde Tech Support approval",
     },
     "badger": {
         "name": "Badger Range Guard",
@@ -506,6 +508,73 @@ def effective_defn(key, mfr_key="kidde"):
     overrides = MFR_APPLIANCE_OVERRIDES.get(mfr_key, {}).get(key, {})
     base.update(overrides)
     return base
+
+
+# Kidde WHDR protection recommendation for Parker SmogHog PSG Series pollution
+# control units (KFS letter dated 2026-09-03, based on UL EX3559 plenum/duct
+# testing plus internal PCU testing). All nozzles are ADP, 1 fp each.
+# model: (inlet plenum, nozzles per ESP pass, odor control module).
+# Outlet plenum and downstream ductwork are NOT included — protect separately.
+KIDDE_SMOGHOG_PSG = {
+    "PSG-11": (2, 4, 4),   "PSG-12": (2, 4, 4),   "PSG-13": (2, 4, 4),
+    "PSG-14": (4, 8, 8),
+    "PSG-21": (4, 6, 6),   "PSG-22": (4, 6, 6),   "PSG-23": (4, 6, 6),
+    "PSG-24": (8, 12, 12), "PSG-25": (8, 12, 12),
+    "PSG-32": (4, 10, 10), "PSG-33": (4, 10, 10), "PSG-34": (8, 20, 20),
+    "PSG-42": (8, 12, 12), "PSG-43": (8, 12, 12),
+    "PSG-44": (16, 24, 24), "PSG-45": (16, 24, 24), "PSG-46": (16, 24, 24),
+    "PSG-52": (8, 16, 16), "PSG-53": (8, 16, 16),
+    "PSG-54": (16, 32, 32), "PSG-55": (16, 32, 32),
+    "PSG-64": (16, 40, 40),
+}
+
+
+# Air Quality Engineering AUTOCLEAN / SMOKEMASTER (KFS letter 2026-09-03).
+# model: (pre-filter/ESP, MERV filter, odor control, outlet) ADP nozzles.
+KIDDE_AQE = {
+    "AUTOCLEAN 2000 / SMOKEMASTER F72A": (4, 2, 6, 2),
+    "AUTOCLEAN 4000 / SMOKEMASTER F72B": (4, 2, 6, 4),
+    "AUTOCLEAN 8000 / SMOKEMASTER F72C": (8, 4, 12, 8),
+}
+
+# Cadexair KAC Series (KFS letter 2026-09-03), per single vertical stack.
+# model: (pre-filter, nozzles per ESP pass, odor media, outlet).
+KIDDE_CADEXAIR = {
+    "KAC 1 module deep (e.g. KAC-2000)": (2, 4, 4, 2),
+    "KAC 2 modules deep (e.g. KAC-4000)": (2, 4, 4, 4),
+    "KAC 3 modules deep (e.g. KAC-6000)": (2, 4, 4, 6),
+}
+
+# make key -> (label, model table)
+KIDDE_PCU_MAKES = {
+    "parker":    ("Parker SmogHog", KIDDE_SMOGHOG_PSG),
+    "aqe":       ("Air Quality Engineering", KIDDE_AQE),
+    "cadexair":  ("Cadexair", KIDDE_CADEXAIR),
+}
+
+
+def pcu_nozzle_count(cfg):
+    """Total ADP nozzles for an ecology-unit (pollution control unit) config
+    {"make" (default "parker"), "model", "esp_passes", "odor" (bool), "stacks"};
+    0 if no/unknown model. Outlet plenum / downstream duct beyond what each
+    Kidde letter's table includes is NOT counted (protect separately)."""
+    cfg = cfg or {}
+    make = cfg.get("make", "parker")
+    row = KIDDE_PCU_MAKES.get(make, (None, {}))[1].get(cfg.get("model"))
+    if not row:
+        return 0
+    odor_on = cfg.get("odor", True)
+    if make == "parker":
+        inlet, esp, odor = row
+        passes = 2 if cfg.get("esp_passes") == 2 else 1
+        return inlet + passes*esp + (odor if odor_on else 0)
+    if make == "aqe":
+        esp, merv, odor, outlet = row
+        return esp + merv + (odor if odor_on else 0) + outlet
+    pre, esp, odor, outlet = row   # cadexair: equal quantity added per extra stack
+    passes = max(1, min(3, int(cfg.get("esp_passes") or 1)))
+    stacks = max(1, int(cfg.get("stacks") or 1))
+    return stacks * (pre + passes*esp + (odor if odor_on else 0) + outlet)
 
 
 def _nozzles_for_appliance(a, all_appliances, free_nozzles):
@@ -908,6 +977,9 @@ class ApplianceItem(QGraphicsItem):
         self.key=key; self.defn=APPLIANCE_DEFS[key]
         self.w_in=w_in or self.defn["dw"]; self.d_in=d_in or self.defn["dd"]; self.h_in=h_in
         self.custom_name=custom_name; self.show_label=True; self.label_offset=(0.0,0.0); self.app_nozzles=[]
+        # Ecology units only: {"make","model","esp_passes","odor","stacks"} for a make Kidde
+        # WHDR has a protection recommendation for (see KIDDE_PCU_MAKES); None = other make.
+        self.eco_cfg=None
         # _nozzles_placed: True once nozzles have been assigned (place, load, or mfr switch).
         # Needed to distinguish "appliance just dropped with 0 nozzles yet" from "user deleted all nozzles".
         # total_flow() and recommendation() use this: if True, count app_nozzles (can be 0);
@@ -920,7 +992,11 @@ class ApplianceItem(QGraphicsItem):
     @property
     def w_px(self): return self.w_in*PX
     @property
-    def box_h_px(self): return APP_BOX_H*PX
+    def box_h_px(self):
+        # Ecology units are tall cabinets, not cooking surfaces: scale the box
+        # with Height (30in default = the old fixed size, so saved drawings look the same).
+        if self.key=="ecology_unit": return APP_BOX_H*PX*max(self.h_in,6)/30.0
+        return APP_BOX_H*PX
     @property
     def leg_px(self): return max(0,(self.h_in-APP_BOX_H))*PX if self.defn.get("legs") else 0
 
@@ -2006,6 +2082,9 @@ class ApplianceItem(QGraphicsItem):
                 default_name=self.defn["name"]
                 self.custom_name=lbl if lbl and lbl!=default_name else None
                 sc=self.scene()
+                if self.key=="ecology_unit":
+                    self.eco_cfg=dlg.eco_cfg()
+                    if sc: sc._refresh_appliance_nozzles(self, sc._active_mfr)
                 self.update()
                 if sc: sc.update(); sc.layout_changed.emit()
         elif result=="Edit Nozzles…":
@@ -2930,8 +3009,40 @@ class SuppressionScene(QGraphicsScene):
                     nz.update()
         self.layout_changed.emit()
 
+    def _place_smoghog_nozzles(self, appl):
+        """Replace an ecology unit's nozzles with the Kidde-recommended ADP set for
+        its Kidde-recommended PCU config: equal quantity on each side, aimed
+        horizontally into the unit, opposing sides vertically offset. Stacked in
+        short columns so large units stay legible; labels hidden to cut clutter."""
+        for nz in list(appl.app_nozzles):
+            self.removeItem(nz)
+        appl.app_nozzles = []
+        total = pcu_nozzle_count(appl.eco_cfg)
+        per_side = total // 2
+        top, span = appl.leg_px + 6, appl.box_h_px - 12
+        rows = max(5, int(span // 12))   # ~12px pitch so the 10px nozzle dots don't overlap
+        step = span / rows
+        col_gap = AppNozzleItem.ARROW_LEN + 6
+        for side in (0, 1):
+            n_side = per_side + (total % 2 if side == 0 else 0)
+            for i in range(n_side):
+                col, row = divmod(i, rows)
+                y = top + step*(row + 0.5) + (step/2 if side else 0)
+                if side == 0:
+                    nz = AppNozzleItem("ADP", "Right →"); x = -20 - col*col_gap
+                else:
+                    nz = AppNozzleItem("ADP", "Left ←");  x = appl.w_px + 20 + col*col_gap
+                nz.show_label = False
+                nz.setParentItem(appl); nz.setPos(x, min(y, top+span))
+                appl.app_nozzles.append(nz)
+        appl._nozzles_placed = True
+        appl.update()
+
     def _refresh_appliance_nozzles(self, appl, mk):
         """Update or replace the child nozzles of an ApplianceItem for manufacturer mk."""
+        if appl.key == "ecology_unit" and mk == "kidde" and pcu_nozzle_count(appl.eco_cfg):
+            self._place_smoghog_nozzles(appl)
+            return
         ed  = effective_defn(appl.key, mk)
         nt  = ed["nt"] or "1N"
         nq  = ed["nq"]
@@ -3253,7 +3364,11 @@ class SuppressionScene(QGraphicsScene):
 
     def restricted_systems(self):
         bad=set()
-        for a in self.appliances(): bad.update(a.defn.get("r",[]))
+        for a in self.appliances():
+            r = set(a.defn.get("r",[]))
+            if a.key == "ecology_unit" and pcu_nozzle_count(a.eco_cfg):
+                r.discard("kidde")   # Kidde covers listed PCU makes
+            bad.update(r)
         return bad
 
     def recommendation(self,mk):
@@ -3318,6 +3433,7 @@ class SuppressionScene(QGraphicsScene):
                              "x":item.x(),"y":item.y(),
                              "z":item.zValue(),
                              "lbl_off":list(getattr(item,"label_offset",(0,0))),
+                             "eco_cfg":item.eco_cfg,
                              "nozzles":nozzles})
             elif t == "free_nozzle":
                 out.append({"type":"free_nozzle","x":item.x(),"y":item.y(),
@@ -3396,6 +3512,7 @@ class SuppressionScene(QGraphicsScene):
                 item.setPos(d["x"], d["y"]); self.addItem(item)
                 if "z" in d: item.setZValue(d["z"])
                 if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
+                item.eco_cfg = d.get("eco_cfg")
                 for nz_d in d.get("nozzles",[]):
                     nz = AppNozzleItem(nz_d["nozzle_type"], nz_d["direction"])
                     nz.setParentItem(item)
@@ -3404,6 +3521,8 @@ class SuppressionScene(QGraphicsScene):
                     item.app_nozzles.append(nz)
                 if d.get("nozzles") is not None:
                     item._nozzles_placed = True
+                if item.eco_cfg:
+                    for nz in item.app_nozzles: nz.show_label = False   # not persisted; keep big PSG sets legible
             elif t == "free_nozzle":
                 item = FreeNozzleItem(d["nozzle_type"], d["direction"])
                 if "lbl_off" in d: item.label_offset=tuple(d["lbl_off"])
@@ -3802,6 +3921,12 @@ class SystemPanel(QWidget):
         if bad:
             warnings.append(f"⚠ Ecology unit — incompatible: "
                             f"{', '.join(MANUFACTURERS[k]['name'] for k in bad if k in MANUFACTURERS)}")
+            if "kidde" in bad:
+                warnings.append("⚠ Kidde WHDR covers Parker SmogHog PSG, AQE AUTOCLEAN/SMOKEMASTER and Cadexair KAC units "
+                                "only — set the model in Edit Appliance (Halton/other makes need Kidde Tech Support approval)")
+        if any(a.key=="ecology_unit" and pcu_nozzle_count(a.eco_cfg) for a in scene.appliances()):
+            warnings.append("ℹ Ecology unit: Kidde nozzle count covers the PCU sections only — add any "
+                            "downstream duct nozzles and a heat detector at the PCU outlet")
         # Clearance check: appliances whose centre falls outside every hood's X span
         # Use sceneBoundingRect() so depth/perspective offsets are accounted for.
         hoods = scene.hoods()
@@ -4487,6 +4612,38 @@ class ApplianceEditDialog(QDialog):
         l.addRow("Height:", self._h)
         l.addRow("Label:", self._lbl)
 
+        # Ecology unit: Kidde WHDR has protection recommendations for Parker
+        # SmogHog PSG, Air Quality Engineering AUTOCLEAN/SMOKEMASTER and
+        # Cadexair KAC pollution control units only.
+        self._eco_model = None
+        if item.key == "ecology_unit":
+            cfg = item.eco_cfg or {}
+            self._eco_model = QComboBox()
+            self._eco_model.addItem("Other make / not listed (no Kidde coverage)", None)
+            for mk, (mlabel, table) in KIDDE_PCU_MAKES.items():
+                for m in table:
+                    self._eco_model.addItem(f"{mlabel} — {m}", f"{mk}|{m}")
+            idx = self._eco_model.findData(f'{cfg.get("make", "parker")}|{cfg.get("model")}')
+            self._eco_model.setCurrentIndex(max(0, idx))
+            self._eco_passes = QSpinBox(); self._eco_passes.setRange(1, 3)
+            self._eco_passes.setValue(int(cfg.get("esp_passes") or 1))
+            self._eco_stacks = QSpinBox(); self._eco_stacks.setRange(1, 20)
+            self._eco_stacks.setValue(int(cfg.get("stacks") or 1))
+            self._eco_odor = QCheckBox("Odor control module")
+            self._eco_odor.setChecked(cfg.get("odor", True))
+            self._eco_count = QLabel()
+            self._eco_count.setWordWrap(True)
+            l.addRow("Kidde WHDR model:", self._eco_model)
+            l.addRow("ESP passes:", self._eco_passes)
+            l.addRow("Vertical stacks:", self._eco_stacks)
+            l.addRow("", self._eco_odor)
+            l.addRow("", self._eco_count)
+            self._eco_model.currentIndexChanged.connect(self._eco_update)
+            self._eco_passes.valueChanged.connect(self._eco_update)
+            self._eco_stacks.valueChanged.connect(self._eco_update)
+            self._eco_odor.toggled.connect(self._eco_update)
+            self._eco_update()
+
         br=QHBoxLayout()
         ok=QPushButton("Apply")
         ok.setStyleSheet("background:#ff7002;color:white;padding:6px 18px;font-weight:bold;")
@@ -4494,6 +4651,35 @@ class ApplianceEditDialog(QDialog):
         ca=QPushButton("Cancel"); ca.clicked.connect(self.reject)
         br.addStretch(); br.addWidget(ca); br.addWidget(ok)
         l.addRow(br)
+
+    def eco_cfg(self):
+        """Pollution-control-unit config for an ecology unit, or None (other make/unset)."""
+        if self._eco_model is None or self._eco_model.currentData() is None:
+            return None
+        make, model = self._eco_model.currentData().split("|", 1)
+        return {"make": make, "model": model, "esp_passes": self._eco_passes.value(),
+                "stacks": self._eco_stacks.value(), "odor": self._eco_odor.isChecked()}
+
+    def _eco_update(self):
+        cfg = self.eco_cfg()
+        on = cfg is not None
+        make = cfg["make"] if on else None
+        self._eco_odor.setEnabled(on)
+        # Parker: 1-2 ESP passes; Cadexair: 1-3 passes and per-stack counts; AQE: fixed sections.
+        self._eco_passes.setEnabled(make in ("parker", "cadexair"))
+        self._eco_passes.setMaximum(2 if make == "parker" else 3)
+        self._eco_stacks.setEnabled(make == "cadexair")
+        if not on:
+            self._eco_count.setText("Kidde has no listed coverage for other makes (e.g. Halton) — "
+                                    "get written approval from Kidde Tech Support.")
+            return
+        n = pcu_nozzle_count(cfg)
+        scope = ("inlet plenum + ESP + odor control" if make == "parker"
+                 else "pre-filter/ESP + MERV + odor control + outlet" if make == "aqe"
+                 else "pre-filter + ESP + odor media + outlet, per stack")
+        self._eco_count.setText(
+            f"{n} ADP nozzles = {n} fp ({scope}). Any additional downstream duct and the "
+            "outlet heat detector are added separately.")
 
     def values(self):
         return self._w.value(), self._d.value(), self._h.value(), self._lbl.text().strip()

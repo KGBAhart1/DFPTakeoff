@@ -876,9 +876,17 @@ def default_start_point(parent_node, child_node):
     if isinstance(parent_node, CircuitNode) and child_node.tap_index is not None:
         return QPointF(*parent_node.device_position(child_node.tap_index))
     is_class_a = isinstance(child_node, CircuitNode) and child_node.circuit_class == "A"
-    x = parent_node._w/2 - 20 if is_class_a else parent_node._w/2
     if isinstance(parent_node, CircuitNode):
-        return QPointF(x, parent_node._h)   # circuits have no "box side" to face — keep the old default
+        # Circuits have no "box side" to face — keep the old default: the
+        # far edge of the box, at the rough midpoint of the line's own run
+        # direction (bottom-center when horizontal, right-center when
+        # rotated vertical).
+        if parent_node.is_vertical():
+            y = parent_node._h/2 - (20 if is_class_a else 0)
+            return QPointF(parent_node._w, y)
+        x = parent_node._w/2 - (20 if is_class_a else 0)
+        return QPointF(x, parent_node._h)
+    x = parent_node._w/2 - 20 if is_class_a else parent_node._w/2
     return QPointF(x, _box_facing_y(parent_node, child_node))
 
 
@@ -902,7 +910,7 @@ def default_end_point(child_node, parent_node=None):
     """Local (x,y) offset — from child_node.pos() — where a connector from
     its parent arrives on child_node by default (before any user drag)."""
     if isinstance(child_node, CircuitNode):
-        return QPointF(OL_MARGIN, OL_HEADER_H + OL_ROW_H/2)
+        return child_node._lp(0, 0)
     y = _box_facing_y(child_node, parent_node) if parent_node is not None else 0.0
     return QPointF(child_node._w/2, y)
 
@@ -913,9 +921,9 @@ def default_return_start_point(circuit_node):
     rows = circuit_node.row_layout()
     last = len(rows) - 1
     cnt = len(rows[last]["devices"])
-    x = OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN + OL_DEV_SPACING*0.5
-    y = OL_HEADER_H + last*OL_ROW_H + OL_ROW_H/2
-    return QPointF(min(x, circuit_node._w - OL_MARGIN), y)
+    along = cnt*OL_DEV_SPACING if cnt else OL_DEV_SPACING*0.5
+    along = min(along, circuit_node._along_size() - 2*OL_MARGIN)
+    return circuit_node._lp(last, along)
 
 
 def default_return_end_point(parent_node, child_node):
@@ -4932,29 +4940,94 @@ class CircuitNode(OneLineNodeBase):
         # in a chain, set this to send the RETURN leg straight back to the
         # root panel instead, skipping the intermediate boxes.
         self.class_a_return_to_panel = False
+        # "h" (default): the wrapped line runs left-to-right, wrapping to a
+        # new row below when it runs out of width. "v": rotated 90 degrees
+        # — the line runs top-to-bottom below the header, wrapping to a new
+        # column to the right when it runs out of height. Everything below
+        # is written in terms of a row/column index ("row_idx") and a
+        # distance along that row/column's own line ("along"), mapped to
+        # real local (x, y) by _lp() — that's the one place the two modes
+        # actually differ.
+        self.orientation = "h"
         self.setZValue(2)
         self._recompute_height()
 
+    def is_vertical(self):
+        return self.orientation == "v"
+
+    def toggle_orientation(self):
+        """Rotate between horizontal and vertical wrap direction, swapping
+        the user-resizable "along the line" dimension (width <-> height) so
+        the box keeps roughly the same amount of wrapped content instead of
+        jumping to some arbitrary new size."""
+        self._w, self._h = self._h, self._w
+        self.orientation = "h" if self.is_vertical() else "v"
+        self.prepareGeometryChange()
+        self._recompute_height()
+        self.update()
+
+    def _along_size(self):
+        """Usable length along the wrapped line's own run direction — the
+        dimension per_row() divides into devices. Width itself when
+        horizontal; height minus the header strip (which always sits at
+        the top, in Y, regardless of orientation) when vertical."""
+        return (self._h - OL_HEADER_H) if self.is_vertical() else self._w
+
+    def _lp(self, row_idx, along):
+        """Local (x, y) for wrapped-line row/column `row_idx`, at distance
+        `along` from that row/column's own start — the one place the
+        horizontal/vertical transpose actually happens. Horizontal: rows
+        stack downward in Y below the header; `along` runs rightward in X.
+        Vertical: columns step rightward in X starting at the same
+        OL_HEADER_H offset a horizontal row0 would use; `along` runs
+        downward in Y, starting just below the header."""
+        if self.is_vertical():
+            return QPointF(OL_HEADER_H + row_idx*OL_ROW_H + OL_ROW_H/2, OL_HEADER_H + OL_MARGIN + along)
+        return QPointF(OL_MARGIN + along, OL_HEADER_H + row_idx*OL_ROW_H + OL_ROW_H/2)
+
+    def _perp(self):
+        """Unit direction, perpendicular to the wrapped line, that device
+        ticks/abbreviation boxes are drawn on — up when horizontal, left
+        when vertical (the T-tap marker uses the opposite side)."""
+        return QPointF(-1, 0) if self.is_vertical() else QPointF(0, -1)
+
+    def _elbow_pts(self, p1, p2):
+        """The row-to-row/column-to-column wrap connector — the same
+        two-bend elbow used between separate boxes elsewhere on the
+        diagram, just with its axes swapped when vertical (horizontal mode
+        drops-crosses-drops; vertical mode crosses-drops-crosses)."""
+        if self.is_vertical():
+            return [(x, y) for (y, x) in elbow_points(p1.y(), p1.x(), p2.y(), p2.x())]
+        return elbow_points(p1.x(), p1.y(), p2.x(), p2.y())
+
     def per_row(self):
-        return max(1, int((self._w - 2*OL_MARGIN) / OL_DEV_SPACING))
+        return max(1, int((self._along_size() - 2*OL_MARGIN) / OL_DEV_SPACING))
 
     def hoverMoveEvent(self, event):
-        # Horizontal resize cursor, not the diagonal one — dragging the grip
-        # only ever changes width (see mouseMoveEvent below).
-        self.setCursor(Qt.SizeHorCursor if self._in_grip(event.pos()) else Qt.ArrowCursor)
+        # Resize cursor matches whichever axis dragging the grip actually
+        # changes — width when horizontal, height when vertical (see
+        # mouseMoveEvent below).
+        in_grip = self._in_grip(event.pos())
+        cursor = (Qt.SizeVerCursor if self.is_vertical() else Qt.SizeHorCursor) if in_grip else Qt.ArrowCursor
+        self.setCursor(cursor)
         QGraphicsItem.hoverMoveEvent(self, event)
 
     def mouseMoveEvent(self, event):
-        # Dragging the corner grip resizes WIDTH only — that's what controls
-        # how many devices fit on a row before the line wraps to the next
-        # one (per_row(), above). Height always follows from that via
-        # _recompute_height(); it's never an independent, free-dragged value
-        # the way it is for the base class's Panel/Booster boxes.
+        # Dragging the corner grip resizes only the axis the wrapped line
+        # actually runs along — width when horizontal, height when
+        # vertical — since that's what controls how many devices fit
+        # before it wraps (per_row(), above). The other dimension always
+        # follows from that via _recompute_height(); it's never an
+        # independent, free-dragged value the way it is for the base
+        # class's Panel/Booster boxes.
         if self._resizing:
             start_pos, start_w, start_h = self._resize_start
             delta = event.scenePos() - start_pos
             self.prepareGeometryChange()
-            self._w = max(self._min_w, start_w + delta.x())
+            if self.is_vertical():
+                self._h = max(self._min_h, start_h + delta.y())
+            else:
+                self._w = max(self._min_w, start_w + delta.x())
             self.manual_size = True
             self._recompute_height()
             self.update()
@@ -4973,23 +5046,23 @@ class CircuitNode(OneLineNodeBase):
         position `tap_index` (an index into self.devices, including any
         floor_break entries at that position) — used to tap a booster's
         connector line into the middle of this circuit's run instead of
-        always off the bottom edge. Falls back to the right end of the
-        last row when the index is out of range (e.g. a booster added
+        always off the bottom edge. Falls back to the far end of the last
+        row/column when the index is out of range (e.g. a booster added
         after the last device, which is also the default at creation)."""
         rows = self.row_layout()
         seen = 0
         for r, row in enumerate(rows):
             n = len(row["devices"])
-            y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
             if seen <= tap_index < seen + n:
                 i = tap_index - seen
-                x = OL_MARGIN + (i+0.5)*OL_DEV_SPACING
-                return (x, y)
+                p = self._lp(r, (i+0.5)*OL_DEV_SPACING)
+                return (p.x(), p.y())
             seen += n
             if row["floor_label"] is not None:
                 seen += 1   # the floor_break entry itself occupies one sequence slot
         last_row = len(rows) - 1
-        return (self._w - OL_MARGIN, OL_HEADER_H + last_row*OL_ROW_H + OL_ROW_H/2)
+        p = self._lp(last_row, self._along_size() - 2*OL_MARGIN)
+        return (p.x(), p.y())
 
     def nearest_line_point(self, local_pos):
         """Snap an arbitrary local point to the nearest spot actually ON
@@ -4998,25 +5071,29 @@ class CircuitNode(OneLineNodeBase):
         wire to, only the line itself."""
         rows = self.row_layout()
         if not rows:
-            return QPointF(OL_MARGIN, OL_HEADER_H + OL_ROW_H/2)
-        row_idx = round((local_pos.y() - OL_HEADER_H - OL_ROW_H/2) / OL_ROW_H)
+            return self._lp(0, 0)
+        if self.is_vertical():
+            row_idx = round((local_pos.x() - OL_HEADER_H - OL_ROW_H/2) / OL_ROW_H)
+            along_in = local_pos.y() - OL_HEADER_H - OL_MARGIN
+        else:
+            row_idx = round((local_pos.y() - OL_HEADER_H - OL_ROW_H/2) / OL_ROW_H)
+            along_in = local_pos.x() - OL_MARGIN
         row_idx = max(0, min(row_idx, len(rows)-1))
-        y = OL_HEADER_H + row_idx*OL_ROW_H + OL_ROW_H/2
-        x = min(max(local_pos.x(), OL_MARGIN), self._w - OL_MARGIN)
-        return QPointF(x, y)
+        along = min(max(along_in, 0), self._along_size() - 2*OL_MARGIN)
+        return self._lp(row_idx, along)
 
     def terminus_point(self):
         """Local (x, y) where the wire physically ends — right after the
-        last device on the last row's line — so an EOL resistor (or the
-        Class B Addressable no-EOL cap) reads as sitting ON the wire,
+        last device on the last row/column's line — so an EOL resistor (or
+        the Class B Addressable no-EOL cap) reads as sitting ON the wire,
         touching the last device, instead of floating in a separate area
         unrelated to where the devices actually stop."""
         rows = self.row_layout()
         last = len(rows) - 1
         cnt = len(rows[last]["devices"])
-        x = OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN
-        y = OL_HEADER_H + last*OL_ROW_H + OL_ROW_H/2
-        return QPointF(min(x, self._w - OL_MARGIN - 40), y)
+        along = cnt*OL_DEV_SPACING if cnt else 0
+        along = min(along, self._along_size() - 2*OL_MARGIN - 40)
+        return self._lp(last, along)
 
     def has_continuation_child(self):
         """True when another circuit continues this one's line in series
@@ -5026,13 +5103,18 @@ class CircuitNode(OneLineNodeBase):
         return any(getattr(c, "continues_parent_line", False) for c in self.children)
 
     def _recompute_height(self):
-        # Unlike Panel/Booster boxes, a circuit's height is never a free
-        # user choice — it's just "however many wrapped rows the current
-        # width forces the device list into", so it's always recomputed
-        # fresh even after a manual width resize (see mouseMoveEvent below,
-        # which resizes width only and leaves height to this).
+        # Unlike Panel/Booster boxes, a circuit's cross-axis size is never
+        # a free user choice — it's just "however many wrapped rows the
+        # current along-axis size forces the device list into", so it's
+        # always recomputed fresh even after a manual resize (see
+        # mouseMoveEvent above, which only ever drags the along axis).
+        # That's height when horizontal, width when vertical.
         rows = self.row_layout()
-        self._h = OL_HEADER_H + len(rows)*OL_ROW_H + OL_TERM_H
+        across = OL_HEADER_H + len(rows)*OL_ROW_H + OL_TERM_H
+        if self.is_vertical():
+            self._w = across
+        else:
+            self._h = across
 
     def total_load(self):
         device_entries = [d for d in self.devices if d.get("type") == "device"]
@@ -5080,69 +5162,87 @@ class CircuitNode(OneLineNodeBase):
             painter.drawText(QRectF(OL_MARGIN-4, 15, self._w-OL_MARGIN, 14), Qt.AlignLeft,
                               f"{load:.0f}/{self.capacity:.0f} {unit}  ({pct:.0f}%)")
 
-        # The circuit is drawn as one continuous horizontal line that wraps
-        # to a new row when it runs out of width (like text wrapping) —
-        # every device is its own tick + free-typed label sitting directly
-        # on the line, and a row that closed on a floor-break gets a dashed
-        # continuation + label to the right, matching a real riser diagram.
+        # The circuit is drawn as one continuous line that wraps to a new
+        # row/column when it runs out of room along its own run direction
+        # (like text wrapping) — every device is its own tick + free-typed
+        # label sitting directly on the line, and a row/column that closed
+        # on a floor-break gets a dashed continuation + label past it,
+        # matching a real riser diagram. self._lp(row_idx, along) is the
+        # one place horizontal (rows stacking down, line running rightward)
+        # vs. vertical (columns stepping right, line running downward)
+        # actually differ — everything else below just works in generic
+        # row/column + along-the-line terms.
         rows = self.row_layout()
+        vert = self.is_vertical()
         if not any(row["devices"] for row in rows):
             painter.setPen(QColor("#999")); painter.setFont(QFont("Arial", 7))
             painter.drawText(QRectF(6, OL_HEADER_H, self._w-12, 13), Qt.AlignLeft,
                               "(no devices — right-click to add)")
         line_pen = QPen(border.darker(110), 1.4)
-        right_edge = self._w - OL_MARGIN
-        row_ends = [max(OL_MARGIN + len(row["devices"])*OL_DEV_SPACING, OL_MARGIN) for row in rows]
+        far_along = self._along_size() - 2*OL_MARGIN
+        row_ends = [min(len(row["devices"])*OL_DEV_SPACING, far_along) for row in rows]
+        perp = self._perp()
 
-        # Pass 1: the row-to-row wrap connectors, drawn FIRST so each row's
-        # own line (pass 2, including any dashed floor-separator stretch)
-        # always paints on TOP of them — otherwise a solid connector drawn
-        # over a dash would show through its gaps and hide it. Routed with
-        # the exact same two-bend elbow (drop, cross, drop) used for the
-        # connector BETWEEN separate circuit boxes elsewhere on the
-        # diagram, so a row wrapping to a new line reads exactly like that
-        # familiar shape instead of a different, one-off corner style.
+        # Pass 1: the row-to-row/column-to-column wrap connectors, drawn
+        # FIRST so each row's own line (pass 2, including any dashed
+        # floor-separator stretch) always paints on TOP of them —
+        # otherwise a solid connector drawn over a dash would show through
+        # its gaps and hide it. Routed with the exact same two-bend elbow
+        # used for the connector BETWEEN separate circuit boxes elsewhere
+        # on the diagram, so a wrap reads exactly like that familiar shape.
         for r in range(len(rows)-1):
-            y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-            next_y = OL_HEADER_H + (r+1)*OL_ROW_H + OL_ROW_H/2
-            drop_x = right_edge if rows[r]["floor_label"] is not None else row_ends[r]
-            pts = elbow_points(drop_x, y, OL_MARGIN, next_y)
+            p_from = self._lp(r, far_along if rows[r]["floor_label"] is not None else row_ends[r])
+            p_to = self._lp(r+1, 0)
+            pts = self._elbow_pts(p_from, p_to)
             painter.setPen(line_pen)
             for p1, p2 in zip(pts, pts[1:]):
                 painter.drawLine(QPointF(*p1), QPointF(*p2))
 
         # Pass 2: each row's own line, devices, and floor-separator dash.
         for r, row in enumerate(rows):
-            y = OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-            line_end = row_ends[r]
+            p_start = self._lp(r, 0)
+            p_end = self._lp(r, row_ends[r])
             painter.setPen(line_pen)
-            painter.drawLine(QPointF(OL_MARGIN, y), QPointF(line_end, y))
+            painter.drawLine(p_start, p_end)
             for i, d in enumerate(row["devices"]):
-                x = OL_MARGIN + (i+0.5)*OL_DEV_SPACING
+                p = self._lp(r, (i+0.5)*OL_DEV_SPACING)
                 painter.setPen(line_pen)
-                painter.drawLine(QPointF(x, y), QPointF(x, y-OL_TICK_LEN))
+                painter.drawLine(p, QPointF(p.x()+perp.x()*OL_TICK_LEN, p.y()+perp.y()*OL_TICK_LEN))
+                box_c = QPointF(p.x()+perp.x()*(OL_TICK_LEN+13), p.y()+perp.y()*(OL_TICK_LEN+13))
+                box_rect = QRectF(box_c.x()-13, box_c.y()-6, 26, 12)
                 abbr = FA_DEVICE_TYPES.get(d["key"], {}).get("abbr", d["key"][:3].upper())
                 painter.setPen(QPen(border.darker(110), 1))
                 painter.setBrush(QBrush(QColor("white")))
-                painter.drawRect(QRectF(x-13, y-OL_TICK_LEN-13, 26, 12))
+                painter.drawRect(box_rect)
                 painter.setPen(QColor("#333")); painter.setFont(QFont("Arial", 6, QFont.Bold))
-                painter.drawText(QRectF(x-13, y-OL_TICK_LEN-13, 26, 12), Qt.AlignCenter, abbr)
+                painter.drawText(box_rect, Qt.AlignCenter, abbr)
                 if d.get("note"):
                     painter.setPen(QPen(QColor("#b8860b"), 1.4))
                     painter.setFont(QFont("Arial", 8, QFont.Bold))
-                    painter.drawText(QRectF(x+8, y-OL_TICK_LEN-17, 10, 12), Qt.AlignCenter, "*")
+                    painter.drawText(QRectF(box_rect.right()-2, box_rect.top()-4, 10, 12), Qt.AlignCenter, "*")
                 label = d.get("label", "")
                 if label:
                     painter.setFont(QFont("Arial", 6))
                     painter.setPen(QColor("#333"))
-                    painter.drawText(QRectF(x-OL_DEV_SPACING/2+2, y+3, OL_DEV_SPACING-4, 20),
-                                      Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, label)
+                    if vert:
+                        lbl_rect = QRectF(p.x()+4, p.y()-OL_DEV_SPACING/2+2, 90, OL_DEV_SPACING-4)
+                        align = Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap
+                    else:
+                        lbl_rect = QRectF(p.x()-OL_DEV_SPACING/2+2, p.y()+3, OL_DEV_SPACING-4, 20)
+                        align = Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap
+                    painter.drawText(lbl_rect, align, label)
             if row["floor_label"] is not None:
+                p1 = self._lp(r, row_ends[r])
+                p2 = self._lp(r, far_along)
                 painter.setPen(QPen(border.darker(130), 1, Qt.DashLine))
-                painter.drawLine(QPointF(line_end, y), QPointF(right_edge, y))
+                painter.drawLine(p1, p2)
                 painter.setPen(QColor("#333")); painter.setFont(QFont("Arial", 6, QFont.Bold))
-                painter.drawText(QRectF(line_end+4, y-12, right_edge-line_end-6, 11),
-                                  Qt.AlignLeft, row["floor_label"])
+                if vert:
+                    lbl_rect = QRectF(p1.x()+6, p1.y()+2, 90, max(11, p2.y()-p1.y()-4))
+                    painter.drawText(lbl_rect, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, row["floor_label"])
+                else:
+                    lbl_rect = QRectF(p1.x()+4, p1.y()-12, max(20, p2.x()-p1.x()-6), 11)
+                    painter.drawText(lbl_rect, Qt.AlignLeft, row["floor_label"])
 
         # Booster panels tap directly onto this circuit's line inline (a
         # small box straddling the run) rather than hanging off the bottom
@@ -5162,10 +5262,16 @@ class CircuitNode(OneLineNodeBase):
                 painter.drawText(QRectF(tx-16, ty-7, 32, 14), Qt.AlignCenter, c.name)
             elif isinstance(c, CircuitNode):
                 painter.setPen(QPen(QColor("#1a5276"), 1.6))
-                painter.drawLine(QPointF(tx, ty), QPointF(tx, ty+10))
-                painter.drawLine(QPointF(tx-6, ty+10), QPointF(tx+6, ty+10))
+                if vert:
+                    painter.drawLine(QPointF(tx, ty), QPointF(tx+10, ty))
+                    painter.drawLine(QPointF(tx+10, ty-6), QPointF(tx+10, ty+6))
+                    label_rect = QRectF(tx+2, ty+8, 100, 11)
+                else:
+                    painter.drawLine(QPointF(tx, ty), QPointF(tx, ty+10))
+                    painter.drawLine(QPointF(tx-6, ty+10), QPointF(tx+6, ty+10))
+                    label_rect = QRectF(tx+8, ty+2, 90, 11)
                 painter.setFont(QFont("Arial", 5, QFont.Bold)); painter.setPen(QColor("#1a5276"))
-                painter.drawText(QRectF(tx+8, ty+2, 90, 11), Qt.AlignLeft, f"T → {c.name}")
+                painter.drawText(label_rect, Qt.AlignLeft, f"T → {c.name}")
 
         # Terminus: Class B physically ends in an EOL resistor; Class B
         # (Addressable) is still a single run but has no physical EOL —
@@ -5175,25 +5281,39 @@ class CircuitNode(OneLineNodeBase):
         # the panel/booster, not by a symbol drawn on the circuit itself
         # (a single line + an in-box "return" icon reads, to an electrician,
         # as the loop returning to ITSELF rather than to the panel). Drawn
-        # right at the end of the last row's line — touching the last
-        # device — not floating in a separate area below the devices.
+        # right at the end of the last row/column's line — touching the
+        # last device — not floating in a separate area below the devices.
         if self.circuit_class in ("B", "B_ADDR") and not self.has_continuation_child():
             tp = self.terminus_point()
             painter.setPen(QPen(border.darker(110), 1.4))
-            painter.drawLine(QPointF(tp.x(), tp.y()), QPointF(tp.x()+8, tp.y()))
+            stub_end = QPointF(tp.x(), tp.y()+8) if vert else QPointF(tp.x()+8, tp.y())
+            painter.drawLine(tp, stub_end)
             painter.setPen(QPen(QColor("#555"), 1.3))
             if self.circuit_class == "B":
-                zx = tp.x() + 8
-                pts = [QPointF(zx+i*4, tp.y()+((-1)**i)*4) for i in range(9)]
+                if vert:
+                    zy = stub_end.y()
+                    pts = [QPointF(tp.x()+((-1)**i)*4, zy+i*4) for i in range(9)]
+                    text_rect = QRectF(tp.x()-30, zy+38, 60, 14); align = Qt.AlignCenter
+                else:
+                    zx = stub_end.x()
+                    pts = [QPointF(zx+i*4, tp.y()+((-1)**i)*4) for i in range(9)]
+                    text_rect = QRectF(zx+38, tp.y()-8, 40, 14); align = Qt.AlignLeft
                 painter.drawPolyline(QPolygonF(pts))
                 painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#555"))
-                painter.drawText(QRectF(zx+38, tp.y()-8, 40, 14), Qt.AlignLeft, "EOL")
+                painter.drawText(text_rect, align, "EOL")
             else:
-                lx = tp.x() + 8
-                painter.drawLine(QPointF(lx, tp.y()), QPointF(lx+10, tp.y()))
-                painter.drawLine(QPointF(lx+10, tp.y()-6), QPointF(lx+10, tp.y()+6))
+                if vert:
+                    ly = stub_end.y()
+                    painter.drawLine(QPointF(tp.x(), ly), QPointF(tp.x(), ly+10))
+                    painter.drawLine(QPointF(tp.x()-6, ly+10), QPointF(tp.x()+6, ly+10))
+                    text_rect = QRectF(tp.x()-55, ly+16, 110, 14); align = Qt.AlignCenter
+                else:
+                    lx = stub_end.x()
+                    painter.drawLine(QPointF(lx, tp.y()), QPointF(lx+10, tp.y()))
+                    painter.drawLine(QPointF(lx+10, tp.y()-6), QPointF(lx+10, tp.y()+6))
+                    text_rect = QRectF(lx+16, tp.y()-8, 110, 14); align = Qt.AlignLeft
                 painter.setFont(QFont("Arial", 6, QFont.Bold)); painter.setPen(QColor("#555"))
-                painter.drawText(QRectF(lx+16, tp.y()-8, 110, 14), Qt.AlignLeft, "No EOL (addressable)")
+                painter.drawText(text_rect, align, "No EOL (addressable)")
         self.paint_resize_grip(painter)
 
     def isolator_key(self):
@@ -5254,6 +5374,8 @@ class CircuitNode(OneLineNodeBase):
         add_next_a = menu.addAction("+ Add Circuit (Continue to Next Box)")
         add_tap_a = menu.addAction("+ Add Circuit (T-tap off isolator/JB)…") if self.isolator_devices() else None
         menu.addSeparator()
+        rotate_a = menu.addAction("Rotate to Horizontal" if self.is_vertical() else "Rotate to Vertical")
+        menu.addSeparator()
         del_a = menu.addAction("Delete Circuit (and Everything After It)")
         del_only_a = menu.addAction("Delete This Block Only (Keep Rest)") if self.children else None
         chosen = menu.exec_(event.screenPos())
@@ -5264,6 +5386,9 @@ class CircuitNode(OneLineNodeBase):
             self._add_next_box(sc)
         elif chosen == add_tap_a and sc:
             self._add_isolator_tap(sc)
+        elif chosen == rotate_a:
+            self.toggle_orientation()
+            if sc: sc.update_connectors(); sc.layout_changed.emit()
         elif chosen == edit_a:
             dlg = CircuitEditDialog(self.circuit_type, self.name, self.capacity, self.devices, self.circuit_class,
                                      source_label=self.source_label,
@@ -5908,6 +6033,7 @@ class OneLineScene(QGraphicsScene):
                               "source_label": n.source_label, "tap_index": n.tap_index,
                               "continues_parent_line": n.continues_parent_line,
                               "class_a_return_to_panel": n.class_a_return_to_panel,
+                              "orientation": n.orientation,
                               "conn_return_start_offset": _pt(n.conn_return_start_offset),
                               "conn_return_end_offset": _pt(n.conn_return_end_offset),
                               "conn_return_waypoints": _pts(n.conn_return_waypoints)})
@@ -5964,6 +6090,7 @@ class OneLineScene(QGraphicsScene):
                 node.tap_index = cd.get("tap_index")
                 node.continues_parent_line = cd.get("continues_parent_line", False)
                 node.class_a_return_to_panel = cd.get("class_a_return_to_panel", False)
+                node.orientation = cd.get("orientation", "h")
                 node.conn_return_start_offset = _unpt(cd.get("conn_return_start_offset"))
                 node.conn_return_end_offset = _unpt(cd.get("conn_return_end_offset"))
                 node.conn_return_waypoints = _unpts(cd.get("conn_return_waypoints"))
@@ -6728,47 +6855,51 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
             shape.draw_rect(fitz.Rect(p1.x, p1.y, p2.x, p2.y))
             shape.finish(color=col, fill=(0.97,0.97,0.97), width=1.4)
         if isinstance(n, CircuitNode):
-            # Continuous horizontal line that wraps to a new row, with each
+            # Continuous line that wraps to a new row/column, with each
             # device as its own tick + icon directly on the line and a
             # dashed continuation + label wherever a row closes on a
             # floor-break — mirrors CircuitNode.paint() exactly, per this
             # file's own convention that the on-screen and PDF renderings
-            # must stay in sync.
+            # must stay in sync (orientation included: n._lp() below is
+            # the same helper paint() uses to transpose horizontal vs.
+            # vertical wrap direction).
+            def L(local_pt):
+                return tx(n.pos().x()+local_pt.x(), n.pos().y()+local_pt.y())
+            vert = n.is_vertical()
+            perp = n._perp()
             rows = n.row_layout()
-            right_edge_x = n.pos().x() + n._w - OL_MARGIN
-            row_ends = [max(n.pos().x()+OL_MARGIN + len(row["devices"])*OL_DEV_SPACING,
-                             n.pos().x()+OL_MARGIN) for row in rows]
+            far_along = n._along_size() - 2*OL_MARGIN
+            row_ends = [min(len(row["devices"])*OL_DEV_SPACING, far_along) for row in rows]
 
-            # Pass 1: row-to-row wrap connectors, drawn FIRST so each row's
-            # own line (pass 2, including any dashed floor-separator
-            # stretch) always paints on TOP of them — otherwise a solid
-            # connector drawn over a dash would show through its gaps and
-            # hide it. Routed with the exact same two-bend elbow (drop,
-            # cross, drop) used for the connector BETWEEN separate circuit
-            # boxes elsewhere on the diagram. Mirrors CircuitNode.paint().
+            # Pass 1: row-to-row/column-to-column wrap connectors, drawn
+            # FIRST so each row's own line (pass 2, including any dashed
+            # floor-separator stretch) always paints on TOP of them —
+            # otherwise a solid connector drawn over a dash would show
+            # through its gaps and hide it. Routed with the exact same
+            # two-bend elbow used for the connector BETWEEN separate
+            # circuit boxes elsewhere on the diagram. Mirrors
+            # CircuitNode.paint().
             for r in range(len(rows)-1):
-                y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-                next_y = n.pos().y() + OL_HEADER_H + (r+1)*OL_ROW_H + OL_ROW_H/2
-                drop_x = right_edge_x if rows[r]["floor_label"] is not None else row_ends[r]
-                pts = [tx(px, py) for px, py in elbow_points(drop_x, y, n.pos().x()+OL_MARGIN, next_y)]
+                p_from = n._lp(r, far_along if rows[r]["floor_label"] is not None else row_ends[r])
+                p_to = n._lp(r+1, 0)
+                pts = [L(QPointF(px, py)) for px, py in n._elbow_pts(p_from, p_to)]
                 for p1, p2 in zip(pts, pts[1:]):
                     shape.draw_line(p1, p2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
 
             # Pass 2: each row's own line, devices, and floor-separator dash.
             for r, row in enumerate(rows):
-                y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-                line_end_x = row_ends[r]
-                lp1 = tx(n.pos().x()+OL_MARGIN, y); lp2 = tx(line_end_x, y)
-                shape.draw_line(lp1, lp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
+                p_start = n._lp(r, 0); p_end = n._lp(r, row_ends[r])
+                shape.draw_line(L(p_start), L(p_end)); shape.finish(color=(0.4,0.4,0.4), width=0.9)
                 for i, d in enumerate(row["devices"]):
-                    dx = n.pos().x() + OL_MARGIN + (i+0.5)*OL_DEV_SPACING
-                    tp1 = tx(dx, y); tp2 = tx(dx, y-OL_TICK_LEN)
+                    p = n._lp(r, (i+0.5)*OL_DEV_SPACING)
+                    tp1 = L(p); tp2 = L(QPointF(p.x()+perp.x()*OL_TICK_LEN, p.y()+perp.y()*OL_TICK_LEN))
                     shape.draw_line(tp1, tp2); shape.finish(color=(0.4,0.4,0.4), width=0.9)
-                    bp1 = tx(dx-13, y-OL_TICK_LEN-13); bp2 = tx(dx+13, y-OL_TICK_LEN-1)
+                    box_c = QPointF(p.x()+perp.x()*(OL_TICK_LEN+13), p.y()+perp.y()*(OL_TICK_LEN+13))
+                    bp1 = L(QPointF(box_c.x()-13, box_c.y()-6)); bp2 = L(QPointF(box_c.x()+13, box_c.y()+6))
                     shape.draw_rect(fitz.Rect(bp1.x, bp1.y, bp2.x, bp2.y))
                     shape.finish(color=(0.4,0.4,0.4), fill=(1,1,1), width=0.6)
                 if row["floor_label"] is not None:
-                    fp1 = tx(line_end_x, y); fp2 = tx(right_edge_x, y)
+                    fp1 = L(n._lp(r, row_ends[r])); fp2 = L(n._lp(r, far_along))
                     shape.draw_line(fp1, fp2); shape.finish(color=(0.35,0.35,0.35), width=0.6, dashes="[2 2] 0")
             for c in n.children:
                 if c.tap_index is None or getattr(c, "hidden", False):
@@ -6779,29 +6910,41 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
                     shape.draw_rect(fitz.Rect(bp1.x, bp1.y, bp2.x, bp2.y))
                     shape.finish(color=(0.49,0.24,0.6), fill=(0.96,0.93,0.99), width=0.7)
                 elif isinstance(c, CircuitNode):
-                    tp1 = tx(n.pos().x()+bx, n.pos().y()+by); tp2 = tx(n.pos().x()+bx, n.pos().y()+by+10)
+                    if vert:
+                        tp1 = tx(n.pos().x()+bx, n.pos().y()+by); tp2 = tx(n.pos().x()+bx+10, n.pos().y()+by)
+                        tp3 = tx(n.pos().x()+bx+10, n.pos().y()+by-6); tp4 = tx(n.pos().x()+bx+10, n.pos().y()+by+6)
+                    else:
+                        tp1 = tx(n.pos().x()+bx, n.pos().y()+by); tp2 = tx(n.pos().x()+bx, n.pos().y()+by+10)
+                        tp3 = tx(n.pos().x()+bx-6, n.pos().y()+by+10); tp4 = tx(n.pos().x()+bx+6, n.pos().y()+by+10)
                     shape.draw_line(tp1, tp2); shape.finish(color=(0.1,0.32,0.46), width=1.1)
-                    tp3 = tx(n.pos().x()+bx-6, n.pos().y()+by+10); tp4 = tx(n.pos().x()+bx+6, n.pos().y()+by+10)
                     shape.draw_line(tp3, tp4); shape.finish(color=(0.1,0.32,0.46), width=1.1)
             # Terminus: Class B EOL resistor zigzag; Class B (Addressable)
             # simple line-end cap, no EOL. Class A draws nothing here — it
             # loops back to its source via the actual RETURN connector leg
             # drawn above, not a symbol on the circuit itself. Drawn right
-            # at the end of the last row's line, touching the last device —
-            # mirrors CircuitNode.paint() exactly.
+            # at the end of the last row/column's line, touching the last
+            # device — mirrors CircuitNode.paint() exactly.
             if n.circuit_class in ("B", "B_ADDR") and not n.has_continuation_child():
                 tp = n.terminus_point()
-                stub1 = tx(n.pos().x()+tp.x(), n.pos().y()+tp.y())
-                stub2 = tx(n.pos().x()+tp.x()+8, n.pos().y()+tp.y())
-                shape.draw_line(stub1, stub2); shape.finish(color=(0.4,0.4,0.4), width=1.0)
+                stub_end = QPointF(tp.x(), tp.y()+8) if vert else QPointF(tp.x()+8, tp.y())
+                shape.draw_line(L(tp), L(stub_end)); shape.finish(color=(0.4,0.4,0.4), width=1.0)
                 if n.circuit_class == "B":
-                    zx = n.pos().x() + tp.x() + 8
-                    pts = [tx(zx+i*4, n.pos().y()+tp.y()+((-1)**i)*4) for i in range(9)]
+                    if vert:
+                        zy = stub_end.y()
+                        pts = [L(QPointF(tp.x()+((-1)**i)*4, zy+i*4)) for i in range(9)]
+                    else:
+                        zx = stub_end.x()
+                        pts = [L(QPointF(zx+i*4, tp.y()+((-1)**i)*4)) for i in range(9)]
                     shape.draw_polyline(pts); shape.finish(color=(0.3,0.3,0.3), width=1.0)
                 else:
-                    lx = n.pos().x() + tp.x() + 8
-                    ly = n.pos().y() + tp.y()
-                    lp1 = tx(lx, ly); lp2 = tx(lx+10, ly); lp3 = tx(lx+10, ly-6); lp4 = tx(lx+10, ly+6)
+                    if vert:
+                        ly = stub_end.y()
+                        lp1 = L(QPointF(tp.x(), ly)); lp2 = L(QPointF(tp.x(), ly+10))
+                        lp3 = L(QPointF(tp.x()-6, ly+10)); lp4 = L(QPointF(tp.x()+6, ly+10))
+                    else:
+                        lx = stub_end.x()
+                        lp1 = L(QPointF(lx, tp.y())); lp2 = L(QPointF(lx+10, tp.y()))
+                        lp3 = L(QPointF(lx+10, tp.y()-6)); lp4 = L(QPointF(lx+10, tp.y()+6))
                     shape.draw_line(lp1, lp2); shape.finish(color=(0.3,0.3,0.3), width=1.0)
                     shape.draw_line(lp3, lp4); shape.finish(color=(0.3,0.3,0.3), width=1.0)
     shape.commit()
@@ -6838,30 +6981,34 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
                 page.insert_text(fitz.Point(p1.x+5, p1.y+27*scale+4),
                                   f"{n.total_load():.0f}/{n.capacity:.0f} {info['unit']} ({n.utilization_pct():.0f}%)",
                                   fontsize=6.5, color=col)
+            def L(local_pt):
+                return tx(n.pos().x()+local_pt.x(), n.pos().y()+local_pt.y())
+            vert = n.is_vertical()
+            perp = n._perp()
             rows = n.row_layout()
             if not any(row["devices"] for row in rows):
                 page.insert_text(fitz.Point(p1.x+5, p1.y+40*scale+4), "(no devices)",
                                   fontsize=6, color=(0.6,0.6,0.6))
+            far_along = n._along_size() - 2*OL_MARGIN
             for r, row in enumerate(rows):
-                y = n.pos().y() + OL_HEADER_H + r*OL_ROW_H + OL_ROW_H/2
-                cnt = len(row["devices"])
-                line_end_x = n.pos().x() + (OL_MARGIN + cnt*OL_DEV_SPACING if cnt else OL_MARGIN)
+                row_end = min(len(row["devices"])*OL_DEV_SPACING, far_along)
                 for i, d in enumerate(row["devices"]):
-                    dx = n.pos().x() + OL_MARGIN + (i+0.5)*OL_DEV_SPACING
+                    p = n._lp(r, (i+0.5)*OL_DEV_SPACING)
+                    box_c = QPointF(p.x()+perp.x()*(OL_TICK_LEN+13), p.y()+perp.y()*(OL_TICK_LEN+13))
                     abbr = FA_DEVICE_TYPES.get(d["key"], {}).get("abbr", d["key"][:3].upper())
-                    tp = tx(dx-12, y-OL_TICK_LEN-4)
-                    page.insert_text(tp, abbr, fontsize=5, fontname="hebo", color=(0.2,0.2,0.2))
+                    page.insert_text(L(QPointF(box_c.x()-12, box_c.y()+3)), abbr,
+                                      fontsize=5, fontname="hebo", color=(0.2,0.2,0.2))
                     if d.get("note"):
-                        page.insert_text(tx(dx+9, y-OL_TICK_LEN-6), "*", fontsize=7, fontname="hebo",
+                        page.insert_text(L(QPointF(box_c.x()+11, box_c.y()+2)), "*", fontsize=7, fontname="hebo",
                                           color=(0.72,0.53,0.04))
                     label = d.get("label", "")
                     if label:
-                        lp = tx(dx-OL_DEV_SPACING/2+2, y+11)
-                        page.insert_text(lp, label, fontsize=5, color=(0.2,0.2,0.2))
+                        lbl_pt = QPointF(p.x()+4, p.y()+2) if vert else QPointF(p.x()-OL_DEV_SPACING/2+2, p.y()+11)
+                        page.insert_text(L(lbl_pt), label, fontsize=5, color=(0.2,0.2,0.2))
                 if row["floor_label"] is not None:
-                    dash_x0 = max(line_end_x, n.pos().x()+OL_MARGIN)
-                    lp = tx(dash_x0+4, y-3)
-                    page.insert_text(lp, row["floor_label"], fontsize=5.5, fontname="hebo", color=(0.2,0.2,0.2))
+                    p1r = n._lp(r, row_end)
+                    lbl_pt = QPointF(p1r.x()+6, p1r.y()+8) if vert else QPointF(p1r.x()+4, p1r.y()-3)
+                    page.insert_text(L(lbl_pt), row["floor_label"], fontsize=5.5, fontname="hebo", color=(0.2,0.2,0.2))
             for c in n.children:
                 if c.tap_index is None or getattr(c, "hidden", False):
                     continue
@@ -6870,18 +7017,20 @@ def export_oneline_pdf(scene, path, project_meta=None, sheet_title="ONE-LINE DIA
                     bp = tx(n.pos().x()+bx-15, n.pos().y()+by+2)
                     page.insert_text(bp, c.name, fontsize=4.5, fontname="hebo", color=(0.36,0.17,0.44))
                 elif isinstance(c, CircuitNode):
-                    bp = tx(n.pos().x()+bx+8, n.pos().y()+by+9)
+                    lbl_pt = (n.pos().x()+bx+2, n.pos().y()+by+17) if vert else (n.pos().x()+bx+8, n.pos().y()+by+9)
+                    bp = tx(*lbl_pt)
                     page.insert_text(bp, f"T -> {c.name}", fontsize=4.5, fontname="hebo", color=(0.1,0.32,0.46))
             if n.circuit_class in ("B", "B_ADDR") and not n.has_continuation_child():
                 tp = n.terminus_point()
-                if n.circuit_class == "B":
-                    lbl_x = n.pos().x()+tp.x()+8+38
-                    page.insert_text(tx(lbl_x, n.pos().y()+tp.y()-6), "EOL",
-                                      fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
+                if vert:
+                    lbl_pt = QPointF(tp.x(), tp.y()+8+38) if n.circuit_class == "B" else QPointF(tp.x(), tp.y()+8+16)
+                    align_dx = -15 if n.circuit_class == "B" else -55
                 else:
-                    lbl_x = n.pos().x()+tp.x()+8+16
-                    page.insert_text(tx(lbl_x, n.pos().y()+tp.y()-6), "No EOL (addressable)",
-                                      fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
+                    lbl_pt = QPointF(tp.x()+8+38, tp.y()-6) if n.circuit_class == "B" else QPointF(tp.x()+8+16, tp.y()-6)
+                    align_dx = 0
+                text = "EOL" if n.circuit_class == "B" else "No EOL (addressable)"
+                page.insert_text(L(QPointF(lbl_pt.x()+align_dx, lbl_pt.y())), text,
+                                  fontsize=6, fontname="helv", color=(0.3,0.3,0.3))
 
     # OUT/RETURN labels at the panel/booster end of each connector leg —
     # mirrors ConnectorItem.paint() so a Class A circuit's two wires both

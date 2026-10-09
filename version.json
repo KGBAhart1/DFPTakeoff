@@ -1,5 +1,5 @@
 {
-  "version": "1.6.4",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.4/DFP_TakeoffPro_Setup_1.6.4.exe",
-  "notes": "One-Line Diagram: right-click a connector wire to insert a new circuit or booster block right into the middle of it. Right-click a circuit or booster to delete just that one block and reconnect everything after it to its parent, instead of taking the whole chain down with it."
+  "version": "1.6.5",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.5/DFP_TakeoffPro_Setup_1.6.5.exe",
+  "notes": "Kitchen Suppression Designer: Kidde WHDR can now protect ecology units (pollution control units) for Parker SmogHog PSG, Air Quality Engineering AUTOCLEAN/SMOKEMASTER and Cadexair KAC models - pick the model in Edit Appliance and the Kidde-recommended ADP nozzle count is placed automatically, and ecology unit height now resizes the picture. One-Line Diagram: circuits can be rotated to run vertically (right-click > Rotate to Vertical)."
 }
