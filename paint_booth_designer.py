@@ -2695,6 +2695,10 @@ class PaintBoothDesigner(QDialog):
                        fontsize=13, color=(1, 1, 1), fontname="helv")
         pg.insert_text((BORDER, 35),  subtitle,
                        fontsize=8,  color=(1, 1, 1), fontname="helv")
+        # AS-BUILT badge, centred in the header
+        bw = 118; bx = (W - bw) / 2 - 30
+        pg.draw_rect(fitz.Rect(bx, 9, bx + bw, HEADER_H - 9), color=(1, 1, 1), width=1.6)
+        pg.insert_text((bx + 10, 33), "AS-BUILT", fontsize=17, color=(1, 1, 1), fontname="hebo")
         sx = W - SIDEBAR_W + 4
         pg.insert_text((sx, 18), f"Customer: {customer}",
                        fontsize=8, color=(1, 1, 1), fontname="helv")

@@ -4953,6 +4953,10 @@ def export_submittal_pdf(systems, path, project_name="", project_meta=None, show
             pg.draw_rect(fitz.Rect(0,0,W,HEADER_H),color=red,fill=red)
             pg.insert_text((BORDER,18),"DEFENSE FIRE PROTECTION",fontsize=13,color=(1,1,1),fontname="helv")
             pg.insert_text((BORDER,35),"Kitchen Fire Suppression System",fontsize=8,color=(1,1,1),fontname="helv")
+            # AS-BUILT badge, centred in the header
+            _bw=118; _bx=(W-_bw)/2-30
+            pg.draw_rect(fitz.Rect(_bx,9,_bx+_bw,HEADER_H-9),color=(1,1,1),width=1.6)
+            pg.insert_text((_bx+10,33),"AS-BUILT",fontsize=17,color=(1,1,1),fontname="hebo")
             _hy=_draw_multiline(pg,W-SIDEBAR_W+4,18,f"Customer: {customer}",8,(1,1,1))
             _draw_multiline(pg,W-SIDEBAR_W+4,_hy+3,f"Location: {location}",7,(1,1,1))
 
