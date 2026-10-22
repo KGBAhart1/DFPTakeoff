@@ -42,6 +42,18 @@ except ImportError:
     _FITZ_OK = False
 
 
+def _projects_dir():
+    """Writable projects folder — Documents/DFP TakeoffPro/Projects when installed
+    (Program Files isn't writable), the app folder when run from source."""
+    if getattr(sys, 'frozen', False):
+        base = os.path.join(os.path.expanduser("~"), "Documents", "DFP TakeoffPro")
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(base, "Projects")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
 def _submittals_dir():
     if getattr(sys, 'frozen', False):
         base = os.path.join(os.path.expanduser("~"), "Documents", "DFP TakeoffPro")
@@ -462,6 +474,14 @@ class ZoneItem(QGraphicsItem):
                           w_px + tdx + pad + extra, h_px - min(dy, tdy) + pad)
         return QRectF(0, dy - pad, w_px + dx + pad, h_px - dy + pad)
 
+    def _noz_n(self):
+        """Nozzles actually placed for this zone (falls back to the DIOM count
+        before the scene has any)."""
+        sc = self._scene_ref
+        if hasattr(sc, "zone_nozzle_count"):
+            return sc.zone_nozzle_count(self.zone.uid)
+        return self.zone.nozzle_count
+
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemPositionHasChanged:
             new_pos = self.pos()
@@ -587,7 +607,7 @@ class ZoneItem(QGraphicsItem):
         info = f"{z.length:.0f}′ × {z.width:.0f}′ × {z.height:.0f}′"
         painter.drawText(QRectF(5, 20, w_px - 10, 14), Qt.AlignLeft | Qt.AlignVCenter, info)
 
-        noz_txt = f"{z.nozzle_count}× {z.nozzle_type}"
+        noz_txt = f"{self._noz_n()}× {z.nozzle_type}"
         if z.zone_type == ZONE_WORK:
             minfo = z.module_info
             if minfo:
@@ -681,7 +701,7 @@ class ZoneItem(QGraphicsItem):
         else:
             info = f"{z.length:.0f}′ long × {z.width:.0f}′ wide"
         painter.drawText(QRectF(4, -5, L_px - 8, 14), Qt.AlignLeft | Qt.AlignVCenter, info)
-        noz_txt = f"{z.nozzle_count}× {z.nozzle_type}"
+        noz_txt = f"{self._noz_n()}× {z.nozzle_type}"
         painter.drawText(QRectF(4, 8, L_px - 8, 14), Qt.AlignLeft | Qt.AlignVCenter, noz_txt)
         if z.warnings():
             painter.setPen(QPen(QColor("#e74c3c"), 1))
@@ -735,7 +755,7 @@ class ZoneItem(QGraphicsItem):
         painter.setFont(QFont("Arial", 7))
         painter.setPen(QPen(border.darker(130)))
         painter.drawText(QRectF(5, 20, L_px - 10, 14), Qt.AlignLeft,
-                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.0f}′  {z.nozzle_count}× {z.nozzle_type}")
+                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.0f}′  {self._noz_n()}× {z.nozzle_type}")
         if z.warnings():
             painter.setPen(QPen(QColor("#e74c3c"), 1))
             painter.setFont(QFont("Arial", 7, QFont.Bold))
@@ -791,7 +811,7 @@ class ZoneItem(QGraphicsItem):
         painter.setFont(QFont("Arial", 7))
         painter.setPen(QPen(border.darker(130)))
         painter.drawText(QRectF(5, H_px + 16, L_px - 10, 14), Qt.AlignLeft,
-                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.1f}′  {z.nozzle_count}× {z.nozzle_type}")
+                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.1f}′  {self._noz_n()}× {z.nozzle_type}")
         if z.warnings():
             painter.setPen(QPen(QColor("#e74c3c"), 1))
             painter.setFont(QFont("Arial", 7, QFont.Bold))
@@ -843,7 +863,7 @@ class ZoneItem(QGraphicsItem):
         painter.setFont(QFont("Arial", 7))
         painter.setPen(QPen(border.darker(130)))
         painter.drawText(QRectF(5, 20, L_px - 10, 14), Qt.AlignLeft,
-                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.0f}′  {z.nozzle_count}× {z.nozzle_type}")
+                         f"{z.length:.0f}′×{z.width:.0f}′×{z.height:.0f}′  {self._noz_n()}× {z.nozzle_type}")
         if z.warnings():
             painter.setPen(QPen(QColor("#e74c3c"), 1))
             painter.setFont(QFont("Arial", 7, QFont.Bold))
@@ -852,12 +872,18 @@ class ZoneItem(QGraphicsItem):
     def contextMenuEvent(self, event):
         menu = QMenu()
         edit_act = menu.addAction("Edit Zone…")
+        add_act  = menu.addAction("Add Nozzle to This Zone")
+        rst_act  = menu.addAction("Reset Nozzles to Auto Layout")
         del_act  = menu.addAction("Delete Zone")
         chosen   = menu.exec_(event.screenPos())
         # Deferred via QTimer — deleting `self` synchronously while still inside
         # its own contextMenuEvent (which Qt is mid-dispatch on) can crash.
         if chosen == edit_act:
             QTimer.singleShot(0, lambda: self._scene_ref._edit_zone(self))
+        elif chosen == add_act:
+            QTimer.singleShot(0, lambda: self._scene_ref.add_zone_nozzle(self))
+        elif chosen == rst_act:
+            QTimer.singleShot(0, lambda: self._scene_ref.reset_zone_nozzles(self))
         elif chosen == del_act:
             QTimer.singleShot(0, lambda: self._scene_ref._delete_zone(self))
 
@@ -958,7 +984,8 @@ class NozzleItem(QGraphicsItem):
         self.nozzle_type     = nozzle_type
         self._scene_ref      = scene_ref
         self.coverage_visible = coverage_visible
-        self.zone_uid        = None   # set when auto-spawned; None = manually placed
+        self.zone_uid        = None   # zone this nozzle belongs to; None = free-standing
+        self.auto            = False  # True = auto-laid-out for its zone (rebuilt on zone edit)
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
@@ -1009,8 +1036,20 @@ class NozzleItem(QGraphicsItem):
     def hoverEnterEvent(self, event): self._hover = True;  self.update()
     def hoverLeaveEvent(self, event): self._hover = False; self.update()
 
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self._scene_ref:
+            self._scene_ref.nozzle_changed()
+
+    def mouseDoubleClickEvent(self, event):
+        if self._scene_ref:
+            QTimer.singleShot(0, lambda: self._scene_ref.edit_nozzle(self))
+
     def contextMenuEvent(self, event):
         menu = QMenu()
+        props_act = menu.addAction("Properties / Position…")
+        dup_act   = menu.addAction("Duplicate Nozzle")
+        menu.addSeparator()
         cov_lbl = "Hide Coverage Circle" if self.coverage_visible else "Show Coverage Circle"
         cov_act = menu.addAction(cov_lbl)
         t_menu  = menu.addMenu("Change Type")
@@ -1020,12 +1059,17 @@ class NozzleItem(QGraphicsItem):
         menu.addSeparator()
         del_act = menu.addAction("Delete Nozzle")
         chosen  = menu.exec_(event.screenPos())
-        if   chosen == cov_act:
+        if chosen == props_act and self._scene_ref:
+            QTimer.singleShot(0, lambda: self._scene_ref.edit_nozzle(self))
+        elif chosen == dup_act and self._scene_ref:
+            QTimer.singleShot(0, lambda: self._scene_ref.duplicate_nozzle(self))
+        elif chosen == cov_act:
             self.coverage_visible = not self.coverage_visible
             self.prepareGeometryChange(); self.update()
-        elif chosen == tf_act:  self.nozzle_type = NOZZLE_TF;  self.update()
-        elif chosen == dp_act:  self.nozzle_type = NOZZLE_DP;  self.update()
-        elif chosen == wy_act:  self.nozzle_type = NOZZLE_3WY; self.update()
+        elif chosen in (tf_act, dp_act, wy_act):
+            self.nozzle_type = {tf_act: NOZZLE_TF, dp_act: NOZZLE_DP, wy_act: NOZZLE_3WY}[chosen]
+            self.update()
+            if self._scene_ref: self._scene_ref.nozzle_changed()
         elif chosen == del_act and self._scene_ref:
             # Defer the actual scene removal — deleting `self` synchronously while
             # still inside its own contextMenuEvent can crash Qt's event dispatch.
@@ -1205,6 +1249,13 @@ class BoothScene(QGraphicsScene):
 
     def _spawn_zone_nozzles(self, z: ZoneData):
         """Auto-place NozzleItems at the calculated grid positions for a zone."""
+        before = set(self._nozzle_items)
+        self._spawn_zone_nozzles_raw(z)
+        for n in self._nozzle_items:
+            if n not in before:
+                n.auto = True
+
+    def _spawn_zone_nozzles_raw(self, z: ZoneData):
         nc = z.nozzle_count
         if nc <= 0:
             return
@@ -1317,6 +1368,55 @@ class BoothScene(QGraphicsScene):
     def remove_nozzle(self, item: NozzleItem):
         self._nozzle_items = [n for n in self._nozzle_items if n is not item]
         self.removeItem(item)
+        self.zones_changed.emit()
+
+    def nozzle_changed(self):
+        """A nozzle was moved/retyped/added: the BOM and zone counts follow the
+        nozzles actually placed on the canvas, so refresh them."""
+        self.zones_changed.emit()
+
+    def zone_nozzle_count(self, uid):
+        return sum(1 for n in self._nozzle_items if n.zone_uid == uid)
+
+    def placed_counts_by_type(self):
+        out = {}
+        for n in self._nozzle_items:
+            out[n.nozzle_type] = out.get(n.nozzle_type, 0) + 1
+        return out
+
+    def add_zone_nozzle(self, zone_item):
+        """Add one extra nozzle to a zone, dropped at the zone centre."""
+        z = zone_item.zone
+        cx = z.x*PX_PER_FT + z.length*PX_PER_FT/2 + _ddx(z.width)/2
+        cy = z.y*PX_PER_FT + _ddy(z.width)/2 + 10
+        n = self.add_nozzle(z.nozzle_type, cx, cy)
+        n.zone_uid = z.uid
+        n.setSelected(True)
+        self.zones_changed.emit()
+        return n
+
+    def reset_zone_nozzles(self, zone_item):
+        """Discard ALL of this zone's nozzles (auto, added or moved) and re-place them per the DIOM calc."""
+        z = zone_item.zone
+        for n in [n for n in self._nozzle_items if n.zone_uid == z.uid]:
+            self.removeItem(n)
+        self._nozzle_items = [n for n in self._nozzle_items if n.zone_uid != z.uid]
+        self._spawn_zone_nozzles(z)
+        self.zones_changed.emit()
+
+    def duplicate_nozzle(self, item):
+        n = self.add_nozzle(item.nozzle_type, item.pos().x() + 24, item.pos().y())
+        n.zone_uid = item.zone_uid
+        n.coverage_visible = item.coverage_visible
+        n.setSelected(True)
+        self.zones_changed.emit()
+
+    def edit_nozzle(self, item):
+        dlg = NozzleDialog(item, self.all_zones(), self.views()[0] if self.views() else None)
+        if dlg.exec_() == QDialog.Accepted:
+            dlg.apply_to(item)
+            item.prepareGeometryChange(); item.update()
+            self.zones_changed.emit()
 
     def clear_nozzles(self):
         for n in list(self._nozzle_items):
@@ -1387,9 +1487,9 @@ class BoothScene(QGraphicsScene):
             item.prepareGeometryChange()
             item.update()
             # Remove auto-spawned nozzles for this zone then respawn
-            for n in [n for n in self._nozzle_items if n.zone_uid == item.zone.uid]:
+            for n in [n for n in self._nozzle_items if n.zone_uid == item.zone.uid and n.auto]:
                 self.removeItem(n)
-            self._nozzle_items = [n for n in self._nozzle_items if n.zone_uid != item.zone.uid]
+            self._nozzle_items = [n for n in self._nozzle_items if not (n.zone_uid == item.zone.uid and n.auto)]
             self._spawn_zone_nozzles(item.zone)
             self.zones_changed.emit()
 
@@ -1589,6 +1689,49 @@ class ZoneDialog(QDialog):
 #  BOM / Validation panel
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class NozzleDialog(QDialog):
+    """Exact control over one nozzle: type, position (ft from the scene origin),
+    which zone it counts toward, and its coverage circle."""
+    def __init__(self, nozzle, zones, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nozzle Properties")
+        self.setMinimumWidth(320)
+        f = QFormLayout(self); f.setSpacing(8); f.setContentsMargins(14, 14, 14, 14)
+        self.type_combo = QComboBox()
+        for t, d in ((NOZZLE_TF, "TF - Work Area"), (NOZZLE_DP, "DP - Duct / Plenum"),
+                     (NOZZLE_3WY, "3-Way - Pit / Tunnel")):
+            self.type_combo.addItem(d, t)
+        self.type_combo.setCurrentIndex(max(0, self.type_combo.findData(nozzle.nozzle_type)))
+        self.sp_x = QDoubleSpinBox(); self.sp_y = QDoubleSpinBox()
+        for sp, v in ((self.sp_x, nozzle.pos().x()), (self.sp_y, nozzle.pos().y())):
+            sp.setRange(-2000, 2000); sp.setDecimals(2); sp.setSuffix(" ft")
+            sp.setValue(v / PX_PER_FT)
+        self.zone_combo = QComboBox()
+        self.zone_combo.addItem("None (free-standing)", None)
+        for z in zones:
+            self.zone_combo.addItem(z.label, z.uid)
+        self.zone_combo.setCurrentIndex(max(0, self.zone_combo.findData(nozzle.zone_uid)))
+        self.chk_cov = QCheckBox("Show coverage circle")
+        self.chk_cov.setChecked(nozzle.coverage_visible)
+        f.addRow("Type:", self.type_combo)
+        f.addRow("X position:", self.sp_x)
+        f.addRow("Y position:", self.sp_y)
+        f.addRow("Counts toward zone:", self.zone_combo)
+        f.addRow("", self.chk_cov)
+        br = QHBoxLayout()
+        ok = QPushButton("Apply"); ok.clicked.connect(self.accept)
+        ca = QPushButton("Cancel"); ca.clicked.connect(self.reject)
+        br.addStretch(); br.addWidget(ca); br.addWidget(ok)
+        f.addRow(br)
+
+    def apply_to(self, n):
+        n.nozzle_type = self.type_combo.currentData()
+        n.setPos(self.sp_x.value() * PX_PER_FT, self.sp_y.value() * PX_PER_FT)
+        n.zone_uid = self.zone_combo.currentData()
+        n.coverage_visible = self.chk_cov.isChecked()
+        n.auto = False
+
+
 class BOMPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1631,21 +1774,30 @@ class BOMPanel(QWidget):
         layout.addWidget(self.summary_lbl)
 
     def refresh(self, zones: list[ZoneData], cylinder_model: str, detector_type: str,
-                num_pull_stations: int = 1, has_elec_actuator: bool = False):
-        # Collect nozzle counts by type
+                num_pull_stations: int = 1, has_elec_actuator: bool = False,
+                placed_by_type=None, zone_placed=None):
+        # Nozzle quantities follow what is actually placed on the canvas (auto-laid-out,
+        # added, moved or deleted by the user). Without a scene, fall back to the DIOM calc.
         nozzles = {}
         all_warnings = []
+        if placed_by_type is not None:
+            nozzles = dict(placed_by_type)
+        else:
+            for z in zones:
+                nozzles[z.nozzle_type] = nozzles.get(z.nozzle_type, 0) + z.nozzle_count
         for z in zones:
-            nt = z.nozzle_type
-            nozzles[nt] = nozzles.get(nt, 0) + z.nozzle_count
             all_warnings.extend(z.warnings())
+            if zone_placed is not None:
+                have = zone_placed.get(z.uid, 0)
+                if have < z.nozzle_count:
+                    all_warnings.append(f"[{z.label}] {have} nozzle(s) placed, {z.nozzle_count} required by the DIOM calc")
 
         total_nozzles = sum(nozzles.values())
 
         # Cylinder selection recommendation
         # IND-21 handles up to 2 nozzles; IND-45 up to 4; IND-70 for large single-system
         # This is a simplified recommendation; exact selection requires piping balance check
-        cyls_needed = self._recommend_cylinders(zones, cylinder_model)
+        cyls_needed = self._recommend_cylinders(zones, cylinder_model, total_nozzles)
 
         # Build BOM
         items = []
@@ -1719,14 +1871,15 @@ class BOMPanel(QWidget):
     # IND-21 = DC-21 (21 lb), IND-45 = DC-45 (45 lb), IND-70 = DC-70 (70 lb).
     _MAX_NOZZLES = {"IND-21": 2, "IND-45": 4, "IND-70": 6}
 
-    def _recommend_cylinders(self, zones, preferred_model):
+    def _recommend_cylinders(self, zones, preferred_model, total_nozzles=None):
         """
         Cylinder count = ceil(total_nozzles / max_nozzles_per_cylinder).
         Limits per DIOM: IND-21 → 2 nozzles, IND-45 → 4, IND-70 → 6.
         """
         if not zones:
             return {}
-        total_nozzles = sum(z.nozzle_count for z in zones)
+        if total_nozzles is None:
+            total_nozzles = sum(z.nozzle_count for z in zones)
         if total_nozzles == 0:
             return {}
         cap = self._MAX_NOZZLES.get(preferred_model, 4)
@@ -2049,12 +2202,15 @@ class PaintBoothDesigner(QDialog):
         det   = self.det_combo.currentText()
         self._bom.refresh(zones, cyl, det,
                           num_pull_stations=self.sp_pull.value(),
-                          has_elec_actuator=self.chk_elec.isChecked())
+                          has_elec_actuator=self.chk_elec.isChecked(),
+                          placed_by_type=self._scene.placed_counts_by_type(),
+                          zone_placed={z.uid: self._scene.zone_nozzle_count(z.uid) for z in zones})
 
     def _add_nozzle(self, nozzle_type):
         """Drop a nozzle at the centre of the current view."""
         centre = self._canvas.mapToScene(self._canvas.viewport().rect().center())
         self._scene.add_nozzle(nozzle_type, centre.x(), centre.y())
+        self._scene.nozzle_changed()
 
     def _add_link(self):
         centre = self._canvas.mapToScene(self._canvas.viewport().rect().center())
@@ -2098,7 +2254,7 @@ class PaintBoothDesigner(QDialog):
             "coverage_on":  self._cov_action.isChecked(),
             "zones":        [z.to_dict() for z in self._scene.all_zones()],
             "nozzles":      [{"type": n.nozzle_type, "x": n.pos().x(), "y": n.pos().y(),
-                               "cov": n.coverage_visible}
+                               "cov": n.coverage_visible, "zone_uid": n.zone_uid, "auto": n.auto}
                              for n in self._scene.all_nozzles()],
             "links":        [{"type": l.link_type, "x": l.pos().x(), "y": l.pos().y()}
                              for l in self._scene.all_links()],
@@ -2129,6 +2285,7 @@ class PaintBoothDesigner(QDialog):
 
     def _load_data(self, data):
         self._project_meta = data.get("project_meta", {})
+        self._project_name = data.get("project_name", self._project_name)
         self.sp_booth_L.setValue(data.get("booth_L", 30.0))
         self.sp_booth_W.setValue(data.get("booth_W", 14.0))
         self.sp_booth_H.setValue(data.get("booth_H", 9.0))
@@ -2154,11 +2311,28 @@ class PaintBoothDesigner(QDialog):
             z = ZoneData.from_dict(zd)
             self._scene.add_zone(z, spawn_nozzles=False)
 
-        # Reload nozzles
+        # New zones created after loading must not reuse a loaded zone's uid
+        ZoneData._id_counter = max([z.uid for z in self._scene.all_zones()] + [0])
+
+        # Reload nozzles (zone membership + auto-layout flag included)
+        zones_now = self._scene.all_zones()
+        valid_uids = {z.uid for z in zones_now}
         for nd in data.get("nozzles", []):
-            self._scene.add_nozzle(nd.get("type", NOZZLE_TF),
-                                   nd.get("x", 0.0), nd.get("y", 0.0))
-            self._scene.all_nozzles()[-1].coverage_visible = nd.get("cov", True)
+            n = self._scene.add_nozzle(nd.get("type", NOZZLE_TF),
+                                       nd.get("x", 0.0), nd.get("y", 0.0))
+            n.coverage_visible = nd.get("cov", True)
+            if "zone_uid" in nd:
+                n.zone_uid = nd["zone_uid"] if nd["zone_uid"] in valid_uids else None
+                n.auto = bool(nd.get("auto", False))
+            elif zones_now:
+                # Project saved before nozzles remembered their zone: attach each to the
+                # nearest zone so counts, zone moves and edits work again.
+                def _dist(z, n=n):
+                    cx = z.x*PX_PER_FT + z.length*PX_PER_FT/2 + _ddx(z.width)/2
+                    cy = z.y*PX_PER_FT + _ddy(z.width)/2
+                    return (n.pos().x()-cx)**2 + (n.pos().y()-cy)**2
+                n.zone_uid = min(zones_now, key=_dist).uid
+                n.auto = True
 
         # Reload links
         for ld in data.get("links", []):
@@ -2332,7 +2506,7 @@ class PaintBoothDesigner(QDialog):
                                    fontsize=7, color=dark, fontname="helv")
                     pg.insert_text((SX, sy + 9), f"  {z.zone_type}  {z.length:.0f}×{z.width:.0f}×{z.height:.0f} ft",
                                    fontsize=6, color=(0.35, 0.35, 0.35), fontname="helv")
-                    pg.insert_text((SX, sy + 17), f"  {z.nozzle_count} nozzle(s)",
+                    pg.insert_text((SX, sy + 17), f"  {self._scene.zone_nozzle_count(z.uid)} nozzle(s)",
                                    fontsize=6, color=(0.35, 0.35, 0.35), fontname="helv")
                     if z.zone_type == ZONE_WORK:
                         mi = z.module_info

@@ -1,5 +1,5 @@
 {
-  "version": "1.6.5",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.5/DFP_TakeoffPro_Setup_1.6.5.exe",
-  "notes": "Kitchen Suppression Designer: Kidde WHDR can now protect ecology units (pollution control units) for Parker SmogHog PSG, Air Quality Engineering AUTOCLEAN/SMOKEMASTER and Cadexair KAC models - pick the model in Edit Appliance and the Kidde-recommended ADP nozzle count is placed automatically, and ecology unit height now resizes the picture. One-Line Diagram: circuits can be rotated to run vertically (right-click > Rotate to Vertical)."
+  "version": "1.6.6",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.6/DFP_TakeoffPro_Setup_1.6.6.exe",
+  "notes": "Paint Booth Designer: fixed Save and Open (they were failing outright), and projects now remember each nozzle's zone and the project name. New nozzle control: double-click a nozzle to set its type, exact position and zone, duplicate nozzles, add a nozzle to a zone, or reset a zone to the auto layout. The parts list, cylinder count and PDF now follow the nozzles you actually place, with a warning if a zone has fewer than the DIOM calc requires."
 }
