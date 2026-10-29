@@ -1,5 +1,5 @@
 {
-  "version": "1.6.7",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.7/DFP_TakeoffPro_Setup_1.6.7.exe",
-  "notes": "Kitchen Suppression and Paint Booth PDF exports now carry an AS-BUILT badge in the header of every page."
+  "version": "1.6.8",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.8/DFP_TakeoffPro_Setup_1.6.8.exe",
+  "notes": "Paint Booth Designer: BOM quantities are now editable (double-click Qty), cylinder types can be changed or mixed from the BOM, and edits save with the project. Fixed tracer/ghost lines on the paint booth canvas."
 }

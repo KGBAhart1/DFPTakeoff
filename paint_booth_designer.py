@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QFileDialog, QMenu, QLineEdit, QCheckBox, QAbstractItemView,
     QSizePolicy, QAction, QToolBar, QInputDialog, QApplication,
     QGraphicsRectItem, QGraphicsEllipseItem, QGraphicsLineItem,
-    QGraphicsTextItem,
+    QGraphicsTextItem, QStyledItemDelegate,
 )
 from PyQt5.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QFontMetricsF,
@@ -1513,6 +1513,9 @@ class BoothCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setBackgroundBrush(QColor("#f5f5f5"))
         self.setMinimumSize(400, 300)
+        # FullViewportUpdate repaints the entire viewport on every change,
+        # eliminating ghost/trail artifacts when items are dragged.
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.ControlModifier:
@@ -1732,9 +1735,38 @@ class NozzleDialog(QDialog):
         n.auto = False
 
 
+class _QtySpinDelegate(QStyledItemDelegate):
+    """Spin-box editor for the BOM Qty column."""
+    def createEditor(self, parent, option, index):
+        sp = QSpinBox(parent); sp.setRange(0, 999); sp.setAlignment(Qt.AlignCenter)
+        return sp
+
+    def setEditorData(self, editor, index):
+        try:
+            editor.setValue(int(index.data() or 0))
+        except ValueError:
+            editor.setValue(0)
+
+    def setModelData(self, editor, model, index):
+        editor.interpretText()
+        model.setData(index, str(editor.value()))
+
+
 class BOMPanel(QWidget):
+    """BOM table. Quantities are calculated from the design, but the user can
+    override any Qty (double-click) and change / mix cylinder models. Edits are
+    kept as overrides on top of the calculation so they survive a refresh."""
+    edited = pyqtSignal()
+
+    _EDIT_BG = QColor("#fff3cd")
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._cyl_rows = None        # None = calculated; else [[model, qty], ...]
+        self._qty_overrides = {}     # row key -> qty
+        self._last_args = None
+        self._cur_cyl_rows = []
+        self._populating = False
         self._build()
 
     def _build(self):
@@ -1745,15 +1777,26 @@ class BOMPanel(QWidget):
         lbl.setStyleSheet(f"font-weight:bold;font-size:13px;padding:4px;color:{_PALETTE_DARK};")
         layout.addWidget(lbl)
 
+        hint = QLabel("Double-click a Qty to edit · right-click for cylinder / reset options")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size:10px;color:#777;padding:0 4px;")
+        layout.addWidget(hint)
+
         self.tbl = QTableWidget(0, 3)
         self.tbl.setHorizontalHeaderLabels(["Item", "P/N", "Qty"])
         self.tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl.setEditTriggers(QAbstractItemView.DoubleClicked |
+                                 QAbstractItemView.EditKeyPressed |
+                                 QAbstractItemView.SelectedClicked)
+        self.tbl.setItemDelegateForColumn(2, _QtySpinDelegate(self.tbl))
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setAlternatingRowColors(True)
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tbl.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tbl.customContextMenuRequested.connect(self._table_menu)
+        self.tbl.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.tbl)
 
         # Validation area
@@ -1773,9 +1816,128 @@ class BOMPanel(QWidget):
         self.summary_lbl.setStyleSheet("font-size:11px;padding:4px;background:#f0f8ff;border:1px solid #cde;border-radius:3px;")
         layout.addWidget(self.summary_lbl)
 
+    # ── Edit state (saved in .pbp) ──────────────────────────────────────────
+
+    def get_edits(self):
+        return {"cyl_rows": [list(r) for r in self._cyl_rows] if self._cyl_rows is not None else None,
+                "qty": dict(self._qty_overrides)}
+
+    def set_edits(self, d):
+        d = d or {}
+        rows = d.get("cyl_rows")
+        self._cyl_rows = [[str(m), int(q)] for m, q in rows] if rows is not None else None
+        self._qty_overrides = {k: int(v) for k, v in (d.get("qty") or {}).items()}
+
+    def clear_cylinder_edits(self):
+        self._cyl_rows = None
+
+    def has_edits(self):
+        return self._cyl_rows is not None or bool(self._qty_overrides)
+
+    def cylinder_summary(self):
+        """e.g. '2× IND-45, 1× IND-70' — what the BOM currently calls for."""
+        return ", ".join(f"{q}× {m}" for m, q in self._cur_cyl_rows if q > 0) or "—"
+
+    def _rerun(self):
+        if self._last_args is not None:
+            self.refresh(**self._last_args)
+
+    def _seed_cyl_rows(self):
+        if self._cyl_rows is None:
+            self._cyl_rows = [list(r) for r in self._cur_cyl_rows]
+
+    def _merge_cyl_rows(self):
+        merged = {}
+        for m, q in self._cyl_rows:
+            merged[m] = merged.get(m, 0) + q
+        self._cyl_rows = [[m, q] for m, q in merged.items()]
+
+    def _after_edit(self):
+        self.edited.emit()
+        QTimer.singleShot(0, self._rerun)   # don't rebuild the table mid-edit
+
+    def _on_item_changed(self, item):
+        if self._populating or item.column() != 2:
+            return
+        key_item = self.tbl.item(item.row(), 0)
+        key = key_item.data(Qt.UserRole) if key_item else None
+        if not key:
+            return
+        try:
+            val = max(0, int(item.text().strip()))
+        except ValueError:
+            self._after_edit(); return
+        if key.startswith("cyl:"):
+            self._seed_cyl_rows()
+            i = int(key[4:])
+            if i < len(self._cyl_rows):
+                self._cyl_rows[i][1] = val
+        else:
+            calc = key_item.data(Qt.UserRole + 1)
+            if calc is not None and val == calc:
+                self._qty_overrides.pop(key, None)
+            else:
+                self._qty_overrides[key] = val
+        self._after_edit()
+
+    def _on_cyl_model_changed(self, row_idx, model):
+        self._seed_cyl_rows()
+        if row_idx < len(self._cyl_rows):
+            self._cyl_rows[row_idx][0] = model
+            self._merge_cyl_rows()
+        self._after_edit()
+
+    def _table_menu(self, pos):
+        row = self.tbl.rowAt(pos.y())
+        key_item = self.tbl.item(row, 0) if row >= 0 else None
+        key = key_item.data(Qt.UserRole) if key_item else None
+
+        menu = QMenu(self)
+        add_menu = menu.addMenu("Add Cylinder Type")
+        add_acts = {add_menu.addAction(f"{c['model']} ({c['lbs']} lb)"): c["model"] for c in CYLINDERS}
+        rm_act = None
+        if key and key.startswith("cyl:"):
+            rm_act = menu.addAction("Remove This Cylinder Row")
+        menu.addSeparator()
+        reset_row = None
+        if key and (key in self._qty_overrides or (key.startswith("cyl:") and self._cyl_rows is not None)):
+            reset_row = menu.addAction("Reset Cylinders to Calculated" if key.startswith("cyl:")
+                                       else "Reset Row to Calculated")
+        reset_all = menu.addAction("Reset All BOM Edits")
+        reset_all.setEnabled(self.has_edits())
+
+        chosen = menu.exec_(self.tbl.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen in add_acts:
+            self._seed_cyl_rows()
+            self._cyl_rows.append([add_acts[chosen], 1])
+            self._merge_cyl_rows()
+        elif chosen is rm_act:
+            self._seed_cyl_rows()
+            i = int(key[4:])
+            if i < len(self._cyl_rows):
+                del self._cyl_rows[i]
+        elif chosen is reset_row:
+            if key.startswith("cyl:"):
+                self._cyl_rows = None
+            else:
+                self._qty_overrides.pop(key, None)
+        elif chosen is reset_all:
+            self._cyl_rows = None
+            self._qty_overrides.clear()
+        else:
+            return
+        self._after_edit()
+
     def refresh(self, zones: list[ZoneData], cylinder_model: str, detector_type: str,
                 num_pull_stations: int = 1, has_elec_actuator: bool = False,
                 placed_by_type=None, zone_placed=None):
+        self._last_args = dict(zones=zones, cylinder_model=cylinder_model,
+                               detector_type=detector_type,
+                               num_pull_stations=num_pull_stations,
+                               has_elec_actuator=has_elec_actuator,
+                               placed_by_type=placed_by_type, zone_placed=zone_placed)
         # Nozzle quantities follow what is actually placed on the canvas (auto-laid-out,
         # added, moved or deleted by the user). Without a scene, fall back to the DIOM calc.
         nozzles = {}
@@ -1797,34 +1959,54 @@ class BOMPanel(QWidget):
         # Cylinder selection recommendation
         # IND-21 handles up to 2 nozzles; IND-45 up to 4; IND-70 for large single-system
         # This is a simplified recommendation; exact selection requires piping balance check
-        cyls_needed = self._recommend_cylinders(zones, cylinder_model, total_nozzles)
+        calc_cyls = self._recommend_cylinders(zones, cylinder_model, total_nozzles)
+        cyl_edited = self._cyl_rows is not None
+        cyl_rows = ([list(r) for r in self._cyl_rows] if cyl_edited
+                    else [[m, q] for m, q in calc_cyls.items()])
+        self._cur_cyl_rows = cyl_rows
+        cyls_needed = {}
+        for m, q in cyl_rows:
+            if q > 0:
+                cyls_needed[m] = cyls_needed.get(m, 0) + q
+        total_cyls = sum(cyls_needed.values())
 
-        # Build BOM
+        if cyl_edited:
+            cap_total = sum(self._MAX_NOZZLES.get(m, 4) * q for m, q in cyls_needed.items())
+            if total_nozzles > cap_total:
+                all_warnings.append(f"Edited cylinders support {cap_total} nozzle(s); "
+                                    f"design has {total_nozzles}")
+
+        # Build BOM — (key, name, P/N, calculated qty)
         items = []
+        cyl_row_idx = {}
 
         # Cylinders
-        for cyl_model, qty in cyls_needed.items():
-            c = next((c for c in CYLINDERS if c["model"] == cyl_model), None)
-            if c and qty > 0:
-                items.append((f"Cylinder & Valve Assy – {c['model']} ({c['lbs']} lb ABC)", c["part"], qty))
-                items.append((f"Mounting Bracket – {c['model']}", "B486487/88/100009", qty))
-                items.append((f"Discharge Adapter Kit", "844908", qty))
-                items.append((f"System Valve Actuator (SVA)", "B120042", qty))
+        for i, (m, q) in enumerate(cyl_rows):
+            c = next((c for c in CYLINDERS if c["model"] == m), None)
+            if c:
+                cyl_row_idx[len(items)] = i
+                items.append((f"cyl:{i}", f"Cylinder & Valve Assy – {c['model']} ({c['lbs']} lb ABC)",
+                              c["part"], q))
+        for m, q in cyls_needed.items():
+            items.append((f"bracket:{m}", f"Mounting Bracket – {m}", "B486487/88/100009", q))
+        if total_cyls:
+            items.append(("adapter", "Discharge Adapter Kit", "844908", total_cyls))
+            items.append(("sva", "System Valve Actuator (SVA)", "B120042", total_cyls))
 
         # UCH and actuation
         num_systems = len(cyls_needed)
-        items.append(("Universal Control Head (UCH)", "B120099", num_systems))
-        items.append(("System Nitrogen Cartridge", "B120043", num_systems))
-        items.append(("Actuation Delay Assembly", "B100035", num_systems))
-        items.append(("High-Pressure Nitrogen Tubing", "B120045", num_systems))
+        items.append(("uch", "Universal Control Head (UCH)", "B120099", num_systems))
+        items.append(("n2", "System Nitrogen Cartridge", "B120043", num_systems))
+        items.append(("delay", "Actuation Delay Assembly", "B100035", num_systems))
+        items.append(("n2tube", "High-Pressure Nitrogen Tubing", "B120045", num_systems))
 
         # Nozzles
         for nt, qty in nozzles.items():
-            items.append((f"{NOZZLE_DESC[nt]} Nozzle ({nt})", NOZZLE_PARTS[nt], qty))
+            items.append((f"noz:{nt}", f"{NOZZLE_DESC[nt]} Nozzle ({nt})", NOZZLE_PARTS[nt], qty))
 
         # Flow restrictors — needed when nozzle count > 1 in a branch
         if total_nozzles > 1:
-            items.append(('3/4" Flow Restrictor', "B100050", total_nozzles))
+            items.append(("restrictor", '3/4" Flow Restrictor', "B100050", total_nozzles))
 
         # Detection
         if detector_type:
@@ -1832,24 +2014,54 @@ class BOMPanel(QWidget):
             work_nozzles = nozzles.get(NOZZLE_TF, 0)
             duct_nozzles = nozzles.get(NOZZLE_DP, 0)
             det_qty = work_nozzles + duct_nozzles + 1  # +1 for UCH
-            items.append((detector_type, self._det_part(detector_type), det_qty))
-            items.append(("Universal-Link Housing Kit", "B120064", det_qty))
+            items.append(("detector", detector_type, self._det_part(detector_type), det_qty))
+            items.append(("link_housing", "Universal-Link Housing Kit", "B120064", det_qty))
 
         # Accessories
-        items.append(("Remote Manual Release Pull Station", "87-120110-001", max(1, num_pull_stations)))
-        items.append(('Microswitch Kit (for shutdowns)', "B120039", 2))
-        items.append(('1/16" Control Cable (500 ft roll)', "219649", 1))
+        items.append(("pull", "Remote Manual Release Pull Station", "87-120110-001", max(1, num_pull_stations)))
+        items.append(("microswitch", 'Microswitch Kit (for shutdowns)', "B120039", 2))
+        items.append(("cable", '1/16" Control Cable (500 ft roll)', "219649", 1))
         if has_elec_actuator:
-            items.append(("Electrical Actuator", "B100034", num_systems))
+            items.append(("elec_act", "Electrical Actuator", "B100034", num_systems))
 
         # Populate table
+        self._populating = True
         self.tbl.setRowCount(0)
-        for name, pn, qty in items:
+        bold = QFont(); bold.setBold(True)
+        for idx, (key, name, pn, calc) in enumerate(items):
             r = self.tbl.rowCount(); self.tbl.insertRow(r)
-            self.tbl.setItem(r, 0, QTableWidgetItem(name))
-            self.tbl.setItem(r, 1, QTableWidgetItem(pn))
+            is_cyl = key.startswith("cyl:")
+            edited = cyl_edited if is_cyl else key in self._qty_overrides
+            qty = self._qty_overrides[key] if (edited and not is_cyl) else calc
+
+            ni = QTableWidgetItem(name)
+            ni.setFlags(ni.flags() & ~Qt.ItemIsEditable)
+            ni.setData(Qt.UserRole, key)
+            ni.setData(Qt.UserRole + 1, calc)
+            self.tbl.setItem(r, 0, ni)
+            pi = QTableWidgetItem(pn)
+            pi.setFlags(pi.flags() & ~Qt.ItemIsEditable)
+            self.tbl.setItem(r, 1, pi)
             qi = QTableWidgetItem(str(qty)); qi.setTextAlignment(Qt.AlignCenter)
+            if edited:
+                qi.setBackground(self._EDIT_BG); qi.setFont(bold)
+                if is_cyl:
+                    qi.setToolTip("Edited cylinders — right-click to reset to calculated")
+                else:
+                    qi.setToolTip(f"Edited — calculated qty is {calc}")
             self.tbl.setItem(r, 2, qi)
+
+            if is_cyl:
+                ci = cyl_row_idx[idx]
+                cb = QComboBox()
+                for c in CYLINDERS:
+                    cb.addItem(f"Cylinder & Valve Assy – {c['model']} ({c['lbs']} lb ABC)", c["model"])
+                cb.setCurrentIndex(max(0, cb.findData(cyl_rows[ci][0])))
+                cb.setToolTip("Change cylinder type")
+                cb.currentIndexChanged.connect(
+                    lambda _i, cb=cb, ci=ci: self._on_cyl_model_changed(ci, cb.currentData()))
+                self.tbl.setCellWidget(r, 0, cb)
+        self._populating = False
 
         # Warnings
         if all_warnings:
@@ -1860,9 +2072,12 @@ class BOMPanel(QWidget):
         # Summary
         cyl_summary = ", ".join(f"{qty}× {m}" for m, qty in cyls_needed.items())
         noz_summary = ", ".join(f"{qty}× {t}" for t, qty in nozzles.items())
-        cap = self._MAX_NOZZLES.get(cylinder_model, 4)
+        if cyl_edited:
+            cap_txt = "edited"
+        else:
+            cap_txt = f"{self._MAX_NOZZLES.get(cylinder_model, 4)} nozzles/cylinder max"
         self.summary_lbl.setText(
-            f"<b>Cylinders:</b> {cyl_summary or '—'} ({cap} nozzles/cylinder max)<br>"
+            f"<b>Cylinders:</b> {cyl_summary or '—'} ({cap_txt})<br>"
             f"<b>Nozzles:</b> {noz_summary or '—'}<br>"
             f"<b>Total Nozzles:</b> {total_nozzles}"
         )
@@ -2102,7 +2317,7 @@ class PaintBoothDesigner(QDialog):
         for c in CYLINDERS:
             self.cyl_combo.addItem(f"{c['model']}  ({c['lbs']} lb)", c["model"])
         self.cyl_combo.setCurrentText("IND-45  (45 lb)")
-        self.cyl_combo.currentIndexChanged.connect(self._refresh_bom)
+        self.cyl_combo.currentIndexChanged.connect(self._on_cyl_combo_changed)
         form.addRow("Cylinder Model:", self.cyl_combo)
 
         self.det_combo = QComboBox(); self.det_combo.addItems(DETECTOR_TYPES)
@@ -2196,6 +2411,11 @@ class PaintBoothDesigner(QDialog):
             self._canvas.fit()
             self._refresh_bom()
 
+    def _on_cyl_combo_changed(self):
+        # Picking a model here is an explicit choice: drop any cylinder edits made in the BOM
+        self._bom.clear_cylinder_edits()
+        self._refresh_bom()
+
     def _refresh_bom(self):
         zones = self._scene.all_zones()
         cyl   = self.cyl_combo.currentData() or "IND-45"
@@ -2252,6 +2472,7 @@ class PaintBoothDesigner(QDialog):
             "pull_stations":self.sp_pull.value(),
             "elec_actuator":self.chk_elec.isChecked(),
             "coverage_on":  self._cov_action.isChecked(),
+            "bom_edits":    self._bom.get_edits(),
             "zones":        [z.to_dict() for z in self._scene.all_zones()],
             "nozzles":      [{"type": n.nozzle_type, "x": n.pos().x(), "y": n.pos().y(),
                                "cov": n.coverage_visible, "zone_uid": n.zone_uid, "auto": n.auto}
@@ -2349,6 +2570,7 @@ class PaintBoothDesigner(QDialog):
         self._scene.set_coverage_visible(cov)
         self._cov_action.setText("Coverage: ON" if cov else "Coverage: OFF")
 
+        self._bom.set_edits(data.get("bom_edits"))
         self._apply_booth_dims()
         self._refresh_bom()
 
@@ -2408,7 +2630,7 @@ class PaintBoothDesigner(QDialog):
         notes    = (meta.get("notes", "") or "").strip()
 
         zones    = self._scene.all_zones()
-        cyl_text = self.cyl_combo.currentText()
+        cyl_text = self._bom.cylinder_summary()
         det_text = self.det_combo.currentText()
         booth_L  = self.sp_booth_L.value()
         booth_W  = self.sp_booth_W.value()
