@@ -1,5 +1,5 @@
 {
-  "version": "1.6.8",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.8/DFP_TakeoffPro_Setup_1.6.8.exe",
-  "notes": "Paint Booth Designer: BOM quantities are now editable (double-click Qty), cylinder types can be changed or mixed from the BOM, and edits save with the project. Fixed tracer/ghost lines on the paint booth canvas."
+  "version": "1.6.9",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.9/DFP_TakeoffPro_Setup_1.6.9.exe",
+  "notes": "Library backup: devices, assemblies, labour units and cut sheets are now saved to OneDrive (DFP TakeoffPro Library) automatically and restored on a fresh install. New Library menu: back up now, recover devices from an old database, restore, and check for missing cut sheets."
 }
