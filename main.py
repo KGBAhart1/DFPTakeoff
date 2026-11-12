@@ -18,6 +18,7 @@ from PyQt5.QtGui  import QPixmap, QImage, QPainter, QPen, QColor, QFont, QKeySeq
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, QThread, pyqtSignal, QTimer
 
 import db, excel_export, estimator
+import library_vault
 
 MARK_COLORS = [
     "#e74c3c","#2980b9","#27ae60","#8e44ad","#e67e22",
@@ -1478,11 +1479,13 @@ class ProductDialog(QDialog):
 
     def _browse(self):
         p,_ = QFileDialog.getOpenFileName(self,"Select Shop Drawing","","Documents (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
-        if p: self.drawing_edit.setText(p)
+        # Copy into the OneDrive library vault so the cut sheet survives resets
+        if p: self.drawing_edit.setText(library_vault.import_attachment(p))
 
     def _browse_img(self):
         p,_ = QFileDialog.getOpenFileName(self,"Select Product Image","","Images (*.png *.jpg *.jpeg *.bmp *.gif)")
         if p:
+            p = library_vault.import_attachment(p)
             self.img_edit.setText(p)
             self._set_img_preview(p)
 
@@ -2986,9 +2989,24 @@ class MainWindow(QMainWindow):
         self._last_field_line_width = 2.0
         self._snip_windows = {}   # {snip_id: SnipWindow} — only currently-open ones
         self._snip_toggle_actions = {}   # {snip_id: QAction} — dynamic Snips ▾ menu entries
+        # Fresh install / laptop reset → bring back devices, cut sheets and jobs
+        # from the OneDrive library vault before the empty DB gets initialised.
+        restore_msg = library_vault.restore_on_startup(db.DB_PATH)
         db.init_db()
+        if restore_msg == "__RESTORE_JSON_AFTER_INIT__":
+            try:
+                restore_msg = library_vault.restore_library_json(db.DB_PATH)
+            except Exception as e:
+                restore_msg = f"Automatic library restore failed: {e}"
         self._build_ui()
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
+        if restore_msg:
+            QTimer.singleShot(500, lambda: QMessageBox.information(self, "Library Restored", restore_msg))
+        # Keep the OneDrive vault up to date: now, every 5 minutes, and on close.
+        self.statusBar().showMessage(library_vault.backup(db.DB_PATH), 6000)
+        self._vault_timer = QTimer(self)
+        self._vault_timer.timeout.connect(lambda: library_vault.backup(db.DB_PATH))
+        self._vault_timer.start(5 * 60 * 1000)
 
     def _build_ui(self):
         splitter = QSplitter(Qt.Horizontal)
@@ -3119,6 +3137,27 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._open_programming)
         self._quotes_btn.setMenu(self._quotes_menu)
         tb.addWidget(self._quotes_btn)
+
+        # ── Library backup (OneDrive vault) ───────────────────────────────
+        tb.addSeparator()
+        self._vault_btn = HoverMenuButton("Library ▾")
+        self._vault_menu = QMenu(self._vault_btn); self._vault_menu.setStyleSheet(MENU_STYLE)
+        a = self._vault_menu.addAction("Back Up Library Now")
+        a.setToolTip("Save devices, assemblies, labour units, cut sheets and jobs to OneDrive")
+        a.triggered.connect(self._vault_backup_now)
+        a = self._vault_menu.addAction("Recover Devices from Old Database…")
+        a.setToolTip("Add devices/assemblies from an old takeoff.db or backup snapshot "
+                     "(nothing you have now is changed or deleted)")
+        a.triggered.connect(self._vault_merge_db)
+        a = self._vault_menu.addAction("Restore Library from Backup…")
+        a.setToolTip("Replace the device library with the saved library.json")
+        a.triggered.connect(self._vault_restore_json)
+        a = self._vault_menu.addAction("Check for Missing Cut Sheets")
+        a.triggered.connect(self._vault_check_missing)
+        a = self._vault_menu.addAction("Open Library Backup Folder")
+        a.triggered.connect(lambda: os.startfile(library_vault.vault_dir()))
+        self._vault_btn.setMenu(self._vault_menu)
+        tb.addWidget(self._vault_btn)
 
         # ── Design Mode ────────────────────────────────────────────────────
         tb.addSeparator()
@@ -4157,9 +4196,68 @@ class MainWindow(QMainWindow):
                     self.setWindowTitle(f"DFP TakeoffPro    {p['name']}"); return
         self.setWindowTitle("DFP TakeoffPro")
 
+    # ── Library vault actions ────────────────────────────────────────────────
+
+    def _vault_backup_now(self):
+        msg = library_vault.backup(db.DB_PATH, force=True)
+        self.library_panel.refresh()
+        QMessageBox.information(self, "Library Backup", msg)
+
+    def _vault_merge_db(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select an old takeoff database", library_vault.vault_dir(),
+            "Takeoff database (*.db)")
+        if not path:
+            return
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(db.DB_PATH)):
+            QMessageBox.warning(self, "Recover Devices", "That is the database you're using now.")
+            return
+        try:
+            msg = library_vault.merge_from_database(db.DB_PATH, path)
+        except Exception as e:
+            QMessageBox.critical(self, "Recover Devices", f"Could not read that database:\n{e}")
+            return
+        library_vault.backup(db.DB_PATH, force=True)
+        self.library_panel.refresh()
+        QMessageBox.information(self, "Recover Devices", msg)
+
+    def _vault_restore_json(self):
+        default = os.path.join(library_vault.vault_dir(), "library.json")
+        path, _ = QFileDialog.getOpenFileName(self, "Select library backup", default, "Library backup (*.json)")
+        if not path:
+            return
+        if QMessageBox.question(
+                self, "Restore Library",
+                "This REPLACES your current devices, assemblies and labour units with the backup.\n"
+                "Jobs are not touched. To add devices without replacing, use "
+                "'Recover Devices from Old Database' instead.\n\nContinue?") != QMessageBox.Yes:
+            return
+        try:
+            msg = library_vault.restore_library_json(db.DB_PATH, path)
+        except Exception as e:
+            QMessageBox.critical(self, "Restore Library", f"Restore failed:\n{e}")
+            return
+        self.library_panel.refresh()
+        QMessageBox.information(self, "Restore Library", msg)
+
+    def _vault_check_missing(self):
+        library_vault.relink_all(db.DB_PATH)
+        missing = library_vault.missing_attachments(db.DB_PATH)
+        if not missing:
+            QMessageBox.information(self, "Cut Sheets", "All cut sheets and images are present and backed up.")
+            return
+        lines = "\n".join(f"• {name}:  {os.path.basename(p)}" for name, p in missing[:40])
+        more = f"\n…and {len(missing) - 40} more" if len(missing) > 40 else ""
+        QMessageBox.warning(
+            self, "Missing Cut Sheets",
+            f"{len(missing)} cut sheet/image file(s) can't be found:\n\n{lines}{more}\n\n"
+            f"Drop the files into:\n{os.path.join(library_vault.vault_dir(), 'cutsheets')}\n"
+            "and run this check again — they'll relink automatically by file name.")
+
     def closeEvent(self, event):
         for win in list(self._snip_windows.values()):
             win.close()
+        library_vault.backup(db.DB_PATH)
         super().closeEvent(event)
 
 
