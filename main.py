@@ -32,6 +32,18 @@ CATEGORIES = [
 
 CANDELA_OPTIONS = [15, 30, 75, 110, 135, 177, 185]
 
+# Product ids that are notification appliances (horns, strobes, speakers…).
+# Only these have a candela rating — detectors, pull stations, modules and
+# assemblies never do. Refreshed whenever the library panel reloads.
+_NOTIF_IDS = set()
+
+def refresh_notification_ids():
+    global _NOTIF_IDS
+    _NOTIF_IDS = db.notification_product_ids()
+
+def has_candela(entity_type, entity_id):
+    return entity_type == "product" and entity_id in _NOTIF_IDS
+
 # ── Coverage rules: ULC S524 + National Fire Code of Canada (NFC overrides S524) ──
 # Radii = √(max_area / π).  NFC 2010 Table 2.5.4.1 / ULC S524 Cl. 6.5 & 6.7.
 COVERAGE_RADII_M = {
@@ -559,7 +571,7 @@ class PdfCanvas(QLabel):
             if m["label"]:
                 painter.setPen(QPen(QColor("#ffffff")))
                 painter.drawText(cx-R, cy-R, R*2, R*2, Qt.AlignCenter, m["label"])
-            candela = m.get("candela", 0)
+            candela = m.get("candela", 0) if has_candela(m["entity_type"], m["entity_id"]) else 0
             if candela:
                 cd_font = QFont("Arial", max(6, R - 5), QFont.Bold)
                 painter.setFont(cd_font)
@@ -1187,9 +1199,12 @@ class PdfCanvas(QLabel):
         run  = self._find_nearest_run(pos)
         note = self._find_nearest_field_note(pos)
         line = self._find_nearest_field_line(pos)
-        cd = mark.get("candela", 0) if mark else 0
+        # Candela only exists on notification appliances — no option at all
+        # for detectors, pull stations, modules or assemblies.
+        mark_has_cd = bool(mark) and has_candela(mark["entity_type"], mark["entity_id"])
+        cd = mark.get("candela", 0) if mark_has_cd else 0
         candela_label = f"Set Candela…  ({cd:g} cd)" if cd else "Set Candela…"
-        candela_act  = menu.addAction(candela_label) if mark else None
+        candela_act  = menu.addAction(candela_label) if mark_has_cd else None
         del_mark_act = menu.addAction(f"Delete mark  ({mark['label']})") if mark else None
         del_run_act  = menu.addAction(f"Delete run  ({run.get('footage', 0):.1f} ft)") if run else None
         edit_note_act = menu.addAction(f"Edit note…  ({note['text'][:20]})") if note else None
@@ -1370,6 +1385,16 @@ class ProductDialog(QDialog):
             "For strobes/horn strobes — just a default that pre-fills when you place\n"
             "a new one on the print. Each placed device's candela is independent and\n"
             "can be changed on its own afterward (right-click the mark -> Set Candela…).")
+        # Only notification appliances have a candela. For new products the
+        # box follows the name/category as you type until you tick/untick it.
+        self.notif_check = QCheckBox("Notification appliance (horn / strobe / speaker) — has a candela rating")
+        self._notif_touched = False
+        self.notif_check.clicked.connect(lambda: setattr(self, "_notif_touched", True))
+        self.notif_check.toggled.connect(self._on_notif_toggled)
+        for sig in (self.name_edit.textChanged, self.cat_combo.currentTextChanged,
+                    self.subcat_combo.currentTextChanged):
+            sig.connect(self._auto_notif)
+        self._auto_notif()
         dr = QHBoxLayout()
         self.drawing_edit = QLineEdit(); self.drawing_edit.setPlaceholderText("No drawing attached"); self.drawing_edit.setReadOnly(True)
         browse = QPushButton("Browse"); browse.setFixedWidth(72); browse.clicked.connect(self._browse)
@@ -1411,6 +1436,7 @@ class ProductDialog(QDialog):
         layout.addRow("Unit Cost",       self.cost_spin)
         layout.addRow("Category",        self.cat_combo)
         layout.addRow("Subcategory",     self.subcat_combo)
+        layout.addRow("",                self.notif_check)
         layout.addRow("Default Candela", self.candela_combo)
 
         lu_sep = QFrame(); lu_sep.setFrameShape(QFrame.HLine); layout.addRow(lu_sep)
@@ -1477,6 +1503,20 @@ class ProductDialog(QDialog):
         val = self.lu_combo.currentData()
         self._lu_custom_widget.setVisible(val == -1)
 
+    def _auto_notif(self, *_):
+        if self._notif_touched:
+            return
+        self.notif_check.setChecked(db.guess_is_notification(
+            self.name_edit.text(), self.cat_combo.currentText(), self.subcat_combo.currentText()))
+        self._on_notif_toggled(self.notif_check.isChecked())
+
+    def _on_notif_toggled(self, on):
+        self.candela_combo.setEnabled(on)
+        if not on:
+            self.candela_combo.setCurrentIndex(0)          # N/A
+        elif not self.candela_combo.currentData():
+            self.candela_combo.setCurrentIndex(self.candela_combo.findData(15))
+
     def _browse(self):
         p,_ = QFileDialog.getOpenFileName(self,"Select Shop Drawing","","Documents (*.pdf *.png *.jpg *.jpeg *.tif *.tiff *.bmp)")
         # Copy into the OneDrive library vault so the cut sheet survives resets
@@ -1502,6 +1542,14 @@ class ProductDialog(QDialog):
             self.img_preview.clear()
 
     def _load(self, p):
+        # Existing product: its saved notification setting wins over guessing.
+        notif = p["is_notification"] if "is_notification" in p.keys() else None
+        if notif is None:
+            notif = db.guess_is_notification(p["name"], p["category"] or "",
+                                             (p["subcategory"] if "subcategory" in p.keys() else "") or "")
+        self._notif_touched = True
+        self.notif_check.setChecked(bool(notif))
+        self._on_notif_toggled(bool(notif))
         self.name_edit.setText(p["name"]); self.code_edit.setText(p["code"] or "")
         self.cost_spin.setValue(p["unit_cost"] or 0.0)
         self.drawing_edit.setText(p["shop_drawing_path"] or "")
@@ -1559,7 +1607,8 @@ class ProductDialog(QDialog):
             unit_cost=self.cost_spin.value(),
             category=self.cat_combo.currentText().strip() or "General",
             subcategory=self.subcat_combo.currentText().strip(),
-            candela=self.candela_combo.currentData(),
+            is_notification=self.notif_check.isChecked(),
+            candela=self.candela_combo.currentData() if self.notif_check.isChecked() else 0,
             shop_drawing_path=self.drawing_edit.text().strip(),
             image_path=self.img_edit.text().strip(),
             coverage_type="" if raw_ctype == "(auto-detect)" else raw_ctype,
@@ -2025,6 +2074,7 @@ class LibraryPanel(QWidget):
         layout.addWidget(btns); return w
 
     def refresh(self):
+        refresh_notification_ids()
         self._all_products = list(db.get_products())
         self._filter(self.prod_search.text() if hasattr(self,"prod_search") else "")
         self.asm_list.clear()
@@ -2137,7 +2187,8 @@ class LibraryPanel(QWidget):
                            d.get("shop_drawing_path", ""), d.get("image_path", ""),
                            d.get("coverage_type", ""), d.get("coverage_radius_m", 0.0),
                            d.get("lu_reg", 0.0), d.get("lu_diff", 0.0), d.get("lu_hard", 0.0),
-                           d.get("lu_id"), d.get("subcategory", ""), d.get("candela", 0.0))
+                           d.get("lu_id"), d.get("subcategory", ""), d.get("candela", 0.0),
+                           is_notification=d.get("is_notification"))
             self.refresh()
 
     def _edit_prod(self):
@@ -2150,7 +2201,8 @@ class LibraryPanel(QWidget):
                               d.get("shop_drawing_path", ""), d.get("image_path", ""),
                               d.get("coverage_type", ""), d.get("coverage_radius_m", 0.0),
                               d.get("lu_reg", 0.0), d.get("lu_diff", 0.0), d.get("lu_hard", 0.0),
-                              d.get("lu_id"), d.get("subcategory", ""), d.get("candela", 0.0))
+                              d.get("lu_id"), d.get("subcategory", ""), d.get("candela", 0.0),
+                           is_notification=d.get("is_notification"))
             self.refresh()
 
     def _del_prod(self):
@@ -3681,8 +3733,69 @@ class MainWindow(QMainWindow):
 
     def _load_pdf(self):
         if not self._project_id: QMessageBox.warning(self,"No Project","Open or create a project first."); return
-        path,_ = QFileDialog.getOpenFileName(self,"Open PDF","","PDF Files (*.pdf)")
-        if path: self._open_pdf(path); db.update_project_pdf(self._project_id,path)
+        start_dir = os.path.dirname(self._pdf_path) if self._pdf_path else ""
+        box = QMessageBox(self)
+        box.setWindowTitle("Load Prints")
+        box.setText("Are the prints in one PDF, or several PDFs in a folder?")
+        box.setInformativeText("Pick the folder and every PDF in it is merged into one "
+                               "file so you can work on the whole set at once.")
+        folder_btn = box.addButton("Folder of Prints…", QMessageBox.AcceptRole)
+        single_btn = box.addButton("Single PDF…", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(folder_btn)
+        box.exec_()
+        if box.clickedButton() is folder_btn:
+            self._load_print_folder(start_dir)
+        elif box.clickedButton() is single_btn:
+            path,_ = QFileDialog.getOpenFileName(self,"Open PDF",start_dir,"PDF Files (*.pdf)")
+            if path: self._open_pdf(path); db.update_project_pdf(self._project_id,path)
+
+    def _load_print_folder(self, start_dir=""):
+        """Merge every PDF in a folder into one combined print set and open it."""
+        import print_set
+        folder = QFileDialog.getExistingDirectory(self, "Select the folder that holds all the prints", start_dir)
+        if not folder:
+            return
+        files = print_set.find_prints(folder)
+        if not files:
+            QMessageBox.warning(self, "No PDFs", "That folder has no PDF files in it.")
+            return
+        if len(files) > 1:
+            dlg = print_set.PrintSetDialog(files, self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            files = dlg.selected_files()
+            if not files:
+                return
+        if len(files) == 1:
+            # Nothing to merge — just open it.
+            self._open_pdf(files[0]); db.update_project_pdf(self._project_id, files[0])
+            return
+        project_name = next((p["name"] for p in db.get_projects() if p["id"] == self._project_id), "Project")
+        pid = self._project_id
+        def in_use(path):
+            return bool(db.get_marks(pid, path) or db.get_linear_runs(pid, path)
+                        or db.get_field_notes(pid, path) or db.get_field_lines(pid, path))
+        out_path = print_set.combined_path(folder, project_name, in_use)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            labels, skipped = print_set.merge_prints(files, out_path)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Combine Prints", f"Could not combine the prints:\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+        for idx, label in labels.items():
+            db.set_page_label(pid, out_path, idx, label)
+        db.update_project_pdf(pid, out_path)
+        self._open_pdf(out_path)
+        used = len(files) - len(skipped)
+        self.statusBar().showMessage(
+            f"Combined {used} PDFs ({len(labels)} pages) into {os.path.basename(out_path)}", 8000)
+        if skipped:
+            QMessageBox.warning(self, "Some Prints Skipped",
+                "These files couldn't be added:\n\n" +
+                "\n".join(f"• {os.path.basename(f)} — {why}" for f, why in skipped))
 
     def _manage_pages(self):
         if not self._doc:
@@ -3871,11 +3984,15 @@ class MainWindow(QMainWindow):
         # switch it, count the next batch — instead of right-clicking each
         # device individually. Leave it at N/A to fall back to whatever
         # each product's own Default Candela is (previous behavior).
+        # Non-notification devices (detectors, pull stations, assemblies…)
+        # never get a candela, whatever the toolbar selector says.
         active_candela = self._active_candela_combo.currentData()
-        if active_candela:
+        if not has_candela(etype, eid):
+            candela = 0.0
+        elif active_candela:
             candela = float(active_candela)
         else:
-            candela = (entity.get("candela", 0) or 0.0) if etype == "product" else 0.0
+            candela = entity.get("candela", 0) or 0.0
 
         db_id = db.add_mark(self._project_id, self._pdf_path, self._page_index,
                             page_pt.x(), page_pt.y(), etype, eid, color, label, section_id, candela)

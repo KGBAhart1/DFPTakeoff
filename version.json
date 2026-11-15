@@ -1,5 +1,5 @@
 {
-  "version": "1.6.9",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.6.9/DFP_TakeoffPro_Setup_1.6.9.exe",
-  "notes": "Library backup: devices, assemblies, labour units and cut sheets are now saved to OneDrive (DFP TakeoffPro Library) automatically and restored on a fresh install. New Library menu: back up now, recover devices from an old database, restore, and check for missing cut sheets."
+  "version": "1.7.0",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.0/DFP_TakeoffPro_Setup_1.7.0.exe",
+  "notes": "Load Prints: pick the folder that holds all the print PDFs and they're combined into one file so the whole set can be worked on at once. Candela: only notification appliances (horns, strobes, speakers) carry a candela rating now; detectors, pull stations and modules no longer get one."
 }

@@ -144,6 +144,10 @@ def init_db():
     _safe_alter("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
     _safe_alter("ALTER TABLE products ADD COLUMN candela REAL DEFAULT 0")   # default candela suggested for new placements
     _safe_alter("ALTER TABLE marks ADD COLUMN candela REAL DEFAULT 0")     # actual per-placed-device candela — editable independently on each plot
+    # Only notification appliances (horns, strobes, speakers…) have a candela.
+    # NULL = not decided yet → classified once from name/category below.
+    _safe_alter("ALTER TABLE products ADD COLUMN is_notification INTEGER DEFAULT NULL")
+    _classify_unset_notification()
     _seed_labour_units()
     _safe_alter("ALTER TABLE takeoff_items ADD COLUMN section_id INTEGER DEFAULT NULL")
     _safe_alter("ALTER TABLE takeoff_items ADD COLUMN notes TEXT DEFAULT ''")
@@ -261,6 +265,49 @@ def init_db():
         conn.commit()
 
 
+_NOTIFICATION_WORDS = (
+    "horn", "strobe", "speaker", "bell", "chime", "siren", "beacon", "sounder",
+    "notification", "notifier appliance", "audible", "visual", "audio/visual",
+    "a/v", "h/s", "s/v", "spk", "nac appliance",
+)
+_NOT_NOTIFICATION_WORDS = (
+    "detector", "smoke", "heat", "pull", "manual station", "module", "panel",
+    "facp", "annunciator", "power supply", "booster", "relay", "switch",
+    "duct", "base", "wire", "conduit", "cable",
+)
+
+
+def guess_is_notification(name="", category="", subcategory=""):
+    """Best guess from the name/category whether a device is a notification
+    appliance (and so has a candela rating). The user can override it per
+    device in the product dialog."""
+    text = f" {name} {category} {subcategory} ".lower()
+    if any(w in text for w in _NOTIFICATION_WORDS):
+        # "Strobe power supply", "speaker module", "NAC booster" etc. aren't appliances
+        name_l = f" {name} ".lower()
+        if any(w in name_l for w in _NOT_NOTIFICATION_WORDS):
+            return False
+        return True
+    return False
+
+
+def _classify_unset_notification():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, category, subcategory FROM products WHERE is_notification IS NULL"
+        ).fetchall()
+        for r in rows:
+            conn.execute("UPDATE products SET is_notification=? WHERE id=?",
+                         (int(guess_is_notification(r["name"], r["category"], r["subcategory"] or "")), r["id"]))
+        conn.commit()
+
+
+def notification_product_ids():
+    """Set of product ids that are notification appliances (have candela)."""
+    with get_conn() as conn:
+        return {r[0] for r in conn.execute("SELECT id FROM products WHERE is_notification=1")}
+
+
 def _safe_alter(sql):
     try:
         with get_conn() as conn:
@@ -313,15 +360,21 @@ def add_product(name, code="", unit_cost=0.0, category="General",
                 shop_drawing_path="", image_path="",
                 coverage_type="", coverage_radius_m=0.0,
                 lu_reg=0.0, lu_diff=0.0, lu_hard=0.0, lu_id=None,
-                subcategory="", candela=0.0):
+                subcategory="", candela=0.0, is_notification=None):
+    if is_notification is None:
+        is_notification = guess_is_notification(name, category, subcategory)
+    if not is_notification:
+        candela = 0.0
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO products "
             "(name, code, unit_cost, category, shop_drawing_path, image_path, "
-            " coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela,"
+            " is_notification)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, code, unit_cost, category, shop_drawing_path, image_path,
-             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela),
+             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela,
+             int(bool(is_notification))),
         )
         conn.commit()
 
@@ -330,15 +383,20 @@ def update_product(pid, name, code, unit_cost, category,
                    shop_drawing_path="", image_path="",
                    coverage_type="", coverage_radius_m=0.0,
                    lu_reg=0.0, lu_diff=0.0, lu_hard=0.0, lu_id=None,
-                   subcategory="", candela=0.0):
+                   subcategory="", candela=0.0, is_notification=None):
+    if is_notification is None:
+        is_notification = guess_is_notification(name, category, subcategory)
+    if not is_notification:
+        candela = 0.0
     with get_conn() as conn:
         conn.execute(
             "UPDATE products SET name=?,code=?,unit_cost=?,category=?,"
             "shop_drawing_path=?,image_path=?,"
             "coverage_type=?,coverage_radius_m=?,"
-            "lu_reg=?,lu_diff=?,lu_hard=?,lu_id=?,subcategory=?,candela=? WHERE id=?",
+            "lu_reg=?,lu_diff=?,lu_hard=?,lu_id=?,subcategory=?,candela=?,is_notification=? WHERE id=?",
             (name, code, unit_cost, category, shop_drawing_path, image_path,
-             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela, pid),
+             coverage_type, coverage_radius_m, lu_reg, lu_diff, lu_hard, lu_id, subcategory, candela,
+             int(bool(is_notification)), pid),
         )
         conn.commit()
 
@@ -653,19 +711,23 @@ def get_candela_breakdown(project_id, section_ids=None):
     section_ids to scope to just those sections instead of the whole
     project — unassigned (no-section) marks are excluded once a section
     filter is applied, matching how the rest of the export is scoped."""
+    # Only notification appliances count — a stray candela left on a detector,
+    # pull station or assembly mark is ignored.
+    notif = ("entity_type='product' AND entity_id IN "
+             "(SELECT id FROM products WHERE is_notification=1)")
     with get_conn() as conn:
         if section_ids:
             placeholders = ",".join("?" * len(section_ids))
             rows = conn.execute(
                 f"SELECT candela, COUNT(*) as cnt FROM marks "
-                f"WHERE project_id=? AND candela > 0 AND section_id IN ({placeholders}) "
+                f"WHERE project_id=? AND candela > 0 AND {notif} AND section_id IN ({placeholders}) "
                 f"GROUP BY candela ORDER BY candela",
                 (project_id, *section_ids),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT candela, COUNT(*) as cnt FROM marks "
-                "WHERE project_id=? AND candela > 0 GROUP BY candela ORDER BY candela",
+                f"SELECT candela, COUNT(*) as cnt FROM marks "
+                f"WHERE project_id=? AND candela > 0 AND {notif} GROUP BY candela ORDER BY candela",
                 (project_id,),
             ).fetchall()
         return {r["candela"]: r["cnt"] for r in rows}
@@ -687,6 +749,7 @@ def get_candela_breakdown_by_section(project_id, section_ids=None):
             LEFT JOIN sections s ON m.section_id = s.id
             LEFT JOIN products p ON m.entity_type='product' AND m.entity_id = p.id
             WHERE m.project_id=? AND m.candela > 0
+              AND m.entity_type='product' AND p.is_notification=1
         """
         params = [project_id]
         if section_ids:
