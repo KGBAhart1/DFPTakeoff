@@ -147,6 +147,7 @@ def init_db():
     # Only notification appliances (horns, strobes, speakers…) have a candela.
     # NULL = not decided yet → classified once from name/category below.
     _safe_alter("ALTER TABLE products ADD COLUMN is_notification INTEGER DEFAULT NULL")
+    _safe_alter("ALTER TABLE sections ADD COLUMN multiplier INTEGER DEFAULT 1")
     _classify_unset_notification()
     _seed_labour_units()
     _safe_alter("ALTER TABLE takeoff_items ADD COLUMN section_id INTEGER DEFAULT NULL")
@@ -539,13 +540,37 @@ def get_sections(project_id):
         ).fetchall()
 
 
-def add_section(project_id, name):
+def add_section(project_id, name, multiplier=1):
+    """multiplier > 1 makes this a 'typical' — e.g. one typical suite layout
+    counted once, that occurs 24 times in the building. Everything counted in
+    the section (devices, assemblies, wire runs) is multiplied in the totals."""
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO sections (project_id, name) VALUES (?,?)", (project_id, name)
+            "INSERT INTO sections (project_id, name, multiplier) VALUES (?,?,?)",
+            (project_id, name, max(1, int(multiplier or 1)))
         )
         conn.commit()
         return cur.lastrowid
+
+
+def set_section_multiplier(section_id, multiplier):
+    with get_conn() as conn:
+        conn.execute("UPDATE sections SET multiplier=? WHERE id=?",
+                     (max(1, int(multiplier or 1)), section_id))
+        conn.commit()
+
+
+def get_section_multipliers(project_id):
+    """{section_id: multiplier} for sections that are typicals (multiplier > 1)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, multiplier FROM sections WHERE project_id=? AND multiplier > 1",
+            (project_id,)).fetchall()
+        return {r["id"]: r["multiplier"] for r in rows}
+
+
+# SQL fragment: how many times a row in section alias `s` occurs in the building.
+_MULT = "COALESCE(s.multiplier, 1)"
 
 
 def rename_section(section_id, name):
@@ -558,6 +583,7 @@ def delete_section(section_id):
     with get_conn() as conn:
         conn.execute("UPDATE marks SET section_id=NULL WHERE section_id=?", (section_id,))
         conn.execute("UPDATE takeoff_items SET section_id=NULL WHERE section_id=?", (section_id,))
+        conn.execute("UPDATE linear_runs SET section_id=NULL WHERE section_id=?", (section_id,))
         conn.execute("DELETE FROM sections WHERE id=?", (section_id,))
         conn.commit()
 
@@ -597,9 +623,11 @@ def get_all_takeoff_items(project_id, section_ids=None):
             return conn.execute(f"""
                 SELECT p.id as product_id, p.name, p.code, p.unit_cost, p.category,
                        p.shop_drawing_path,
-                       SUM(ti.count) as count
+                       SUM(ti.count * COALESCE(s.multiplier, 1)) as count,
+                       SUM(ti.count) as raw_count
                 FROM takeoff_items ti
                 JOIN products p ON ti.product_id = p.id
+                LEFT JOIN sections s ON ti.section_id = s.id
                 WHERE ti.project_id=? AND ti.section_id IN ({placeholders})
                 GROUP BY p.id
                 ORDER BY p.category, p.name
@@ -607,9 +635,11 @@ def get_all_takeoff_items(project_id, section_ids=None):
         return conn.execute("""
             SELECT p.id as product_id, p.name, p.code, p.unit_cost, p.category,
                    p.shop_drawing_path,
-                   SUM(ti.count) as count
+                   SUM(ti.count * COALESCE(s.multiplier, 1)) as count,
+                   SUM(ti.count) as raw_count
             FROM takeoff_items ti
             JOIN products p ON ti.product_id = p.id
+            LEFT JOIN sections s ON ti.section_id = s.id
             WHERE ti.project_id=?
             GROUP BY p.id
             ORDER BY p.category, p.name
@@ -719,14 +749,14 @@ def get_candela_breakdown(project_id, section_ids=None):
         if section_ids:
             placeholders = ",".join("?" * len(section_ids))
             rows = conn.execute(
-                f"SELECT candela, COUNT(*) as cnt FROM marks "
+                f"SELECT candela, SUM(COALESCE((SELECT multiplier FROM sections s WHERE s.id=marks.section_id), 1)) as cnt FROM marks "
                 f"WHERE project_id=? AND candela > 0 AND {notif} AND section_id IN ({placeholders}) "
                 f"GROUP BY candela ORDER BY candela",
                 (project_id, *section_ids),
             ).fetchall()
         else:
             rows = conn.execute(
-                f"SELECT candela, COUNT(*) as cnt FROM marks "
+                f"SELECT candela, SUM(COALESCE((SELECT multiplier FROM sections s WHERE s.id=marks.section_id), 1)) as cnt FROM marks "
                 f"WHERE project_id=? AND candela > 0 AND {notif} GROUP BY candela ORDER BY candela",
                 (project_id,),
             ).fetchall()
@@ -741,10 +771,12 @@ def get_candela_breakdown_by_section(project_id, section_ids=None):
     candela. Unassigned (no-section) marks show under 'Unassigned'."""
     with get_conn() as conn:
         base_sql = """
-            SELECT COALESCE(s.name, 'Unassigned') as section_name,
+            SELECT CASE WHEN COALESCE(s.multiplier, 1) > 1
+                        THEN s.name || ' (typical x' || s.multiplier || ')'
+                        ELSE COALESCE(s.name, 'Unassigned') END as section_name,
                    COALESCE(s.sort_order, 999999) as section_sort,
                    COALESCE(p.name, 'Assembly') as device_name,
-                   m.candela, COUNT(*) as cnt
+                   m.candela, SUM(COALESCE(s.multiplier, 1)) as cnt
             FROM marks m
             LEFT JOIN sections s ON m.section_id = s.id
             LEFT JOIN products p ON m.entity_type='product' AND m.entity_id = p.id
@@ -877,6 +909,18 @@ def delete_linear_run(run_id):
     with get_conn() as conn:
         conn.execute("DELETE FROM linear_runs WHERE id=?", (run_id,))
         conn.commit()
+
+
+def get_linear_run(run_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM linear_runs WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_mark(mark_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM marks WHERE id=?", (mark_id,)).fetchone()
+        return dict(row) if row else None
 
 
 # ── Field Notes (installer markup layer) ────────────────────────────────────────
@@ -1058,8 +1102,9 @@ def delete_fire_plan_certificate(cert_id):
 def get_assembly_footage(project_id, assembly_id):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT COALESCE(SUM(footage),0) as total FROM linear_runs"
-            " WHERE project_id=? AND assembly_id=?",
+            "SELECT COALESCE(SUM(lr.footage * COALESCE(s.multiplier, 1)),0) as total"
+            " FROM linear_runs lr LEFT JOIN sections s ON lr.section_id = s.id"
+            " WHERE lr.project_id=? AND lr.assembly_id=?",
             (project_id, assembly_id),
         ).fetchone()
         return row["total"] if row else 0.0
@@ -1069,8 +1114,9 @@ def get_linear_run_totals(project_id):
     """Return {assembly_id: total_footage} for all linear runs in a project."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT assembly_id, SUM(footage) as total FROM linear_runs"
-            " WHERE project_id=? GROUP BY assembly_id",
+            "SELECT lr.assembly_id, SUM(lr.footage * COALESCE(s.multiplier, 1)) as total"
+            " FROM linear_runs lr LEFT JOIN sections s ON lr.section_id = s.id"
+            " WHERE lr.project_id=? GROUP BY lr.assembly_id",
             (project_id,),
         ).fetchall()
     return {r["assembly_id"]: r["total"] for r in rows}
@@ -1089,7 +1135,7 @@ def get_section_breakdown(project_id):
     with get_conn() as conn:
         return conn.execute("""
             SELECT s.id as section_id, s.name as section_name, p.name as product_name, p.code,
-                   p.category, ti.count
+                   p.category, ti.count, COALESCE(s.multiplier, 1) as multiplier
             FROM takeoff_items ti
             JOIN products p ON ti.product_id = p.id
             JOIN sections s ON ti.section_id = s.id

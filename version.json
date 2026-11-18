@@ -1,5 +1,5 @@
 {
-  "version": "1.7.0",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.0/DFP_TakeoffPro_Setup_1.7.0.exe",
-  "notes": "Load Prints: pick the folder that holds all the print PDFs and they're combined into one file so the whole set can be worked on at once. Candela: only notification appliances (horns, strobes, speakers) carry a candela rating now; detectors, pull stations and modules no longer get one."
+  "version": "1.7.1",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.1/DFP_TakeoffPro_Setup_1.7.1.exe",
+  "notes": "Typical layouts: give a section a quantity (e.g. Suite Type A x24), count one suite, and every total is multiplied. New By Print tab shows counts per print; click a device to ring and number each one on the drawing. Undo/Redo (Ctrl+Z / Ctrl+Y) works across all prints. Clear This Print removes a page's counts from the totals (undoable)."
 }

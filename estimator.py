@@ -1937,9 +1937,10 @@ class InstallEstimateDialog(QDialog):
             rows = conn.execute("""
                 SELECT p.id, p.name, p.category, p.unit_cost,
                        p.lu_reg, p.lu_diff, p.lu_hard, p.lu_id,
-                       SUM(ti.count) as total_count
+                       SUM(ti.count * COALESCE(s.multiplier, 1)) as total_count
                 FROM takeoff_items ti
                 JOIN products p ON ti.product_id = p.id
+                LEFT JOIN sections s ON ti.section_id = s.id
                 WHERE ti.project_id = ? AND ti.count > 0
                 GROUP BY p.id
                 ORDER BY p.category, p.name
@@ -2162,9 +2163,10 @@ class InstallEstimateDialog(QDialog):
                        a.wire_count, a.bundle_factor, a.prep_lu_per_wire,
                        a.lu_reg, a.lu_diff, a.lu_hard,
                        a.wire_lu_reg, a.wire_lu_diff, a.wire_lu_hard,
-                       SUM(lr.footage) as total_footage
+                       SUM(lr.footage * COALESCE(s.multiplier, 1)) as total_footage
                 FROM linear_runs lr
                 JOIN assemblies a ON lr.assembly_id = a.id
+                LEFT JOIN sections s ON lr.section_id = s.id
                 WHERE lr.project_id = ?
                 GROUP BY lr.assembly_id
             """, (self.project_id,)).fetchall()

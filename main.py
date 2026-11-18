@@ -326,9 +326,35 @@ class PdfCanvas(QLabel):
             return removed
         return None
 
-    def clear_marks_current_page(self):
-        self._page_marks.pop((self._pdf_path, self._page_index), None)
+    def remove_mark_by_db_id(self, db_id, repaint=True):
+        for key in list(self._page_marks.keys()):
+            self._page_marks[key] = [m for m in self._page_marks[key] if m["db_id"] != db_id]
+        if repaint:
+            self._paint_overlay()
+
+    def insert_mark(self, pdf_path, page_index, m, repaint=True):
+        """Put a mark (DB-row-shaped dict) back on any page — used by undo/redo."""
+        self._mark_counter += 1
+        self._page_marks.setdefault((pdf_path, page_index), []).append(dict(
+            id=self._mark_counter, db_id=m["id"],
+            page_x=m["page_x"], page_y=m["page_y"],
+            entity_type=m["entity_type"], entity_id=m["entity_id"],
+            color=m["color"], label=m["label"], section_id=m.get("section_id"),
+            coverage_type=m.get("coverage_type", ""),
+            coverage_radius_m=m.get("coverage_radius_m", 0.0),
+            candela=m.get("candela", 0.0) or 0.0,
+        ))
+        if repaint:
+            self._paint_overlay()
+
+    def set_trace(self, entity_type=None, entity_id=None):
+        """Ring + number every mark of one device so its count can be checked
+        by eye. None clears it."""
+        self._trace = (entity_type, entity_id) if entity_type else None
         self._paint_overlay()
+
+    def trace(self):
+        return getattr(self, "_trace", None)
 
     def set_highlight(self, page_rect):
         self._highlight_rect = page_rect
@@ -586,6 +612,30 @@ class PdfCanvas(QLabel):
                 painter.setPen(QPen(QColor("#ffff00")))
                 painter.drawText(tx, ty, tw, th, Qt.AlignCenter, cd_text)
                 painter.setFont(font)
+
+        # ── Count trace: ring + number each mark of the traced device ─────────
+        trace = getattr(self, "_trace", None)
+        if trace:
+            traced = [m for m in marks
+                      if (m["entity_type"], m["entity_id"]) == trace]
+            traced.sort(key=lambda m: (round(m["page_y"] / 40), m["page_x"]))
+            num_font = QFont("Arial", max(7, R - 3), QFont.Bold)
+            painter.setFont(num_font)
+            fm = painter.fontMetrics()
+            for n, m in enumerate(traced, 1):
+                cx = int(m["page_x"] * self._zoom)
+                cy = int(m["page_y"] * self._zoom)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(QColor("#00c8ff"), 3))
+                painter.drawEllipse(cx-R-7, cy-R-7, (R+7)*2, (R+7)*2)
+                txt = str(n)
+                tw = fm.horizontalAdvance(txt) + 6; th = fm.height()
+                tx, ty = cx - R - 7 - tw, cy - R - 7 - th + 4
+                painter.setPen(Qt.NoPen); painter.setBrush(QColor("#00a0d0"))
+                painter.drawRoundedRect(tx, ty, tw, th, 3, 3)
+                painter.setPen(QPen(QColor("#ffffff")))
+                painter.drawText(tx, ty, tw, th, Qt.AlignCenter, txt)
+            painter.setFont(font)
 
         # ── Completed linear runs ─────────────────────────────────────────────
         import json as _json, math as _math
@@ -2398,6 +2448,8 @@ class SubmittalProductPickerDialog(QDialog):
 #
 
 class TakeoffPanel(QWidget):
+    trace_requested = pyqtSignal(int, str, int)   # page_index (-1 = stop), entity_type, entity_id
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._project_id = None
@@ -2420,8 +2472,17 @@ class TakeoffPanel(QWidget):
         sec_row.addWidget(self.sec_combo)
         add_sec = QPushButton("+"); add_sec.setFixedWidth(24); add_sec.setToolTip("Add section"); add_sec.clicked.connect(self._add_section)
         del_sec = QPushButton(""); del_sec.setFixedWidth(24); del_sec.setToolTip("Delete section"); del_sec.clicked.connect(self._del_section)
-        sec_row.addWidget(add_sec); sec_row.addWidget(del_sec)
+        typ_sec = QPushButton("×"); typ_sec.setFixedWidth(24)
+        typ_sec.setToolTip("Typical: set how many times this section occurs in the building\n"
+                           "(e.g. a typical suite layout that repeats 24 times)")
+        typ_sec.clicked.connect(self._set_typical_qty)
+        sec_row.addWidget(add_sec); sec_row.addWidget(typ_sec); sec_row.addWidget(del_sec)
         layout.addLayout(sec_row)
+        self.typical_label = QLabel("")
+        self.typical_label.setAlignment(Qt.AlignCenter); self.typical_label.setWordWrap(True)
+        self.typical_label.setStyleSheet("background:#00a0d0;color:white;font-weight:bold;padding:4px;border-radius:4px;")
+        self.typical_label.setVisible(False)
+        layout.addWidget(self.typical_label)
 
         # Count +/
         count_row = QHBoxLayout()
@@ -2440,6 +2501,7 @@ class TakeoffPanel(QWidget):
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(self._build_summary_tab(), "Summary")
         self.tab_widget.addTab(self._build_section_tab(), "By Section")
+        self.tab_widget.addTab(self._build_print_tab(), "By Print")
         self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.tabBar().setUsesScrollButtons(False)
         self.tab_widget.tabBar().setElideMode(Qt.ElideNone)
@@ -2498,6 +2560,145 @@ class TakeoffPanel(QWidget):
         layout.addWidget(self.sec_table)
         return w
 
+    def _build_print_tab(self):
+        w = QWidget(); layout = QVBoxLayout(w); layout.setContentsMargins(0,4,0,0)
+        hint = QLabel("Counts on each print (page). Click a device to jump to it — "
+                      "every one is ringed and numbered on the drawing.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;font-size:10px;padding:2px 4px;")
+        layout.addWidget(hint)
+        self.print_tree = QTreeWidget()
+        self.print_tree.setColumnCount(2)
+        self.print_tree.setHeaderLabels(["Print / Device", "Qty"])
+        self.print_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.print_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.print_tree.header().setStretchLastSection(False)
+        self.print_tree.setAlternatingRowColors(True)
+        self.print_tree.itemClicked.connect(self._on_print_item_clicked)
+        self.print_tree.itemExpanded.connect(lambda it: self._print_expanded.add(it.data(0, Qt.UserRole + 1)))
+        self.print_tree.itemCollapsed.connect(lambda it: self._print_expanded.discard(it.data(0, Qt.UserRole + 1)))
+        layout.addWidget(self.print_tree)
+        btns = QHBoxLayout()
+        clear_trace = QPushButton("Stop Tracing")
+        clear_trace.setToolTip("Remove the rings/numbers from the drawing")
+        clear_trace.clicked.connect(lambda: self.trace_requested.emit(-1, "", 0))
+        btns.addWidget(clear_trace); btns.addStretch()
+        layout.addLayout(btns)
+        self._print_expanded = set()
+        self._pdf_path = ""
+        return w
+
+    def set_pdf(self, pdf_path):
+        self._pdf_path = pdf_path or ""
+        self._print_expanded = set()
+        self.refresh_print_tree()
+
+    def _on_print_item_clicked(self, item, _col):
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        page, etype, eid = data
+        self.trace_requested.emit(page, etype or "", eid or 0)
+
+    def refresh_print_tree(self):
+        if not hasattr(self, "print_tree"):
+            return
+        tree = self.print_tree
+        tree.clear()
+        if not self._project_id:
+            return
+        products   = {p["id"]: dict(p) for p in db.get_products()}
+        assemblies = {a["id"]: dict(a) for a in db.get_assemblies()}
+
+        def ent_name(etype, eid):
+            src = products if etype == "product" else assemblies
+            e = src.get(eid)
+            return (e["name"] if e else f"(deleted {etype} #{eid})")
+
+        all_marks = [dict(m) for m in db.get_marks(self._project_id)]
+        here = [m for m in all_marks if m["pdf_path"] == self._pdf_path]
+        runs = [dict(r) for r in db.get_linear_runs(self._project_id, self._pdf_path)] if self._pdf_path else []
+        labels = db.get_page_labels(self._project_id, self._pdf_path) if self._pdf_path else {}
+        mults = db.get_section_multipliers(self._project_id)
+        sec_names = {s["id"]: s["name"] for s in db.get_sections(self._project_id)}
+
+        pages = sorted({m["page_index"] for m in here} | {r["page_index"] for r in runs})
+        bold = QFont(); bold.setBold(True)
+        for pg in pages:
+            pmarks = [m for m in here if m["page_index"] == pg]
+            pruns  = [r for r in runs if r["page_index"] == pg]
+            title = f"Page {pg + 1}" + (f"  —  {labels[pg]}" if labels.get(pg) else "")
+            top = QTreeWidgetItem([title, str(len(pmarks))])
+            top.setData(0, Qt.UserRole, (pg, None, None))
+            top.setData(0, Qt.UserRole + 1, ("page", pg))
+            top.setFont(0, bold); top.setFont(1, bold)
+            top.setTextAlignment(1, Qt.AlignCenter)
+            counts = {}
+            for m in pmarks:
+                k = (m["entity_type"], m["entity_id"], m["section_id"] if mults.get(m["section_id"]) else None)
+                counts[k] = counts.get(k, 0) + 1
+            for (etype, eid, tsid), n in sorted(counts.items(), key=lambda kv: (ent_name(*kv[0][:2]).lower(), kv[0][2] or 0)):
+                name = ("◆ " if etype == "assembly" else "") + ent_name(etype, eid)
+                qty = str(n)
+                if tsid:
+                    name += f"   [{sec_names.get(tsid, 'typical')} ×{mults[tsid]}]"
+                    qty = f"{n} → {n * mults[tsid]}"
+                ch = QTreeWidgetItem([name, qty])
+                ch.setData(0, Qt.UserRole, (pg, etype, eid))
+                ch.setTextAlignment(1, Qt.AlignCenter)
+                ch.setForeground(0, QColor(color_for_id(eid if etype == "product" else 1000 + eid)).darker(130))
+                top.addChild(ch)
+            footage = {}
+            for r in pruns:
+                k = (r["assembly_id"], r["section_id"] if mults.get(r["section_id"]) else None)
+                footage[k] = footage.get(k, 0.0) + (r["footage"] or 0.0)
+            for (aid, tsid), ft in footage.items():
+                name, qty = f"⌇ {ent_name('assembly', aid)}", f"{ft:.1f} ft"
+                if tsid:
+                    name += f"   [{sec_names.get(tsid, 'typical')} ×{mults[tsid]}]"
+                    qty = f"{ft:.0f} → {ft * mults[tsid]:.0f} ft"
+                ch = QTreeWidgetItem([name, qty])
+                ch.setData(0, Qt.UserRole, (pg, None, None))
+                ch.setTextAlignment(1, Qt.AlignCenter)
+                top.addChild(ch)
+            tree.addTopLevelItem(top)
+            top.setExpanded(("page", pg) in self._print_expanded)
+
+        # Marks on PDFs other than the one open (older print sets for this job)
+        others = {}
+        for m in all_marks:
+            if m["pdf_path"] != self._pdf_path:
+                others[m["pdf_path"]] = others.get(m["pdf_path"], 0) + 1
+        for path, n in others.items():
+            it = QTreeWidgetItem([f"Other PDF: {os.path.basename(path)}", str(n)])
+            it.setForeground(0, QColor("#888")); it.setTextAlignment(1, Qt.AlignCenter)
+            tree.addTopLevelItem(it)
+
+        # Counts entered with the +/− buttons rather than placed on a print
+        from_marks, asm_items = {}, {}
+        for m in all_marks:
+            if m["entity_type"] == "product":
+                from_marks[m["entity_id"]] = from_marks.get(m["entity_id"], 0) + 1
+            else:
+                if m["entity_id"] not in asm_items:
+                    asm_items[m["entity_id"]] = db.get_assembly_items(m["entity_id"])
+                for c in asm_items[m["entity_id"]]:
+                    from_marks[c["product_id"]] = from_marks.get(c["product_id"], 0) + c["quantity"]
+        manual = []
+        for item in db.get_all_takeoff_items(self._project_id):
+            diff = (item["raw_count"] or 0) - from_marks.get(item["product_id"], 0)
+            if diff:
+                manual.append((item["name"], diff))
+        if manual:
+            top = QTreeWidgetItem(["Not on a print (entered with + / −)", str(sum(d for _, d in manual))])
+            top.setData(0, Qt.UserRole + 1, ("manual", 0))
+            top.setForeground(0, QColor("#a05000")); top.setTextAlignment(1, Qt.AlignCenter)
+            for name, d in sorted(manual):
+                ch = QTreeWidgetItem([name, f"{d:+d}"]); ch.setTextAlignment(1, Qt.AlignCenter)
+                top.addChild(ch)
+            tree.addTopLevelItem(top)
+            top.setExpanded(("manual", 0) in self._print_expanded)
+
     def selected_section_ids(self):
         """Distinct section_ids from selected rows in the By Section tab —
         empty set means no filter (export the whole project)."""
@@ -2521,40 +2722,89 @@ class TakeoffPanel(QWidget):
         self._reload_sections()
         self.refresh_table()
 
-    def _reload_sections(self):
+    def _reload_sections(self, select_id=None):
         self.sec_combo.blockSignals(True)
         self.sec_combo.clear()
         self.sec_combo.addItem("All / Unassigned", None)
+        self._section_mult = {}
         if self._project_id:
             for s in db.get_sections(self._project_id):
-                self.sec_combo.addItem(s["name"], s["id"])
+                mult = (s["multiplier"] if "multiplier" in s.keys() else 1) or 1
+                self._section_mult[s["id"]] = mult
+                text = f"{s['name']}   (typical ×{mult})" if mult > 1 else s["name"]
+                self.sec_combo.addItem(text, s["id"])
+        idx = self.sec_combo.findData(select_id) if select_id else 0
+        self.sec_combo.setCurrentIndex(max(0, idx))
         self.sec_combo.blockSignals(False)
-        self._active_section_id = None
+        self._active_section_id = self.sec_combo.currentData()
+        self._update_typical_label()
+
+    def section_multiplier(self, section_id=None):
+        sid = self._active_section_id if section_id is None else section_id
+        return getattr(self, "_section_mult", {}).get(sid, 1) if sid else 1
+
+    def _update_typical_label(self):
+        mult = self.section_multiplier()
+        if mult > 1:
+            self.typical_label.setText(
+                f"TYPICAL ×{mult}  —  count ONE {self.sec_combo.currentText().split('   (')[0]}; "
+                f"totals are multiplied by {mult}")
+        self.typical_label.setVisible(mult > 1)
 
     def _on_section_changed(self, idx):
         self._active_section_id = self.sec_combo.itemData(idx)
+        self._update_typical_label()
         self.refresh_table()
         self._update_count_display()
 
+    def _ask_typical_qty(self, name, current=1):
+        n, ok = QInputDialog.getInt(
+            self, "Typical Quantity",
+            f"How many times does '{name}' occur in the building?\n\n"
+            "Typical suite / floor / unit layout: enter how many there are\n"
+            "(e.g. 24 suites of this type). Count the devices on ONE of them\n"
+            "and every total is multiplied by this number.\n\n"
+            "Normal area (not a typical): leave it at 1.",
+            current, 1, 10000, 1)
+        return n if ok else None
+
     def _add_section(self):
         if not self._project_id: return
-        name, ok = QInputDialog.getText(self,"New Section","Section name (e.g. Floor 1):")
+        name, ok = QInputDialog.getText(self, "New Section",
+            "Section name (e.g. Floor 1, or Suite Type A for a typical):")
         if ok and name.strip():
-            db.add_section(self._project_id, name.strip())
-            self._reload_sections()
-            # Select the new section
-            for i in range(self.sec_combo.count()):
-                if self.sec_combo.itemText(i) == name.strip():
-                    self.sec_combo.setCurrentIndex(i); break
+            mult = self._ask_typical_qty(name.strip())
+            if mult is None:
+                return
+            sid = db.add_section(self._project_id, name.strip(), mult)
+            self._reload_sections(select_id=sid)
+            self.refresh_table(); self._update_count_display()
+
+    def _set_typical_qty(self):
+        sid = self.sec_combo.currentData()
+        if not sid:
+            QMessageBox.information(self, "Typical Quantity",
+                "Pick (or add with +) the section for the typical layout first,\n"
+                "e.g. 'Suite Type A', then press × to set how many there are.")
+            return
+        name = self.sec_combo.currentText().split("   (")[0]
+        mult = self._ask_typical_qty(name, self.section_multiplier(sid))
+        if mult is None:
+            return
+        db.set_section_multiplier(sid, mult)
+        self._reload_sections(select_id=sid)
+        self.refresh_table(); self._update_count_display()
 
     def _del_section(self):
         sid = self.sec_combo.currentData()
         if not sid: return
         name = self.sec_combo.currentText()
-        if QMessageBox.question(self,"Delete Section",f"Delete section '{name}'?\nMarks in this section will become unassigned.",
+        extra = ("\n\nIt's a typical — its counts will go back to being counted once."
+                 if self.section_multiplier(sid) > 1 else "")
+        if QMessageBox.question(self,"Delete Section",f"Delete section '{name}'?\nMarks in this section will become unassigned.{extra}",
                                 QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
             db.delete_section(sid)
-            self._reload_sections(); self.refresh_table()
+            self._reload_sections(); self.refresh_table(); self._update_count_display()
 
     def active_section_id(self):
         return self._active_section_id
@@ -2632,6 +2882,11 @@ class TakeoffPanel(QWidget):
             else:
                 cnt = 0
         self.count_label.setText(str(cnt))
+        mult = self.section_multiplier()
+        if mult > 1:
+            self._update_typical_label()
+            self.typical_label.setText(self.typical_label.text() +
+                                       f"\n{cnt} in this layout × {mult} = {cnt * mult} total")
 
     def refresh_table(self):
         if not self._project_id: return
@@ -2679,9 +2934,16 @@ class TakeoffPanel(QWidget):
             sec_item.setData(Qt.UserRole, item["section_id"])
             self.sec_table.setItem(row,0,sec_item)
             self.sec_table.setItem(row,1,QTableWidgetItem(item["product_name"]))
-            qi = QTableWidgetItem(str(item["count"])); qi.setTextAlignment(Qt.AlignCenter)
+            mult = item["multiplier"] or 1
+            if mult > 1:
+                sec_item.setText(f"{item['section_name']} (×{mult})")
+                qi = QTableWidgetItem(f"{item['count']} × {mult} = {item['count'] * mult}")
+            else:
+                qi = QTableWidgetItem(str(item["count"]))
+            qi.setTextAlignment(Qt.AlignCenter)
             self.sec_table.setItem(row,2,qi)
             self.sec_table.setItem(row,3,QTableWidgetItem(""))
+        self.refresh_print_tree()
 
     #  Export 
 
@@ -3041,6 +3303,10 @@ class MainWindow(QMainWindow):
         self._last_field_line_width = 2.0
         self._snip_windows = {}   # {snip_id: SnipWindow} — only currently-open ones
         self._snip_toggle_actions = {}   # {snip_id: QAction} — dynamic Snips ▾ menu entries
+        # Count history: each entry is {"kind": "add"|"remove", "marks": [row…],
+        # "runs": [row…], "what": str}. Rows are DB-row dicts so they can be
+        # re-inserted exactly (page, position, section, candela).
+        self._undo_stack, self._redo_stack = [], []
         # Fresh install / laptop reset → bring back devices, cut sheets and jobs
         # from the OneDrive library vault before the empty DB gets initialised.
         restore_msg = library_vault.restore_on_startup(db.DB_PATH)
@@ -3052,6 +3318,9 @@ class MainWindow(QMainWindow):
                 restore_msg = f"Automatic library restore failed: {e}"
         self._build_ui()
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
+        QShortcut(QKeySequence("Ctrl+Y"), self, self._redo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, self._redo)
+        self.takeoff_panel.trace_requested.connect(self._on_trace_requested)
         if restore_msg:
             QTimer.singleShot(500, lambda: QMessageBox.information(self, "Library Restored", restore_msg))
         # Keep the OneDrive vault up to date: now, every 5 minutes, and on close.
@@ -3083,7 +3352,7 @@ class MainWindow(QMainWindow):
         for w in (zo,zi,fit): nav.addWidget(w)
         cl.addLayout(nav)
 
-        self.count_banner = QLabel("COUNTING MODE    Click to count  |  Ctrl+drag to pan  |  Ctrl+scroll to zoom  |  Ctrl+Z to undo")
+        self.count_banner = QLabel("COUNTING MODE    Click to count  |  Ctrl+drag to pan  |  Ctrl+scroll to zoom  |  Ctrl+Z undo  ·  Ctrl+Y redo")
         self.count_banner.setAlignment(Qt.AlignCenter)
         self.count_banner.setStyleSheet("background:#ff7002;color:white;font-weight:bold;padding:4px;font-size:11px;")
         self.count_banner.setVisible(False); cl.addWidget(self.count_banner)
@@ -3130,7 +3399,16 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         self.count_action = QAction("Start Counting", self); self.count_action.setCheckable(True)
         self.count_action.triggered.connect(self._toggle_counting); tb.addAction(self.count_action)
-        a = QAction("Clear Marks (page)", self); a.triggered.connect(self.canvas.clear_marks_current_page); tb.addAction(a)
+        self.undo_action = QAction("Undo", self); self.undo_action.setToolTip("Undo last count (Ctrl+Z)")
+        self.undo_action.triggered.connect(self._undo); tb.addAction(self.undo_action)
+        self.redo_action = QAction("Redo", self); self.redo_action.setToolTip("Redo (Ctrl+Y)")
+        self.redo_action.triggered.connect(self._redo); tb.addAction(self.redo_action)
+        a = QAction("Clear This Print…", self)
+        a.setToolTip("Remove every count and wire run on the page you're looking at\n"
+                     "and take them off the totals, to start that print over.\n"
+                     "Can be undone with Ctrl+Z.")
+        a.triggered.connect(self._clear_current_print); tb.addAction(a)
+        self._update_undo_actions()
         tb.addWidget(QLabel("  Candela:"))
         self._active_candela_combo = QComboBox()
         self._active_candela_combo.addItem("N/A", 0)
@@ -3835,6 +4113,10 @@ class MainWindow(QMainWindow):
         self._doc = fitz.open(path)
         self._pdf_path = path
         self._page_index = 0
+        # Page numbers in the history would be stale after a reload/page trim.
+        self._undo_stack.clear(); self._redo_stack.clear(); self._update_undo_actions()
+        self.canvas.set_trace(None)
+        self.takeoff_panel.set_pdf(path)
         if self._project_id:
             saved = db.get_marks(self._project_id, path)
             # Enrich marks with coverage data from product catalogue
@@ -3945,7 +4227,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_linear_mode(False)
             self.canvas.set_counting_mode(checked and not is_linear)
             self.count_banner.setText(
-                "COUNTING MODE    Click to count  |  Ctrl+drag to pan  |  Ctrl+scroll to zoom  |  Ctrl+Z to undo"
+                "COUNTING MODE    Click to count  |  Ctrl+drag to pan  |  Ctrl+scroll to zoom  |  Ctrl+Z undo  ·  Ctrl+Y redo"
             )
             self.count_banner.setVisible(checked)
             self.count_action.setText("Stop Counting" if checked else "Start Counting")
@@ -4000,23 +4282,183 @@ class MainWindow(QMainWindow):
                              coverage_type=ctype, coverage_radius_m=cr_m, candela=candela)
         self.takeoff_panel.set_active_entity(etype, entity)
         self.takeoff_panel.add_one()
+        row = db.get_mark(db_id)
+        if row:
+            row.update(coverage_type=ctype, coverage_radius_m=cr_m)
+            self._push_history("add", [row], [], entity["name"])
         if etype == "product":
             db.increment_use_count(eid)
             self.library_panel.refresh()
 
+    # ── Count history (undo / redo / clear print) ─────────────────────────────
+
+    def _push_history(self, kind, marks, runs, what):
+        self._undo_stack.append({"kind": kind, "marks": marks, "runs": runs, "what": what})
+        del self._undo_stack[:-500]
+        self._redo_stack.clear()
+        self._update_undo_actions()
+
+    def _update_undo_actions(self):
+        if hasattr(self, "undo_action"):
+            u = self._undo_stack[-1] if self._undo_stack else None
+            r = self._redo_stack[-1] if self._redo_stack else None
+            self.undo_action.setEnabled(bool(u)); self.redo_action.setEnabled(bool(r))
+            self.undo_action.setToolTip(f"Undo {self._history_text(u)}  (Ctrl+Z)" if u else "Nothing to undo")
+            self.redo_action.setToolTip(f"Redo {self._history_text(r)}  (Ctrl+Y)" if r else "Nothing to redo")
+
+    @staticmethod
+    def _history_text(entry):
+        verb = "count" if entry["kind"] == "add" else "delete"
+        if entry["what"].startswith("clear"):
+            verb = ""
+        return f"{verb} {entry['what']}".strip()[:40]
+
+    def _adjust_counts(self, etype, eid, section_id, sign):
+        if etype == "product":
+            db.adjust_item_count(self._project_id, eid, sign, section_id)
+        else:
+            for item in db.get_assembly_items(eid):
+                db.adjust_item_count(self._project_id, item["product_id"], sign * item["quantity"], section_id)
+
+    def _take_out(self, marks, runs):
+        """Delete marks/runs from the DB + drawing and take them off the totals."""
+        for m in marks:
+            if db.get_mark(m["id"]):
+                db.delete_mark(m["id"])
+                self._adjust_counts(m["entity_type"], m["entity_id"], m.get("section_id"), -1)
+            self.canvas.remove_mark_by_db_id(m["id"], repaint=False)
+        for r in runs:
+            db.delete_linear_run(r["id"])
+            self.canvas.delete_run_by_id(r["id"])
+
+    def _put_back(self, marks, runs):
+        """Re-insert marks/runs (they get new DB ids, stored back into the rows
+        so a later undo/redo finds them)."""
+        for m in marks:
+            m["id"] = db.add_mark(self._project_id, m["pdf_path"], m["page_index"],
+                                  m["page_x"], m["page_y"], m["entity_type"], m["entity_id"],
+                                  m["color"], m["label"], m.get("section_id"), m.get("candela", 0) or 0)
+            self._adjust_counts(m["entity_type"], m["entity_id"], m.get("section_id"), +1)
+            self.canvas.insert_mark(m["pdf_path"], m["page_index"], m, repaint=False)
+        for r in runs:
+            r["id"] = db.add_linear_run(self._project_id, r["assembly_id"], r["pdf_path"], r["page_index"],
+                                        r["points"], r["footage"], r.get("section_id"))
+            self.canvas.add_linear_run(dict(r, color=color_for_id(r["assembly_id"])), repaint=False)
+
+    def _apply_history(self, entry, undo):
+        # Undoing an "add" removes it; undoing a "remove" puts it back. Redo is the reverse.
+        removing = (entry["kind"] == "add") == undo
+        if removing:
+            self._take_out(entry["marks"], entry["runs"])
+        else:
+            self._put_back(entry["marks"], entry["runs"])
+        # Show the print where it happened
+        items = entry["marks"] + entry["runs"]
+        if items and self._doc:
+            pg = items[-1]["page_index"]
+            if items[-1]["pdf_path"] == self._pdf_path and pg != self._page_index and 0 <= pg < len(self._doc):
+                self._goto_page(pg)
+        self.canvas._paint_overlay()
+        self.takeoff_panel._update_count_display(); self.takeoff_panel.refresh_table()
+
     def _undo(self):
-        if not self._counting_mode: return
-        removed = self.canvas.undo_last_mark()
-        if removed:
-            # Delete from DB
-            if removed.get("db_id"): db.delete_mark(removed["db_id"])
-            self.takeoff_panel.subtract_one(removed["entity_type"], removed["entity_id"])
-            self.statusBar().showMessage("Undo: last mark removed.")
+        if not self._undo_stack:
+            self.statusBar().showMessage("Nothing to undo.", 3000); return
+        entry = self._undo_stack.pop()
+        self._apply_history(entry, undo=True)
+        self._redo_stack.append(entry)
+        self._update_undo_actions()
+        self.statusBar().showMessage(f"Undone: {self._history_text(entry)}   (Ctrl+Y to redo)", 5000)
+
+    def _redo(self):
+        if not self._redo_stack:
+            self.statusBar().showMessage("Nothing to redo.", 3000); return
+        entry = self._redo_stack.pop()
+        self._apply_history(entry, undo=False)
+        self._undo_stack.append(entry)
+        self._update_undo_actions()
+        self.statusBar().showMessage(f"Redone: {self._history_text(entry)}", 5000)
+
+    def _goto_page(self, idx):
+        if not self._doc or not (0 <= idx < len(self._doc)):
+            return
+        self._page_index = idx
+        self.canvas.set_page(idx)
+        self._update_page_label()
+        self.prev_btn.setEnabled(idx > 0); self.next_btn.setEnabled(idx < len(self._doc) - 1)
+        if self._project_id and self._pdf_path:
+            ppm = db.get_page_scale(self._project_id, self._pdf_path, idx)
+            self.canvas.set_page_scale(ppm if ppm else 0.0)
+            self._update_scale_warning()
+
+    def _clear_current_print(self):
+        if not self._project_id or not self._doc:
+            self.statusBar().showMessage("Open a project and its prints first."); return
+        marks = [dict(m) for m in db.get_marks(self._project_id, self._pdf_path)
+                 if m["page_index"] == self._page_index]
+        runs = [dict(r) for r in db.get_linear_runs(self._project_id, self._pdf_path)
+                if r["page_index"] == self._page_index]
+        lbl = db.get_page_label(self._project_id, self._pdf_path, self._page_index)
+        page_name = f"Page {self._page_index + 1}" + (f" ({lbl})" if lbl else "")
+        if not marks and not runs:
+            QMessageBox.information(self, "Clear This Print", f"{page_name} has no counts on it."); return
+        products   = {p["id"]: p["name"] for p in db.get_products()}
+        assemblies = {a["id"]: a["name"] for a in db.get_assemblies()}
+        counts = {}
+        for m in marks:
+            n = (products if m["entity_type"] == "product" else assemblies).get(m["entity_id"], "?")
+            counts[n] = counts.get(n, 0) + 1
+        lines = [f"   {n}: {c}" for n, c in sorted(counts.items())]
+        if runs:
+            lines.append(f"   {len(runs)} wire run(s), {sum(r['footage'] or 0 for r in runs):.1f} ft")
+        if QMessageBox.question(
+                self, "Clear This Print",
+                f"Remove everything counted on {page_name}?\n\n" + "\n".join(lines[:25])
+                + ("\n   …" if len(lines) > 25 else "")
+                + "\n\nThe totals go down to match (typicals by their multiplier). Other prints aren't touched.\n"
+                  "You can undo this with Ctrl+Z.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        products_d = {p["id"]: dict(p) for p in db.get_products()}
+        for m in marks:
+            p = products_d.get(m["entity_id"]) if m["entity_type"] == "product" else None
+            m["coverage_type"], m["coverage_radius_m"] = _coverage_for_product(p) if p else ("", 0.0)
+        self._take_out(marks, runs)
+        self._push_history("remove", marks, runs, f"clear {page_name}")
+        self.canvas._paint_overlay()
+        self.takeoff_panel._update_count_display(); self.takeoff_panel.refresh_table()
+        self.statusBar().showMessage(f"Cleared {len(marks)} count(s) from {page_name}.  Ctrl+Z to undo.", 8000)
+
+    def _on_trace_requested(self, page, etype, eid):
+        if page < 0:
+            self.canvas.set_trace(None)
+            self.statusBar().showMessage("Tracing off.", 3000); return
+        if page != self._page_index:
+            self._goto_page(page)
+        if etype:
+            self.canvas.set_trace(etype, eid)
+            n = sum(1 for m in db.get_marks(self._project_id, self._pdf_path)
+                    if m["page_index"] == page and m["entity_type"] == etype and m["entity_id"] == eid)
+            src = db.get_products() if etype == "product" else db.get_assemblies()
+            name = next((x["name"] for x in src if x["id"] == eid), "?")
+            self.statusBar().showMessage(f"Tracing {name}: {n} on this print — each one is ringed and numbered.")
+        else:
+            self.canvas.set_trace(None)
 
     def _on_mark_deleted(self, db_id, entity_type, entity_id):
-        if db_id: db.delete_mark(db_id)
-        self.takeoff_panel.subtract_one(entity_type, entity_id)
-        self.statusBar().showMessage("Mark deleted  count adjusted.")
+        row = db.get_mark(db_id) if db_id else None
+        if row:
+            db.delete_mark(db_id)
+            self._adjust_counts(row["entity_type"], row["entity_id"], row["section_id"], -1)
+            src = db.get_products() if row["entity_type"] == "product" else db.get_assemblies()
+            p = next((dict(x) for x in src if x["id"] == row["entity_id"]), None)
+            row["coverage_type"], row["coverage_radius_m"] = (
+                _coverage_for_product(p) if p and row["entity_type"] == "product" else ("", 0.0))
+            self._push_history("remove", [row], [], p["name"] if p else "mark")
+            self.takeoff_panel._update_count_display(); self.takeoff_panel.refresh_table()
+        else:
+            self.takeoff_panel.subtract_one(entity_type, entity_id)
+        self.statusBar().showMessage("Mark deleted — count adjusted.  Ctrl+Z to undo.")
 
     def _on_mark_candela_changed(self, db_id, candela):
         if db_id:
@@ -4067,12 +4509,18 @@ class MainWindow(QMainWindow):
             "color": color_for_id(assembly_id),
         }
         self.canvas.add_linear_run(run_dict)
+        row = db.get_linear_run(run_id)
+        if row:
+            self._push_history("add", [], [row], f"{a.get('name', 'run')} {footage:.0f} ft")
         self.takeoff_panel._update_count_display()
         self.takeoff_panel.refresh_table()
         self.statusBar().showMessage(f"Run saved: {footage:.1f} ft  (total: {db.get_assembly_footage(self._project_id, assembly_id):.1f} ft)")
 
     def _on_run_deleted(self, run_id, assembly_id):
+        row = db.get_linear_run(run_id)
         db.delete_linear_run(run_id)
+        if row:
+            self._push_history("remove", [], [row], f"run {row['footage'] or 0:.0f} ft")
         self.takeoff_panel._update_count_display()
         self.takeoff_panel.refresh_table()
         self.statusBar().showMessage("Run deleted.")
