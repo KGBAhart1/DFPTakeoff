@@ -1,5 +1,5 @@
 {
-  "version": "1.7.2",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.2/DFP_TakeoffPro_Setup_1.7.2.exe",
-  "notes": "Paint Booth Designer: draw piping runs with the same Draw Pipe tool as the kitchen designer (colours, thickness, curves). Pipes lock to the booth's axes, snap to nozzles, cylinders and other pipes, save with the project and appear on the exported PDF."
+  "version": "1.7.3",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.3/DFP_TakeoffPro_Setup_1.7.3.exe",
+  "notes": "Paint Booth Designer: the Draw Pipe instruction bar is now a single slim line instead of filling half the window."
 }

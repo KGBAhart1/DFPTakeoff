@@ -2432,6 +2432,9 @@ class PaintBoothDesigner(QDialog):
             "  ✏ DRAW PIPE — Left-click to place points (chains automatically)  |  Right-click = end run  |  "
             "Ctrl = any angle  |  Esc = cancel  |  Ends snap to nozzles, cylinders and other pipes")
         self._pipe_hint.setStyleSheet(f"background:{_PALETTE_ORANGE};color:white;font-weight:bold;padding:4px;font-size:11px;")
+        # One slim line — never let the layout stretch it into a big block.
+        self._pipe_hint.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._pipe_hint.setFixedHeight(self._pipe_hint.fontMetrics().height() + 10)
         self._pipe_hint.setVisible(False)
         root.addWidget(self._pipe_hint)
 
@@ -2457,7 +2460,7 @@ class PaintBoothDesigner(QDialog):
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([260, 9999, 340])
 
-        root.addWidget(splitter)
+        root.addWidget(splitter, 1)
 
         # Reconnect fit after canvas is built
         fit_a.triggered.disconnect()
