@@ -41,6 +41,12 @@ try:
 except ImportError:
     _FITZ_OK = False
 
+# Piping is drawn exactly like the Kitchen Suppression Designer — same pipe
+# segment item (straight or drag-to-curve), colours and thicknesses.
+from suppression_designer import PipeSegmentItem, PIPE_COLORS, PIPE_W, PIPE_COL
+
+PIPE_SNAP_RADIUS = 14   # scene px: pipe ends snap to nozzles, cylinders, other pipe ends
+
 
 def _projects_dir():
     """Writable projects folder — Documents/DFP TakeoffPro/Projects when installed
@@ -1209,6 +1215,101 @@ class BoothScene(QGraphicsScene):
         self._booth_W = 0.0
         self._booth_H = 9.0
         self._coverage_visible = True
+        # Pipe-draw state (same behaviour as the kitchen designer)
+        self._pipe_draw    = False
+        self._pipe_start   = None    # QPointF: start of the segment being drawn
+        self._pipe_preview = None    # QPointF: current mouse position
+        self._pipe_color   = QColor(PIPE_COL)
+        self._pipe_width   = PIPE_W
+        self._exporting    = False   # hides pipe end-dots / handles in the PDF
+
+    # ── Piping ───────────────────────────────────────────────────────────────
+
+    def all_pipes(self):
+        return [i for i in self.items() if getattr(i, "ITEM_TYPE", "") == "pipe_segment"]
+
+    def clear_pipes(self):
+        for p in self.all_pipes():
+            self.removeItem(p)
+
+    def add_pipe(self, p1, p2, color=None, width=None, curved=False, ctrl=None):
+        seg = PipeSegmentItem(QPointF(p1), QPointF(p2),
+                              color=QColor(color) if color else QColor(self._pipe_color),
+                              width=width or self._pipe_width)
+        if curved and ctrl is not None:
+            seg._curved = True
+            seg._ctrl = QPointF(ctrl)
+        self.addItem(seg)
+        return seg
+
+    def pipe_to_dict(self, seg):
+        return {"x1": seg._p1.x(), "y1": seg._p1.y(), "x2": seg._p2.x(), "y2": seg._p2.y(),
+                "curved": seg._curved, "ctrl_x": seg._ctrl.x(), "ctrl_y": seg._ctrl.y(),
+                "color": seg._color.name(), "width": seg._width}
+
+    def _snap_point(self, pt):
+        """Nearest nozzle / cylinder / existing pipe end within snap range, else pt."""
+        cands = [n.scenePos() for n in self._nozzle_items]
+        cands += [c.scenePos() for c in self._cyl_items]
+        for p in self.all_pipes():
+            cands += [p._p1, p._p2]
+        best, best_d = None, PIPE_SNAP_RADIUS
+        for sp in cands:
+            d = ((sp.x() - pt.x()) ** 2 + (sp.y() - pt.y()) ** 2) ** 0.5
+            if d < best_d:
+                best_d, best = d, sp
+        return QPointF(best) if best is not None else pt
+
+    @staticmethod
+    def _ortho(start, end):
+        """Lock the segment to the nearest drawing axis: left-right, up-down, or
+        the booth's depth (isometric) direction — hold Ctrl to draw at any angle."""
+        dx, dy = end.x() - start.x(), end.y() - start.y()
+        axes = [(1.0, 0.0), (0.0, 1.0), (math.cos(_ISO_ANG), -math.sin(_ISO_ANG))]
+        ax, ay = max(axes, key=lambda a: abs(dx * a[0] + dy * a[1]))
+        t = dx * ax + dy * ay
+        return QPointF(start.x() + ax * t, start.y() + ay * t)
+
+    def pipe_end_point(self, raw, ctrl_held):
+        """Where a click at `raw` would put the next pipe point."""
+        pt = raw
+        if self._pipe_start is not None and not ctrl_held:
+            pt = self._ortho(self._pipe_start, raw)
+        return self._snap_point(pt)
+
+    def mousePressEvent(self, event):
+        if self._pipe_draw and event.button() == Qt.LeftButton:
+            pt = self.pipe_end_point(event.scenePos(), bool(event.modifiers() & Qt.ControlModifier))
+            if self._pipe_start is None:
+                self._pipe_start = pt
+            elif pt != self._pipe_start:
+                self.add_pipe(self._pipe_start, pt)
+                self._pipe_start = pt      # chain: next segment starts here
+            return
+        if self._pipe_draw and event.button() == Qt.RightButton:
+            self._pipe_start = None
+            for v in self.views(): v.viewport().update()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pipe_draw:
+            self._pipe_preview = event.scenePos()
+            for v in self.views(): v.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self._pipe_draw and self._pipe_start is not None:
+            self._pipe_start = None
+            for v in self.views(): v.viewport().update()
+            return
+        if event.key() == Qt.Key_Delete:
+            pipes = [i for i in self.selectedItems() if getattr(i, "ITEM_TYPE", "") == "pipe_segment"]
+            if pipes:
+                for p in pipes:
+                    self.removeItem(p)
+                return
+        super().keyPressEvent(event)
 
     # ── Booth shell ──────────────────────────────────────────────────────────
 
@@ -1360,6 +1461,7 @@ class BoothScene(QGraphicsScene):
 
     def add_nozzle(self, nozzle_type=NOZZLE_TF, sx=0.0, sy=0.0):
         item = NozzleItem(nozzle_type, self, self._coverage_visible)
+        item.setZValue(2)   # above piping
         item.setPos(sx, sy)
         self.addItem(item)
         self._nozzle_items.append(item)
@@ -1437,6 +1539,7 @@ class BoothScene(QGraphicsScene):
 
     def add_link(self, link_type=None, sx=0.0, sy=0.0):
         item = LinkItem(link_type, self)
+        item.setZValue(2)   # above piping
         item.setPos(sx, sy)
         self.addItem(item)
         self._link_items.append(item)
@@ -1458,6 +1561,7 @@ class BoothScene(QGraphicsScene):
 
     def add_cylinder(self, label="IND-45", sx=0.0, sy=0.0):
         item = CylinderItem(label, self)
+        item.setZValue(2)   # above piping
         item.setPos(sx, sy)
         self.addItem(item)
         self._cyl_items.append(item)
@@ -1527,6 +1631,43 @@ class BoothCanvas(QGraphicsView):
     def fit(self):
         self.fitInView(self.scene().itemsBoundingRect().adjusted(-20, -20, 20, 20),
                        Qt.KeepAspectRatio)
+
+    def set_pipe_mode(self, on):
+        # No rubber-band selection box while drawing pipe — clicks place points.
+        self.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.RubberBandDrag)
+        self.viewport().setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+        self.viewport().update()
+
+    def drawForeground(self, painter, rect):
+        """Crosshair + dashed preview of the next pipe segment (pipe-draw mode)."""
+        sc = self.scene()
+        if not getattr(sc, "_pipe_draw", False):
+            return
+        preview = getattr(sc, "_pipe_preview", None)
+        if preview is None:
+            return
+        ctrl = bool(QApplication.keyboardModifiers() & Qt.ControlModifier)
+        start = sc._pipe_start
+        unsnapped = sc._ortho(start, preview) if (start is not None and not ctrl) else preview
+        target = sc._snap_point(unsnapped)
+        vpt = self.mapFromScene(preview)
+        vw, vh = self.viewport().width(), self.viewport().height()
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor(60, 120, 200, 90), 1, Qt.DashLine))
+        painter.drawLine(0, vpt.y(), vw, vpt.y())
+        painter.drawLine(vpt.x(), 0, vpt.x(), vh)
+        if start is not None:
+            vs, ve = self.mapFromScene(start), self.mapFromScene(target)
+            painter.setPen(QPen(QColor(sc._pipe_color), 2, Qt.DashLine))
+            painter.drawLine(vs, ve)
+            painter.setPen(Qt.NoPen); painter.setBrush(QBrush(QColor(sc._pipe_color)))
+            painter.drawEllipse(QPointF(vs), 4, 4)
+        if target != unsnapped:   # will lock onto a nozzle / cylinder / pipe end
+            painter.setPen(QPen(QColor(_PALETTE_ORANGE), 2)); painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(self.mapFromScene(target)), 9, 9)
+        painter.restore()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2245,6 +2386,36 @@ class PaintBoothDesigner(QDialog):
         ]:
             a = QAction(label, self); a.triggered.connect(slot); tb.addAction(a)
         tb.addSeparator()
+        # ── Piping (same tool as the Kitchen Suppression Designer) ──
+        self._pipe_action = QAction("✏ Draw Pipe", self)
+        self._pipe_action.setCheckable(True)
+        self._pipe_action.setToolTip("Draw piping runs: click to place points (chains automatically),\n"
+                                     "right-click to end a run, Ctrl = any angle, Esc = cancel.\n"
+                                     "Right-click / drag the middle of a pipe to curve it; Del deletes.")
+        self._pipe_action.toggled.connect(self._toggle_pipe_draw)
+        tb.addAction(self._pipe_action)
+        _cb_style = ("QComboBox{background:#3a3d3e;color:#efe6e1;border:1px solid #666;"
+                     "border-radius:3px;padding:3px 6px;font-size:11px;font-weight:bold;}"
+                     "QComboBox:hover{border:1px solid #ff7002;}"
+                     "QComboBox QAbstractItemView{background:#2d3030;color:#efe6e1;"
+                     "selection-background-color:#ff7002;selection-color:white;}")
+        self._pipe_col_cb = QComboBox(); self._pipe_col_cb.setFixedWidth(90)
+        self._pipe_col_cb.setStyleSheet(_cb_style); self._pipe_col_cb.setToolTip("Pipe colour")
+        for name, hexcol in PIPE_COLORS:
+            self._pipe_col_cb.addItem(name, hexcol)
+            self._pipe_col_cb.setItemData(self._pipe_col_cb.count() - 1, QColor(hexcol), Qt.DecorationRole)
+        self._pipe_col_cb.currentIndexChanged.connect(
+            lambda i: setattr(self._scene, "_pipe_color", QColor(self._pipe_col_cb.itemData(i) or PIPE_COL.name())))
+        tb.addWidget(self._pipe_col_cb)
+        self._pipe_w_cb = QComboBox(); self._pipe_w_cb.setFixedWidth(64)
+        self._pipe_w_cb.setStyleSheet(_cb_style); self._pipe_w_cb.setToolTip("Pipe thickness")
+        for w in range(1, 8):
+            self._pipe_w_cb.addItem(f"{w} px", w)
+        self._pipe_w_cb.setCurrentIndex(PIPE_W - 1)
+        self._pipe_w_cb.currentIndexChanged.connect(
+            lambda i: setattr(self._scene, "_pipe_width", self._pipe_w_cb.itemData(i) or PIPE_W))
+        tb.addWidget(self._pipe_w_cb)
+        tb.addSeparator()
         self._cov_action = QAction("Coverage: ON", self)
         self._cov_action.setCheckable(True)
         self._cov_action.setChecked(True)
@@ -2257,6 +2428,12 @@ class PaintBoothDesigner(QDialog):
         help_a = QAction("Help", self); help_a.triggered.connect(self._show_help)
         tb.addAction(help_a)
         root.addWidget(tb)
+        self._pipe_hint = QLabel(
+            "  ✏ DRAW PIPE — Left-click to place points (chains automatically)  |  Right-click = end run  |  "
+            "Ctrl = any angle  |  Esc = cancel  |  Ends snap to nozzles, cylinders and other pipes")
+        self._pipe_hint.setStyleSheet(f"background:{_PALETTE_ORANGE};color:white;font-weight:bold;padding:4px;font-size:11px;")
+        self._pipe_hint.setVisible(False)
+        root.addWidget(self._pipe_hint)
 
         # ── Main splitter ──
         splitter = QSplitter(Qt.Horizontal)
@@ -2447,6 +2624,17 @@ class PaintBoothDesigner(QDialog):
 
     # ── Save / Open ─────────────────────────────────────────────────────────
 
+    def _toggle_pipe_draw(self, on):
+        sc = self._scene
+        sc._pipe_draw = on
+        sc._pipe_start = None
+        sc._pipe_preview = None
+        if on:
+            sc.clearSelection()
+        self._canvas.set_pipe_mode(on)
+        self._pipe_hint.setVisible(on)
+        self._canvas.setFocus()
+
     def _save(self):
         if not self._save_path:
             path, _ = QFileDialog.getSaveFileName(
@@ -2481,6 +2669,7 @@ class PaintBoothDesigner(QDialog):
                              for l in self._scene.all_links()],
             "cylinders":    [{"label": c.label, "x": c.pos().x(), "y": c.pos().y()}
                              for c in self._scene.all_cylinders()],
+            "pipes":        [self._scene.pipe_to_dict(p) for p in self._scene.all_pipes()],
         }
         try:
             with open(self._save_path, "w", encoding="utf-8") as f:
@@ -2525,6 +2714,7 @@ class PaintBoothDesigner(QDialog):
         self._scene.clear_nozzles()
         self._scene.clear_links()
         self._scene.clear_cylinders()
+        self._scene.clear_pipes()
         ZoneData._id_counter = 0
 
         # Reload zones (no auto-spawn — nozzles loaded separately)
@@ -2563,6 +2753,13 @@ class PaintBoothDesigner(QDialog):
         for cd in data.get("cylinders", []):
             self._scene.add_cylinder(cd.get("label", "IND-45"),
                                      cd.get("x", 0.0), cd.get("y", 0.0))
+
+        # Reload piping
+        for pd in data.get("pipes", []):
+            self._scene.add_pipe(QPointF(pd["x1"], pd["y1"]), QPointF(pd["x2"], pd["y2"]),
+                                 color=pd.get("color", PIPE_COL.name()), width=pd.get("width", PIPE_W),
+                                 curved=pd.get("curved", False),
+                                 ctrl=QPointF(pd.get("ctrl_x", 0.0), pd.get("ctrl_y", 0.0)))
 
         # Restore coverage toggle
         cov = data.get("coverage_on", True)
@@ -2681,7 +2878,16 @@ class PaintBoothDesigner(QDialog):
             img.fill(QColor("white"))
             p = QPainter(img)
             p.setRenderHint(QPainter.Antialiasing)
-            self._scene.render(p, _QRectF(0, 0, img_w, img_h), scene_rect, _Qt.IgnoreAspectRatio)
+            # Hide on-screen-only pipe handles/end dots and selection colour in the PDF
+            selected = self._scene.selectedItems()
+            self._scene.clearSelection()
+            self._scene._exporting = True
+            try:
+                self._scene.render(p, _QRectF(0, 0, img_w, img_h), scene_rect, _Qt.IgnoreAspectRatio)
+            finally:
+                self._scene._exporting = False
+                for it in selected:
+                    it.setSelected(True)
             p.end()
             tmp1 = path + "_tmp0.png"; img.save(tmp1); tmp_files.append(tmp1)
 

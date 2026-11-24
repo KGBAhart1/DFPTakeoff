@@ -1,5 +1,5 @@
 {
-  "version": "1.7.1",
-  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.1/DFP_TakeoffPro_Setup_1.7.1.exe",
-  "notes": "Typical layouts: give a section a quantity (e.g. Suite Type A x24), count one suite, and every total is multiplied. New By Print tab shows counts per print; click a device to ring and number each one on the drawing. Undo/Redo (Ctrl+Z / Ctrl+Y) works across all prints. Clear This Print removes a page's counts from the totals (undoable)."
+  "version": "1.7.2",
+  "download_url": "https://github.com/KGBAhart1/DFPTakeoff/releases/download/1.7.2/DFP_TakeoffPro_Setup_1.7.2.exe",
+  "notes": "Paint Booth Designer: draw piping runs with the same Draw Pipe tool as the kitchen designer (colours, thickness, curves). Pipes lock to the booth's axes, snap to nozzles, cylinders and other pipes, save with the project and appear on the exported PDF."
 }
